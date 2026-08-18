@@ -14,14 +14,19 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use radicle::crypto::ssh::Keystore;
+use radicle::cob;
+use radicle::cob::common::Label;
+use radicle::cob::issue::{CloseReason, State as IssueState};
 use radicle::identity::RepoId;
+use radicle::identity::Visibility;
+use radicle::identity::project::ProjectName;
 use radicle::issue::cache::Issues as _;
 use radicle::node::policy::Scope;
 use radicle::node::{ConnectOptions, ConnectResult, FetchResult, Handle as _};
-use radicle::patch::cache::Patches as _;
+use radicle::patch::{ByRevision, cache::Patches as _};
 use radicle::prelude::*;
-use radicle::profile::{Home, Profile};
-use radicle::storage::{ReadRepository, ReadStorage};
+use radicle::profile::{Home, Profile, Signer};
+use radicle::storage::{ReadRepository, ReadStorage, WriteStorage};
 use radicle_node::runtime::handle::Handle as NodeHandle;
 use radicle_node::runtime::Runtime;
 
@@ -65,6 +70,14 @@ pub struct TreeEntry {
 pub struct Blob {
     pub binary: bool,
     pub content: Vec<u8>,
+}
+
+/// Public identity exposed to the browser provider.
+#[derive(Debug, Clone)]
+pub struct Identity {
+    pub did: String,
+    pub nid: String,
+    pub alias: String,
 }
 
 /// An embedded Radicle stack: profile + in-process node.
@@ -128,6 +141,15 @@ impl Embedded {
     /// The local node's DID.
     pub fn did(&self) -> String {
         self.profile.did().to_string()
+    }
+
+    /// The profile identity and public node alias.
+    pub fn identity(&self) -> Identity {
+        Identity {
+            did: self.profile.did().to_string(),
+            nid: self.profile.id().to_string(),
+            alias: self.profile.config.node.alias.to_string(),
+        }
     }
 
     /// Connect to the profile's configured preferred seeds.
@@ -212,6 +234,137 @@ impl Embedded {
             rid,
             last_err.unwrap_or_else(|| "no candidate succeeded".into()),
         ))
+    }
+
+    /// Stop seeding a repository. The bare repository remains in storage.
+    pub fn unseed_repo(&mut self, rid: RepoId) -> Result<bool, Error> {
+        Ok(self.handle.unseed(rid)?)
+    }
+
+    /// List all locally stored repositories.
+    pub fn list_repos(&self) -> Result<Vec<RepoInfo>, Error> {
+        let policies = self.profile.policies()?;
+        let mut repos = Vec::new();
+        for repo in self.profile.storage.repositories()? {
+            if policies.is_seeding(&repo.rid)? {
+                repos.push(self.repo_info(repo.rid)?);
+            }
+        }
+        Ok(repos)
+    }
+
+    fn signer(&self) -> Result<Signer, Error> {
+        Ok(self.profile.signer()?)
+    }
+
+    /// Create an issue directly in the repository's COB store.
+    pub fn create_issue(
+        &self,
+        rid: RepoId,
+        title: &str,
+        description: &str,
+        labels: Vec<String>,
+    ) -> Result<String, Error> {
+        let repo = self.profile.storage.repository_mut(rid)?;
+        let signer = self.signer()?;
+        let mut issues = self.profile.issues_mut(&repo, &signer)?;
+        let title = cob::Title::new(title).map_err(|e| Error::NodeThread(e.to_string()))?;
+        let labels = labels
+            .into_iter()
+            .map(Label::new)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::NodeThread(e.to_string()))?;
+        let issue = issues.create(title, description, &labels, &[], [])?;
+        Ok(issue.id().to_string())
+    }
+
+    /// Add a comment to an issue.
+    pub fn comment_issue(
+        &self,
+        rid: RepoId,
+        issue_id: &str,
+        body: &str,
+        reply_to: Option<&str>,
+    ) -> Result<String, Error> {
+        let repo = self.profile.storage.repository_mut(rid)?;
+        let signer = self.signer()?;
+        let mut issues = self.profile.issues_mut(&repo, &signer)?;
+        let issue_id: cob::ObjectId = repo.backend.revparse_single(issue_id)?.id().into();
+        let mut issue = issues.get_mut(&issue_id)?;
+        let parent = match reply_to {
+            Some(id) => repo.backend.revparse_single(id)?.id().into(),
+            None => *issue.root().0,
+        };
+        Ok(issue.comment(body, parent, [])?.to_string())
+    }
+
+    /// Transition an issue between open, closed and solved.
+    pub fn edit_issue_state(
+        &self,
+        rid: RepoId,
+        issue_id: &str,
+        state: &str,
+    ) -> Result<String, Error> {
+        let repo = self.profile.storage.repository_mut(rid)?;
+        let signer = self.signer()?;
+        let mut issues = self.profile.issues_mut(&repo, &signer)?;
+        let issue_id: cob::ObjectId = repo.backend.revparse_single(issue_id)?.id().into();
+        let state = match state {
+            "open" => IssueState::Open,
+            "closed" => IssueState::Closed { reason: CloseReason::Other },
+            "solved" => IssueState::Closed { reason: CloseReason::Solved },
+            other => return Err(Error::NodeThread(format!("invalid issue state {other:?}"))),
+        };
+        let mut issue = issues.get_mut(&issue_id)?;
+        issue.lifecycle(state)?;
+        Ok(issue_id.to_string())
+    }
+
+    /// Add a comment to a patch revision.
+    pub fn comment_patch(
+        &self,
+        rid: RepoId,
+        revision_id: &str,
+        body: &str,
+    ) -> Result<String, Error> {
+        let repo = self.profile.storage.repository_mut(rid)?;
+        let signer = self.signer()?;
+        let mut patches = self.profile.patches_mut(&repo, &signer)?;
+        let entry: cob::EntryId = repo.backend.revparse_single(revision_id)?.id().into();
+        let revision_id = radicle::cob::patch::RevisionId::from(entry);
+        let ByRevision { id, patch, .. } = patches
+            .find_by_revision(&revision_id)?
+            .ok_or_else(|| Error::NodeThread(format!("patch revision {revision_id} not found")))?;
+        let mut patch = radicle::cob::patch::PatchMut::new(id, patch, &mut patches);
+        Ok(patch.comment(revision_id, body, None, None, [])?.to_string())
+    }
+
+    /// Import the default branch of an existing working Git repository.
+    pub fn import_repo(
+        &mut self,
+        repo_path: &std::path::Path,
+        name: &str,
+        description: &str,
+        default_branch: &str,
+    ) -> Result<RepoId, Error> {
+        let repo = radicle::git::raw::Repository::open(repo_path)?;
+        let name = ProjectName::try_from(name)
+            .map_err(|e| Error::NodeThread(e.to_string()))?;
+        let branch = radicle::git::BranchName::try_from(default_branch.to_string())
+            .map_err(|e| Error::NodeThread(e.to_string()))?;
+        let signer = self.signer()?;
+        let (rid, _, _) = radicle::rad::init(
+            &repo,
+            name,
+            description,
+            branch,
+            Visibility::Public,
+            &signer,
+            &self.profile.storage,
+        )?;
+        self.handle.seed(rid, Scope::All)?;
+        self.handle.add_inventory(rid)?;
+        Ok(rid)
     }
 
     /// Read a repository's identity payload + head from local storage.

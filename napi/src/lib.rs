@@ -120,6 +120,159 @@ pub fn clone_repo(rid: String, timeout_ms: u32) -> AsyncTask<BlockingJson> {
     })
 }
 
+/// Stop seeding a repository. Resolves to `{"unseeded": bool}`.
+#[napi]
+pub fn unseed_repo(rid: String) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        with_node(|node| match node.unseed_repo(rid) {
+            Ok(unseeded) => serde_json::json!({ "unseeded": unseeded }).to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// The public profile identity used by the browser provider.
+#[napi]
+pub fn identity() -> AsyncTask<BlockingJson> {
+    blocking(|| {
+        with_node(|node| {
+            let identity = node.identity();
+            serde_json::json!({
+                "did": identity.did,
+                "nid": identity.nid,
+                "alias": identity.alias,
+            })
+            .to_string()
+        })
+    })
+}
+
+/// Repositories the local node is currently seeding.
+#[napi]
+pub fn list_repos() -> AsyncTask<BlockingJson> {
+    blocking(|| {
+        with_node(|node| match node.list_repos() {
+            Ok(repos) => serde_json::json!(repos
+                .into_iter()
+                .map(|repo| serde_json::json!({
+                    "rid": repo.rid.to_string(),
+                    "name": repo.name,
+                    "description": repo.description,
+                }))
+                .collect::<Vec<_>>())
+            .to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// Create an issue directly in the COB store.
+#[napi]
+pub fn create_issue(
+    rid: String,
+    title: String,
+    description: String,
+    labels_json: String,
+) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        let labels = match serde_json::from_str::<Vec<String>>(&labels_json) {
+            Ok(labels) => labels,
+            Err(e) => return err_json(format!("invalid labels: {e}")),
+        };
+        with_node(|node| match node.create_issue(rid, &title, &description, labels) {
+            Ok(id) => serde_json::json!({ "id": id }).to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// Comment on an issue.
+#[napi]
+pub fn comment_issue(
+    rid: String,
+    issue_id: String,
+    body: String,
+    reply_to: Option<String>,
+) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        with_node(|node| {
+            match node.comment_issue(rid, &issue_id, &body, reply_to.as_deref()) {
+                Ok(id) => serde_json::json!({ "id": id }).to_string(),
+                Err(e) => err_json(e),
+            }
+        })
+    })
+}
+
+/// Transition an issue state.
+#[napi]
+pub fn edit_issue_state(
+    rid: String,
+    issue_id: String,
+    state: String,
+) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        with_node(|node| match node.edit_issue_state(rid, &issue_id, &state) {
+            Ok(id) => serde_json::json!({ "id": id, "state": state }).to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// Comment on a patch revision.
+#[napi]
+pub fn comment_patch(rid: String, revision_id: String, body: String) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        with_node(|node| match node.comment_patch(rid, &revision_id, &body) {
+            Ok(id) => serde_json::json!({ "id": id }).to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// Import a working Git repository into native Radicle storage.
+#[napi]
+pub fn import_repo(
+    path: String,
+    name: String,
+    description: String,
+    default_branch: String,
+) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        with_node(|node| {
+            match node.import_repo(
+                std::path::Path::new(&path),
+                &name,
+                &description,
+                &default_branch,
+            ) {
+                Ok(rid) => serde_json::json!({ "rid": rid.to_string() }).to_string(),
+                Err(e) => err_json(e),
+            }
+        })
+    })
+}
+
 /// Identity payload + head + COB counts, straight from storage.
 #[napi]
 pub fn repo_info(rid: String) -> AsyncTask<BlockingJson> {

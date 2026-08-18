@@ -40,5 +40,15 @@ pub enum Error {
     #[error(transparent)]
     IssueCache(#[from] radicle::issue::cache::Error),
     #[error(transparent)]
+    Issue(#[from] radicle::issue::Error),
+    #[error(transparent)]
     PatchCache(#[from] radicle::patch::cache::Error),
+    #[error(transparent)]
+    Patch(#[from] radicle::patch::Error),
+    #[error(transparent)]
+    Signer(#[from] radicle::profile::SignerError),
+    #[error(transparent)]
+    Init(#[from] radicle::rad::InitError),
+    #[error(transparent)]
+    Policy(#[from] radicle::node::policy::store::Error),
 }

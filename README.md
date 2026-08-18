@@ -28,15 +28,18 @@ let mut node = Embedded::start(Options {
 })?;
 node.connect_preferred_seeds(Duration::from_secs(15))?;
 node.clone_repo(rid, Duration::from_secs(120))?;   // seed + fetch, bare storage only
+let repos = node.list_repos()?;                    // currently seeded repositories
 let info  = node.repo_info(rid)?;                  // payload, head, COB counts
 let tree  = node.tree(rid, "src")?;                // browse at head
 let blob  = node.read_blob(rid, "README.md")?;
+let issue = node.create_issue(rid, "Title", "Body", vec![])?;
 node.shutdown()?;
 ```
 
-The napi binding (`napi/src/lib.rs`) exposes the same surface to Node.js /
-Electron as JSON-string-returning async functions; `napi/smoke.mjs` is a
-live-network end-to-end test.
+The napi binding (`napi/src/lib.rs`) exposes node lifecycle, identity,
+repository import/list/seed/unseed, storage reads, and issue/patch mutations
+to Node.js / Electron as JSON-string-returning async functions;
+`napi/smoke.mjs` is a live-network end-to-end test.
 
 ## Building
 
