@@ -15,6 +15,11 @@ radicle-signals = { path = "../heartwood/crates/radicle-signals" }
 log = "0.4"
 thiserror = "2"
 
+[features]
+## No child processes anywhere: decline serving fetches, skip git gc.
+## Required for iOS; leave off for desktop, which serves and publishes.
+no-spawn = ["radicle-node/no-serve", "radicle-node/no-gc"]
+
 [dev-dependencies]
 anyhow = "1"
 env_logger = "0.11"

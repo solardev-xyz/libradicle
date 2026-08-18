@@ -20,7 +20,7 @@ use radicle::node::policy::Scope;
 use radicle::node::{ConnectOptions, ConnectResult, FetchResult, Handle as _};
 use radicle::patch::cache::Patches as _;
 use radicle::prelude::*;
-use radicle::profile::{env, Home, Profile};
+use radicle::profile::{Home, Profile};
 use radicle::storage::{ReadRepository, ReadStorage};
 use radicle_node::runtime::handle::Handle as NodeHandle;
 use radicle_node::runtime::Runtime;
@@ -69,13 +69,10 @@ impl Embedded {
     pub fn start(opts: Options) -> Result<Self, Error> {
         let home = Home::new(opts.home.clone())?;
         let profile = if home.keys().join("radicle").exists() {
-            // TODO(fork): add `Profile::load_from(home)` upstream; `load()`
-            // only reads $RAD_HOME. One profile per process is fine for now.
-            env::set_var(env::RAD_HOME, opts.home.as_os_str());
-            Profile::load()?
+            Profile::load_from(home.clone())?
         } else {
             let alias = Alias::new(&opts.alias);
-            let seed = env::seed().unwrap_or_else(|| {
+            let seed = radicle::profile::env::seed().unwrap_or_else(|| {
                 use radicle::crypto::Seed;
                 let mut seed = [0; Seed::BYTES];
                 getrandom::fill(&mut seed).expect("failed to get OS randomness");
