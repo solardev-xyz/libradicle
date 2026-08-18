@@ -7,11 +7,11 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-radicle = { path = "../heartwood/crates/radicle" }
-radicle-node = { path = "../heartwood/crates/radicle-node" }
+radicle = { git = "https://github.com/solardev-xyz/heartwood", rev = "277dbb8cd1efb921e881b86720b1aced298da97d" }
+radicle-node = { git = "https://github.com/solardev-xyz/heartwood", rev = "277dbb8cd1efb921e881b86720b1aced298da97d" }
 getrandom = "0.4"
 git2 = { version = "0.21", default-features = false }
-radicle-signals = { path = "../heartwood/crates/radicle-signals" }
+radicle-signals = { git = "https://github.com/solardev-xyz/heartwood", rev = "277dbb8cd1efb921e881b86720b1aced298da97d" }
 log = "0.4"
 thiserror = "2"
 
