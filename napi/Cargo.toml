@@ -1,0 +1,21 @@
+[package]
+name = "libradicle-napi"
+version = "0.1.0"
+description = "Node.js (napi-rs) binding over libradicle — the Freedom Browser desktop path, replacing radicle-httpd"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+# libradicle.node — loaded by Node via a thin JS loader.
+crate-type = ["cdylib"]
+
+[dependencies]
+libradicle = { path = ".." }
+radicle = { path = "../../heartwood/crates/radicle" }
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+serde_json = "1"
+
+[build-dependencies]
+napi-build = "2"
