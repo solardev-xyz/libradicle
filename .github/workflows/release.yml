@@ -16,17 +16,26 @@ jobs:
       matrix:
         include:
           - { os: macos-14, key: mac-arm64, lib: liblibradicle_napi.dylib }
-          - { os: macos-13, key: mac-x64, lib: liblibradicle_napi.dylib }
+          # Intel macOS runners (macos-13) are deprecated and queue
+          # indefinitely — cross-compile x64 from the arm64 runner instead.
+          - {
+              os: macos-14,
+              key: mac-x64,
+              lib: liblibradicle_napi.dylib,
+              target: x86_64-apple-darwin,
+            }
           - { os: ubuntu-22.04, key: linux-x64, lib: liblibradicle_napi.so }
           - { os: ubuntu-24.04-arm, key: linux-arm64, lib: liblibradicle_napi.so }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target || '' }}
       - uses: Swatinem/rust-cache@v2
       - name: Build napi addon
-        run: cargo build --release -p libradicle-napi
+        run: cargo build --release -p libradicle-napi ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
       - name: Rename artifact
-        run: cp target/release/${{ matrix.lib }} libradicle-${{ matrix.key }}.node
+        run: cp target/${{ matrix.target && format('{0}/', matrix.target) || '' }}release/${{ matrix.lib }} libradicle-${{ matrix.key }}.node
       - uses: actions/upload-artifact@v4
         with:
           name: libradicle-${{ matrix.key }}
