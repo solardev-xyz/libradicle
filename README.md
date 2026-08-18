@@ -4,8 +4,7 @@ An **embeddable Radicle facade**: one Rust crate that runs a full
 [Radicle](https://radicle.xyz) node in-process — profile, storage, and the
 heartwood node runtime on a background thread — and exposes the small API a
 host application actually needs. No `radicle-node` daemon, no
-`radicle-httpd`, no localhost REST API, no child processes on the client
-path.
+`radicle-httpd`, no localhost REST API, and no Radicle CLI on the client path.
 
 Built as the shared core for [Freedom Browser](https://github.com/solardev-xyz/freedom-browser):
 the desktop app embeds it via the napi-rs binding in [`napi/`](napi/), and
@@ -21,7 +20,7 @@ the iOS app will embed the same crate via UniFFI.
 ## API sketch
 
 ```rust
-let mut node = Embedded::start(Options {
+let node = Embedded::start(Options {
     home: "/path/to/radicle-home".into(),
     alias: "my-app".into(),
     listen: vec![],            // outbound-only
@@ -35,6 +34,10 @@ let blob  = node.read_blob(rid, "README.md")?;
 let issue = node.create_issue(rid, "Title", "Body", vec![])?;
 node.shutdown()?;
 ```
+
+COB mutations announce the updated refs before returning. The napi binding
+also runs connect and fetch operations through a cloned network handle, so
+long network requests do not block repository reads or status calls.
 
 The napi binding (`napi/src/lib.rs`) exposes node lifecycle, identity,
 repository import/list/seed/unseed, storage reads, and issue/patch mutations
@@ -63,11 +66,14 @@ radicle-signals = { path = "../heartwood/crates/radicle-signals" }
 
 ## Features
 
-- `no-spawn` — zero child processes: declines to serve inbound fetches and
-  skips `git gc`. Required on iOS (which forbids spawning); leave **off**
+- `no-spawn` — the node runtime starts no child processes: it declines to
+  serve inbound fetches and skips `git gc`. Required on iOS; leave **off**
   on desktop, where the node serves and publishes normally. Publishing
   from a `no-spawn` build is not possible until in-process upload-pack
   lands (follow-up work).
+- `import_repo` is desktop-only: heartwood currently invokes the system
+  `git` executable to push a working copy into storage. Omit this method from
+  iOS bindings until that push is implemented in-process.
 
 ## License
 

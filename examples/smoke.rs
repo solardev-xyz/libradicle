@@ -21,7 +21,7 @@ fn main() -> anyhow::Result<()> {
         .parse()
         .expect("invalid RID");
 
-    let mut node = Embedded::start(Options {
+    let node = Embedded::start(Options {
         home: home.into(),
         alias: "libradicle-smoke".into(),
         listen: vec![],

@@ -13,7 +13,7 @@ use napi::bindgen_prelude::AsyncTask;
 use napi::{Env, Result, Task};
 use napi_derive::napi;
 
-use libradicle::{Embedded, Options};
+use libradicle::{Embedded, Network, Options};
 
 static NODE: Mutex<Option<Embedded>> = Mutex::new(None);
 
@@ -58,9 +58,18 @@ fn with_node(f: impl FnOnce(&mut Embedded) -> String) -> String {
     }
 }
 
+fn network() -> std::result::Result<Network, String> {
+    match NODE.lock() {
+        Ok(guard) => guard
+            .as_ref()
+            .map(Embedded::network)
+            .ok_or_else(|| "node not started".to_string()),
+        Err(_) => Err("node lock poisoned".to_string()),
+    }
+}
+
 fn parse_rid(rid: &str) -> std::result::Result<radicle::identity::RepoId, String> {
-    rid.parse()
-        .map_err(|e| format!("invalid RID {rid:?}: {e}"))
+    rid.parse().map_err(|e| format!("invalid RID {rid:?}: {e}"))
 }
 
 /// Start the embedded node with a profile at `home`. Resolves to
@@ -94,12 +103,14 @@ pub fn start(home: String, alias: String) -> AsyncTask<BlockingJson> {
 #[napi]
 pub fn connect_seeds(timeout_ms: u32) -> AsyncTask<BlockingJson> {
     blocking(move || {
-        with_node(|node| {
-            match node.connect_preferred_seeds(Duration::from_millis(timeout_ms.into())) {
-                Ok(n) => serde_json::json!({ "connected": n }).to_string(),
-                Err(e) => err_json(e),
-            }
-        })
+        let mut network = match network() {
+            Ok(network) => network,
+            Err(e) => return err_json(e),
+        };
+        match network.connect_preferred_seeds(Duration::from_millis(timeout_ms.into())) {
+            Ok(n) => serde_json::json!({ "connected": n }).to_string(),
+            Err(e) => err_json(e),
+        }
     })
 }
 
@@ -111,12 +122,14 @@ pub fn clone_repo(rid: String, timeout_ms: u32) -> AsyncTask<BlockingJson> {
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(
-            |node| match node.clone_repo(rid, Duration::from_millis(timeout_ms.into())) {
-                Ok(()) => r#"{"ok":true}"#.to_string(),
-                Err(e) => err_json(e),
-            },
-        )
+        let mut network = match network() {
+            Ok(network) => network,
+            Err(e) => return err_json(e),
+        };
+        match network.clone_repo(rid, Duration::from_millis(timeout_ms.into())) {
+            Ok(()) => r#"{"ok":true}"#.to_string(),
+            Err(e) => err_json(e),
+        }
     })
 }
 
@@ -187,10 +200,12 @@ pub fn create_issue(
             Ok(labels) => labels,
             Err(e) => return err_json(format!("invalid labels: {e}")),
         };
-        with_node(|node| match node.create_issue(rid, &title, &description, labels) {
-            Ok(id) => serde_json::json!({ "id": id }).to_string(),
-            Err(e) => err_json(e),
-        })
+        with_node(
+            |node| match node.create_issue(rid, &title, &description, labels) {
+                Ok(id) => serde_json::json!({ "id": id }).to_string(),
+                Err(e) => err_json(e),
+            },
+        )
     })
 }
 
@@ -207,22 +222,18 @@ pub fn comment_issue(
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(|node| {
-            match node.comment_issue(rid, &issue_id, &body, reply_to.as_deref()) {
+        with_node(
+            |node| match node.comment_issue(rid, &issue_id, &body, reply_to.as_deref()) {
                 Ok(id) => serde_json::json!({ "id": id }).to_string(),
                 Err(e) => err_json(e),
-            }
-        })
+            },
+        )
     })
 }
 
 /// Transition an issue state.
 #[napi]
-pub fn edit_issue_state(
-    rid: String,
-    issue_id: String,
-    state: String,
-) -> AsyncTask<BlockingJson> {
+pub fn edit_issue_state(rid: String, issue_id: String, state: String) -> AsyncTask<BlockingJson> {
     blocking(move || {
         let rid = match parse_rid(&rid) {
             Ok(r) => r,

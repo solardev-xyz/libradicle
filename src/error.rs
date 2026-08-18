@@ -31,6 +31,8 @@ pub enum Error {
     FetchFailed(RepoId, String),
     #[error("node thread: {0}")]
     NodeThread(String),
+    #[error("invalid collaborative object id {0:?}")]
+    InvalidCobId(String),
     #[error("not a directory: {0}")]
     NotATree(String),
     #[error("not a file: {0}")]
