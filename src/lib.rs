@@ -8,7 +8,7 @@
 //! This is the shared core for the Freedom Browser desktop (napi-rs)
 //! and iOS (UniFFI) bindings.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -213,11 +213,14 @@ impl Embedded {
             .secret_key(None)?
             .ok_or_else(|| Error::NodeThread("secret key not found in keystore".into()))?;
 
+        let socket = profile.home.socket_from_env();
+        prepare_control_socket(&socket)?;
+
         let (sig_tx, sig_rx) = mpsc::channel();
         let runtime = Runtime::init(
             profile.home.clone(),
             profile.config.node.clone(),
-            profile.home.socket_from_env(),
+            socket,
             opts.listen.clone(),
             sig_rx,
             signer,
@@ -543,6 +546,43 @@ impl Embedded {
     }
 }
 
+/// Remove a Unix control socket left behind by an unclean process exit.
+///
+/// A successful connection means another node really is listening, so the
+/// path is preserved and `Runtime::init` reports `AlreadyRunning`. We only
+/// remove an existing socket after the kernel confirms that nobody accepts
+/// connections on it; regular files and other path types are never touched.
+#[cfg(unix)]
+fn prepare_control_socket(path: &Path) -> Result<(), Error> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::FileTypeExt as _;
+    use std::os::unix::net::UnixStream;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    if !metadata.file_type().is_socket() {
+        return Ok(());
+    }
+
+    match UnixStream::connect(path) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::ConnectionRefused => {
+            std::fs::remove_file(path)?;
+            Ok(())
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(_) => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+fn prepare_control_socket(_path: &Path) -> Result<(), Error> {
+    Ok(())
+}
+
 fn validate_cob_id(id: &str) -> Result<(), Error> {
     if (6..=40).contains(&id.len())
         && id
@@ -557,7 +597,65 @@ fn validate_cob_id(id: &str) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_cob_id;
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{prepare_control_socket, validate_cob_id};
+
+    #[cfg(unix)]
+    fn socket_test_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is before Unix epoch")
+            .as_nanos();
+        let path =
+            PathBuf::from("/tmp").join(format!("libradicle-{name}-{}-{nonce}", std::process::id()));
+        fs::create_dir(&path).expect("create socket test directory");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_removes_only_stale_control_sockets() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = socket_test_dir("stale-socket");
+        let socket = dir.join("control.sock");
+        let listener = UnixListener::bind(&socket).expect("bind stale socket");
+        drop(listener);
+
+        prepare_control_socket(&socket).expect("remove stale socket");
+
+        assert!(!socket.exists());
+        fs::remove_dir(dir).expect("remove socket test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_preserves_live_control_sockets_and_regular_files() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = socket_test_dir("live-socket");
+        let socket = dir.join("control.sock");
+        let listener = UnixListener::bind(&socket).expect("bind live socket");
+
+        prepare_control_socket(&socket).expect("probe live socket");
+        assert!(socket.exists());
+
+        let regular_file = dir.join("not-a-socket");
+        fs::write(&regular_file, b"keep").expect("create regular file");
+        prepare_control_socket(&regular_file).expect("inspect regular file");
+        assert_eq!(fs::read(&regular_file).expect("read regular file"), b"keep");
+
+        drop(listener);
+        fs::remove_file(socket).expect("remove live socket");
+        fs::remove_file(regular_file).expect("remove regular file");
+        fs::remove_dir(dir).expect("remove socket test directory");
+    }
 
     #[test]
     fn cob_ids_accept_only_lowercase_hex_object_ids() {
