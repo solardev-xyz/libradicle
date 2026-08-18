@@ -31,6 +31,10 @@ pub enum Error {
     FetchFailed(RepoId, String),
     #[error("node thread: {0}")]
     NodeThread(String),
+    #[error("not a directory: {0}")]
+    NotATree(String),
+    #[error("not a file: {0}")]
+    NotABlob(String),
     #[error(transparent)]
     Cob(#[from] radicle::cob::store::Error),
     #[error(transparent)]

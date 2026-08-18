@@ -159,6 +159,83 @@ pub fn list_files(rid: String) -> AsyncTask<BlockingJson> {
     })
 }
 
+/// Tree entries at the head of the default branch, httpd-shaped:
+/// `{"entries":[{"name","path","kind"}]}`.
+#[napi]
+pub fn tree(rid: String, path: String) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        with_node(|node| match node.tree(rid, &path) {
+            Ok(entries) => serde_json::json!({
+                "entries": entries.iter().map(|e| serde_json::json!({
+                    "name": e.name,
+                    "path": e.path,
+                    "kind": e.kind,
+                })).collect::<Vec<_>>(),
+            })
+            .to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// Blob at the head of the default branch, httpd-shaped:
+/// `{"binary":bool,"content":"...","name":"..."}`. Binary blobs omit
+/// content (the viewer renders a placeholder for them).
+#[napi]
+pub fn blob(rid: String, path: String) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        with_node(|node| match node.read_blob(rid, &path) {
+            Ok(b) if b.binary => serde_json::json!({
+                "binary": true,
+                "name": name,
+            })
+            .to_string(),
+            Ok(b) => serde_json::json!({
+                "binary": false,
+                "name": name,
+                "content": String::from_utf8_lossy(&b.content),
+            })
+            .to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// Node status: `{"connectedPeers": n}`.
+#[napi]
+pub fn status() -> AsyncTask<BlockingJson> {
+    blocking(|| {
+        with_node(|node| match node.connected_peers() {
+            Ok(n) => serde_json::json!({ "connectedPeers": n }).to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// Number of known seeders for a repo: `{"seeding": n}`.
+#[napi]
+pub fn seeders(rid: String) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        with_node(|node| match node.seeders(rid) {
+            Ok(n) => serde_json::json!({ "seeding": n }).to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
 /// Gracefully stop the node and join its thread. Resolves to `{"ok": true}`.
 #[napi]
 pub fn shutdown() -> AsyncTask<BlockingJson> {

@@ -51,6 +51,22 @@ pub struct RepoInfo {
     pub patches_open: usize,
 }
 
+/// One entry in a repository tree listing.
+#[derive(Debug, Clone)]
+pub struct TreeEntry {
+    pub name: String,
+    pub path: String,
+    /// "tree" | "blob" | "submodule"
+    pub kind: String,
+}
+
+/// Blob content read from storage.
+#[derive(Debug, Clone)]
+pub struct Blob {
+    pub binary: bool,
+    pub content: Vec<u8>,
+}
+
 /// An embedded Radicle stack: profile + in-process node.
 pub struct Embedded {
     profile: Profile,
@@ -234,6 +250,75 @@ impl Embedded {
             git2::TreeWalkResult::Ok
         })?;
         Ok(files)
+    }
+
+    /// Number of currently connected peer sessions.
+    pub fn connected_peers(&self) -> Result<usize, Error> {
+        let sessions = self.handle.sessions()?;
+        Ok(sessions
+            .iter()
+            .filter(|s| matches!(s.state, radicle::node::State::Connected { .. }))
+            .count())
+    }
+
+    /// Number of nodes known to seed the given repository.
+    pub fn seeders(&mut self, rid: RepoId) -> Result<usize, Error> {
+        Ok(self.handle.seeds_for(rid, [*self.profile.did()])?.len())
+    }
+
+    /// Entries of the tree at the head of the default branch, under
+    /// `path` (empty = repository root).
+    pub fn tree(&self, rid: RepoId, path: &str) -> Result<Vec<TreeEntry>, Error> {
+        let repo = self.profile.storage.repository(rid)?;
+        let (_, head) = repo.head()?;
+        let commit = repo.backend.find_commit(head.into())?;
+        let root = commit.tree()?;
+        let tree = if path.is_empty() {
+            root
+        } else {
+            let entry = root.get_path(std::path::Path::new(path))?;
+            entry
+                .to_object(&repo.backend)?
+                .into_tree()
+                .map_err(|_| Error::NotATree(path.to_string()))?
+        };
+        let prefix = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", path.trim_end_matches('/'))
+        };
+        Ok(tree
+            .iter()
+            .map(|e| {
+                let name = e.name().unwrap_or("?").to_string();
+                let kind = match e.kind() {
+                    Some(git2::ObjectType::Tree) => "tree",
+                    Some(git2::ObjectType::Commit) => "submodule",
+                    _ => "blob",
+                };
+                TreeEntry {
+                    path: format!("{prefix}{name}"),
+                    name,
+                    kind: kind.to_string(),
+                }
+            })
+            .collect())
+    }
+
+    /// Blob content at the head of the default branch.
+    pub fn read_blob(&self, rid: RepoId, path: &str) -> Result<Blob, Error> {
+        let repo = self.profile.storage.repository(rid)?;
+        let (_, head) = repo.head()?;
+        let commit = repo.backend.find_commit(head.into())?;
+        let entry = commit.tree()?.get_path(std::path::Path::new(path))?;
+        let blob = entry
+            .to_object(&repo.backend)?
+            .into_blob()
+            .map_err(|_| Error::NotABlob(path.to_string()))?;
+        Ok(Blob {
+            binary: blob.is_binary(),
+            content: blob.content().to_vec(),
+        })
     }
 
     /// Gracefully shut the node down and join its thread.
