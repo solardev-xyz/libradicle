@@ -52,6 +52,9 @@ pub struct RepoInfo {
     pub description: String,
     pub default_branch: String,
     pub head: String,
+    pub delegates: Vec<String>,
+    pub threshold: usize,
+    pub visibility: Visibility,
     pub issues_open: usize,
     pub patches_open: usize,
 }
@@ -292,10 +295,11 @@ impl Embedded {
         Ok(self.profile.signer()?)
     }
 
-    fn announce_refs(&self, rid: RepoId) -> Result<(), Error> {
+    fn announce_refs(&self, rid: RepoId) {
         let mut handle = self.handle.clone();
-        handle.announce_refs_for(rid, [*self.profile.did()])?;
-        Ok(())
+        if let Err(err) = handle.announce_refs_for(rid, [*self.profile.did()]) {
+            log::warn!(target: "libradicle", "announce refs for {rid}: {err}");
+        }
     }
 
     /// Create an issue directly in the repository's COB store.
@@ -317,7 +321,7 @@ impl Embedded {
             .map_err(|e| Error::NodeThread(e.to_string()))?;
         let issue = issues.create(title, description, &labels, &[], [])?;
         let id = issue.id().to_string();
-        self.announce_refs(rid)?;
+        self.announce_refs(rid);
         Ok(id)
     }
 
@@ -343,7 +347,7 @@ impl Embedded {
             None => *issue.root().0,
         };
         let id = issue.comment(body, parent, [])?.to_string();
-        self.announce_refs(rid)?;
+        self.announce_refs(rid);
         Ok(id)
     }
 
@@ -371,7 +375,7 @@ impl Embedded {
         };
         let mut issue = issues.get_mut(&issue_id)?;
         issue.lifecycle(state)?;
-        self.announce_refs(rid)?;
+        self.announce_refs(rid);
         Ok(issue_id.to_string())
     }
 
@@ -395,7 +399,7 @@ impl Embedded {
         let id = patch
             .comment(revision_id, body, None, None, [])?
             .to_string();
-        self.announce_refs(rid)?;
+        self.announce_refs(rid);
         Ok(id)
     }
 
@@ -423,8 +427,56 @@ impl Embedded {
         )?;
         self.handle.seed(rid, Scope::All)?;
         self.handle.add_inventory(rid)?;
-        self.announce_refs(rid)?;
+        self.announce_refs(rid);
         Ok(rid)
+    }
+
+    /// Read all issues in repository storage.
+    pub fn issues(&self, rid: RepoId) -> Result<Vec<(cob::ObjectId, cob::issue::Issue)>, Error> {
+        let repo = self.profile.storage.repository(rid)?;
+        let issues = self.profile.issues(&repo)?;
+        let result = issues.list()?.collect::<Result<Vec<_>, _>>()?;
+        Ok(result)
+    }
+
+    /// Read one issue from repository storage.
+    pub fn issue(
+        &self,
+        rid: RepoId,
+        issue_id: &str,
+    ) -> Result<(cob::ObjectId, cob::issue::Issue), Error> {
+        validate_cob_id(issue_id)?;
+        let repo = self.profile.storage.repository(rid)?;
+        let id: cob::ObjectId = repo.backend.revparse_single(issue_id)?.id().into();
+        let issues = self.profile.issues(&repo)?;
+        issues
+            .get(&id)?
+            .map(|issue| (id, issue))
+            .ok_or_else(|| Error::NodeThread(format!("issue {issue_id} not found")))
+    }
+
+    /// Read all patches in repository storage.
+    pub fn patches(&self, rid: RepoId) -> Result<Vec<(cob::ObjectId, cob::patch::Patch)>, Error> {
+        let repo = self.profile.storage.repository(rid)?;
+        let patches = self.profile.patches(&repo)?;
+        let result = patches.list()?.collect::<Result<Vec<_>, _>>()?;
+        Ok(result)
+    }
+
+    /// Read one patch from repository storage.
+    pub fn patch(
+        &self,
+        rid: RepoId,
+        patch_id: &str,
+    ) -> Result<(cob::ObjectId, cob::patch::Patch), Error> {
+        validate_cob_id(patch_id)?;
+        let repo = self.profile.storage.repository(rid)?;
+        let id: cob::ObjectId = repo.backend.revparse_single(patch_id)?.id().into();
+        let patches = self.profile.patches(&repo)?;
+        patches
+            .get(&id)?
+            .map(|patch| (id, patch))
+            .ok_or_else(|| Error::NodeThread(format!("patch {patch_id} not found")))
     }
 
     /// Read a repository's identity payload + head from local storage.
@@ -443,6 +495,14 @@ impl Embedded {
             description: proj.description().to_string(),
             default_branch: proj.default_branch().to_string(),
             head: head.to_string(),
+            delegates: doc
+                .delegates()
+                .as_ref()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            threshold: doc.threshold(),
+            visibility: doc.visibility().clone(),
             issues_open: issues.counts()?.open,
             patches_open: patches.counts()?.open,
         })

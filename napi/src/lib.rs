@@ -72,6 +72,86 @@ fn parse_rid(rid: &str) -> std::result::Result<radicle::identity::RepoId, String
     rid.parse().map_err(|e| format!("invalid RID {rid:?}: {e}"))
 }
 
+fn comment_json<L>(
+    id: &radicle::cob::EntryId,
+    comment: &radicle::cob::thread::Comment<L>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id.to_string(),
+        "author": radicle::cob::common::Author::new(comment.author()),
+        "body": comment.body(),
+        "timestamp": comment.timestamp(),
+        "replyTo": comment.reply_to().map(|id| id.to_string()),
+    })
+}
+
+fn issue_json(
+    id: &radicle::cob::ObjectId,
+    issue: &radicle::cob::issue::Issue,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id.to_string(),
+        "author": issue.author(),
+        "title": issue.title(),
+        "state": issue.state(),
+        "labels": issue.labels().map(ToString::to_string).collect::<Vec<_>>(),
+        "assignees": issue.assignees().map(ToString::to_string).collect::<Vec<_>>(),
+        "discussion": issue.comments().map(|(id, comment)| comment_json(id, comment)).collect::<Vec<_>>(),
+    })
+}
+
+fn patch_json(
+    id: &radicle::cob::ObjectId,
+    patch: &radicle::cob::patch::Patch,
+) -> serde_json::Value {
+    let revisions = patch
+        .revisions()
+        .map(|(id, revision)| {
+            serde_json::json!({
+                "id": id.to_string(),
+                "author": revision.author(),
+                "description": revision.description(),
+                "base": revision.base().to_string(),
+                "oid": revision.head().to_string(),
+                "timestamp": revision.timestamp(),
+                "discussions": revision.discussion().comments()
+                    .map(|(id, comment)| comment_json(id, comment))
+                    .collect::<Vec<_>>(),
+                "reviews": revision.reviews().map(|(_, review)| serde_json::json!({
+                    "id": review.id().to_string(),
+                    "author": review.author(),
+                    "verdict": review.verdict().map(|verdict| verdict.to_string()),
+                    "summary": review.summary(),
+                    "timestamp": review.timestamp(),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let merges = patch
+        .merges()
+        .map(|(author, merge)| {
+            serde_json::json!({
+                "author": radicle::cob::common::Author::new(author),
+                "revision": merge.revision.to_string(),
+                "commit": merge.commit.to_string(),
+                "timestamp": merge.timestamp,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "id": id.to_string(),
+        "author": patch.author(),
+        "title": patch.title(),
+        "state": patch.state(),
+        "target": patch.target(),
+        "labels": patch.labels().map(ToString::to_string).collect::<Vec<_>>(),
+        "assignees": patch.assignees().map(|did| did.to_string()).collect::<Vec<_>>(),
+        "revisions": revisions,
+        "merges": merges,
+    })
+}
+
 /// Start the embedded node with a profile at `home`. Resolves to
 /// `{"did": "..."}` once the node thread is up.
 #[napi]
@@ -178,6 +258,74 @@ pub fn list_repos() -> AsyncTask<BlockingJson> {
                 }))
                 .collect::<Vec<_>>())
             .to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// All issues in a repository, in radicle-httpd-compatible JSON shape.
+#[napi]
+pub fn issues(rid: String) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        with_node(|node| match node.issues(rid) {
+            Ok(issues) => serde_json::json!(issues
+                .iter()
+                .map(|(id, issue)| issue_json(id, issue))
+                .collect::<Vec<_>>())
+            .to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// One issue in radicle-httpd-compatible JSON shape.
+#[napi]
+pub fn issue(rid: String, issue_id: String) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        with_node(|node| match node.issue(rid, &issue_id) {
+            Ok((id, issue)) => issue_json(&id, &issue).to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// All patches in a repository, in radicle-httpd-compatible JSON shape.
+#[napi]
+pub fn patches(rid: String) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        with_node(|node| match node.patches(rid) {
+            Ok(patches) => serde_json::json!(patches
+                .iter()
+                .map(|(id, patch)| patch_json(id, patch))
+                .collect::<Vec<_>>())
+            .to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// One patch in radicle-httpd-compatible JSON shape.
+#[napi]
+pub fn patch(rid: String, patch_id: String) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        with_node(|node| match node.patch(rid, &patch_id) {
+            Ok((id, patch)) => patch_json(&id, &patch).to_string(),
             Err(e) => err_json(e),
         })
     })
@@ -299,6 +447,9 @@ pub fn repo_info(rid: String) -> AsyncTask<BlockingJson> {
                 "description": info.description,
                 "defaultBranch": info.default_branch,
                 "head": info.head,
+                "delegates": info.delegates,
+                "threshold": info.threshold,
+                "visibility": info.visibility,
                 "issuesOpen": info.issues_open,
                 "patchesOpen": info.patches_open,
             })
