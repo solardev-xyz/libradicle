@@ -9,9 +9,10 @@
 //! and iOS (UniFFI) bindings.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use radicle::cob;
 use radicle::cob::common::Label;
@@ -94,6 +95,113 @@ pub struct Network {
     handle: NodeHandle,
 }
 
+/// A progress event emitted while cloning/fetching a repository.
+///
+/// These are the peer-level ("Tier 1") transitions the clone loop drives
+/// itself; byte-level object counts are a separate, later addition that
+/// requires node-side plumbing.
+#[derive(Debug, Clone)]
+pub enum Progress {
+    /// Candidate seeds resolved; the fetch is about to begin.
+    Resolving { candidates: usize },
+    /// Connecting to a candidate seed (1-based `index` of `total`).
+    Connecting {
+        nid: String,
+        addr: String,
+        index: usize,
+        total: usize,
+    },
+    /// Fetching pack data from a connected seed.
+    Fetching {
+        nid: String,
+        index: usize,
+        total: usize,
+    },
+    /// A candidate failed; the loop advances to the next.
+    PeerFailed {
+        nid: String,
+        index: usize,
+        total: usize,
+        reason: String,
+    },
+    /// The fetch completed successfully.
+    Done,
+    /// The fetch failed after exhausting candidates or timing out.
+    Failed { reason: String },
+    /// The fetch was cancelled by the host.
+    Cancelled,
+}
+
+impl Progress {
+    /// A stable `phase` tag for this event (host-facing).
+    pub fn phase(&self) -> &'static str {
+        match self {
+            Progress::Resolving { .. } => "resolving",
+            Progress::Connecting { .. } => "connecting",
+            Progress::Fetching { .. } => "fetching",
+            Progress::PeerFailed { .. } => "peer-failed",
+            Progress::Done => "done",
+            Progress::Failed { .. } => "failed",
+            Progress::Cancelled => "cancelled",
+        }
+    }
+
+}
+
+/// Retry and timeout policy for a clone/fetch.
+#[derive(Debug, Clone)]
+pub struct FetchPolicy {
+    /// Overall wall-clock budget for the whole clone across all candidates.
+    pub overall_timeout: Duration,
+    /// Per-attempt timeout handed to the node's fetch command.
+    pub peer_timeout: Duration,
+    /// Retries per candidate while its session is still coming up
+    /// ("not connected"); other failures advance immediately.
+    pub max_retries_per_peer: u32,
+    /// Delay between per-peer retries.
+    pub backoff: Duration,
+}
+
+impl Default for FetchPolicy {
+    fn default() -> Self {
+        Self {
+            overall_timeout: Duration::from_secs(120),
+            peer_timeout: Duration::from_secs(60),
+            max_retries_per_peer: 240, // ~2 min of 500ms handshake polling
+            backoff: Duration::from_millis(500),
+        }
+    }
+}
+
+impl FetchPolicy {
+    /// Policy from a single overall timeout, keeping sensible defaults for
+    /// the rest (used by the legacy `clone_repo(rid, timeout)` entry point).
+    pub fn from_timeout(timeout: Duration) -> Self {
+        Self {
+            overall_timeout: timeout,
+            peer_timeout: timeout,
+            ..Self::default()
+        }
+    }
+}
+
+/// A cheap, cloneable cancellation flag shared with a running clone.
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Request cancellation of the associated clone.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 impl Network {
     /// Connect to the profile's configured preferred seeds.
     /// Returns the number of seeds successfully connected.
@@ -119,6 +227,46 @@ impl Network {
     /// Seed + fetch a repository from the network into local storage.
     /// No working copy is created; the bare repo in storage is the product.
     pub fn clone_repo(&mut self, rid: RepoId, timeout: Duration) -> Result<(), Error> {
+        self.clone_repo_with(
+            rid,
+            &FetchPolicy::from_timeout(timeout),
+            &CancelToken::new(),
+            &mut |_| {},
+        )
+    }
+
+    /// Seed + fetch a repository, streaming [`Progress`] to `progress` and
+    /// honoring `cancel`. Retry/timeout behavior comes from `policy`.
+    ///
+    /// The per-peer fetch is a blocking node command that cannot be
+    /// interrupted mid-transfer, so cancellation is observed between
+    /// candidates and during handshake-retry backoff — prompt in practice
+    /// since a stuck peer sits in the backoff loop.
+    pub fn clone_repo_with(
+        &mut self,
+        rid: RepoId,
+        policy: &FetchPolicy,
+        cancel: &CancelToken,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<(), Error> {
+        let result = self.run_clone(rid, policy, cancel, progress);
+        match &result {
+            Ok(()) => progress(Progress::Done),
+            Err(Error::Cancelled) => progress(Progress::Cancelled),
+            Err(e) => progress(Progress::Failed {
+                reason: e.to_string(),
+            }),
+        }
+        result
+    }
+
+    fn run_clone(
+        &mut self,
+        rid: RepoId,
+        policy: &FetchPolicy,
+        cancel: &CancelToken,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<(), Error> {
         self.handle.seed(rid, Scope::All)?;
 
         // Try nodes that are known to seed this repo, preferring connected ones.
@@ -141,36 +289,85 @@ impl Network {
         if candidates.is_empty() {
             return Err(Error::NoSeeds(rid));
         }
+        progress(Progress::Resolving {
+            candidates: candidates.len(),
+        });
+
+        // Addresses for nicer "Connecting to <host>" progress labels.
+        let addr_of = |nid: &NodeId| -> String {
+            self.profile
+                .config
+                .preferred_seeds
+                .iter()
+                .find(|s| s.id == *nid)
+                .map(|s| s.addr.to_string())
+                .unwrap_or_else(|| nid.to_string())
+        };
+
+        let total = candidates.len();
         let mut last_err: Option<String> = None;
-        let deadline = std::time::Instant::now() + timeout;
-        for nid in candidates {
-            // Session handshakes complete asynchronously after `connect`
-            // returns; retry while the peer is still coming up.
+        let deadline = Instant::now() + policy.overall_timeout;
+
+        for (i, nid) in candidates.into_iter().enumerate() {
+            let index = i + 1;
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout(rid));
+            }
+            progress(Progress::Connecting {
+                nid: nid.to_string(),
+                addr: addr_of(&nid),
+                index,
+                total,
+            });
+
+            let mut retries = 0u32;
+            let mut announced_fetching = false;
             loop {
-                match self.handle.fetch(rid, nid, timeout, None) {
-                    Ok(FetchResult::Success { .. }) => return Ok(()),
-                    Ok(FetchResult::Failed { reason }) => {
-                        let retryable = reason.contains("not connected");
-                        log::warn!(target: "libradicle", "fetch {rid} from {nid}: {reason}");
-                        last_err = Some(reason);
-                        if retryable && std::time::Instant::now() < deadline {
-                            std::thread::sleep(Duration::from_millis(500));
-                            continue;
-                        }
-                        break;
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        let retryable = msg.contains("not connected");
-                        log::warn!(target: "libradicle", "fetch {rid} from {nid}: {msg}");
-                        last_err = Some(msg);
-                        if retryable && std::time::Instant::now() < deadline {
-                            std::thread::sleep(Duration::from_millis(500));
-                            continue;
-                        }
-                        break;
-                    }
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
                 }
+                if Instant::now() >= deadline {
+                    return Err(Error::Timeout(rid));
+                }
+                // Emit "fetching" once per peer; the "not connected" retries
+                // below are handshake waiting, not repeated fetches.
+                if !announced_fetching {
+                    progress(Progress::Fetching { nid: nid.to_string(), index, total });
+                    announced_fetching = true;
+                }
+
+                let outcome = self.handle.fetch(rid, nid, policy.peer_timeout, None);
+                let reason = match outcome {
+                    Ok(FetchResult::Success { .. }) => return Ok(()),
+                    Ok(FetchResult::Failed { reason }) => reason,
+                    Err(e) => e.to_string(),
+                };
+                log::warn!(target: "libradicle", "fetch {rid} from {nid}: {reason}");
+                last_err = Some(reason.clone());
+
+                // "not connected" means the session is still handshaking;
+                // retry the same peer with backoff up to the cap.
+                let retryable = reason.contains("not connected")
+                    && retries < policy.max_retries_per_peer
+                    && Instant::now() + policy.backoff < deadline;
+                if retryable {
+                    retries += 1;
+                    if cancel_sleep(&policy.backoff, cancel) {
+                        return Err(Error::Cancelled);
+                    }
+                    continue;
+                }
+
+                progress(Progress::PeerFailed {
+                    nid: nid.to_string(),
+                    index,
+                    total,
+                    reason,
+                });
+                break;
             }
         }
         Err(Error::FetchFailed(
@@ -178,6 +375,20 @@ impl Network {
             last_err.unwrap_or_else(|| "no candidate succeeded".into()),
         ))
     }
+}
+
+/// Sleep for `dur` but wake early if cancellation is requested.
+/// Returns true if cancellation was observed.
+fn cancel_sleep(dur: &Duration, cancel: &CancelToken) -> bool {
+    let step = Duration::from_millis(50);
+    let end = Instant::now() + *dur;
+    while Instant::now() < end {
+        if cancel.is_cancelled() {
+            return true;
+        }
+        std::thread::sleep(step.min(end.saturating_duration_since(Instant::now())));
+    }
+    cancel.is_cancelled()
 }
 
 /// An embedded Radicle stack: profile + in-process node.
@@ -272,6 +483,17 @@ impl Embedded {
     /// No working copy is created; the bare repo in storage is the product.
     pub fn clone_repo(&self, rid: RepoId, timeout: Duration) -> Result<(), Error> {
         self.network().clone_repo(rid, timeout)
+    }
+
+    /// Seed + fetch with streamed [`Progress`] and cancellation.
+    pub fn clone_repo_with(
+        &self,
+        rid: RepoId,
+        policy: &FetchPolicy,
+        cancel: &CancelToken,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<(), Error> {
+        self.network().clone_repo_with(rid, policy, cancel, progress)
     }
 
     /// Stop seeding a repository. The bare repository remains in storage.
@@ -665,6 +887,44 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{prepare_control_socket, validate_cob_id};
+    use super::{CancelToken, FetchPolicy, Progress};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn cancel_token_flips() {
+        let t = CancelToken::new();
+        assert!(!t.is_cancelled());
+        let clone = t.clone();
+        clone.cancel();
+        assert!(t.is_cancelled(), "cancel must be visible across clones");
+    }
+
+    #[test]
+    fn policy_from_timeout_keeps_defaults() {
+        let p = FetchPolicy::from_timeout(Duration::from_secs(30));
+        assert_eq!(p.overall_timeout, Duration::from_secs(30));
+        assert_eq!(p.peer_timeout, Duration::from_secs(30));
+        assert_eq!(p.backoff, FetchPolicy::default().backoff);
+    }
+
+    #[test]
+    fn progress_phase_tags_are_stable() {
+        assert_eq!(Progress::Done.phase(), "done");
+        assert_eq!(Progress::Cancelled.phase(), "cancelled");
+        assert_eq!(Progress::Resolving { candidates: 2 }.phase(), "resolving");
+    }
+
+    #[test]
+    fn cancel_sleep_wakes_early() {
+        let t = CancelToken::new();
+        t.cancel();
+        let start = Instant::now();
+        assert!(super::cancel_sleep(&Duration::from_secs(5), &t));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "must not sleep the full duration"
+        );
+    }
 
     #[cfg(unix)]
     fn socket_test_dir(name: &str) -> PathBuf {

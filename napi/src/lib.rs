@@ -6,16 +6,28 @@
 //! process owns exactly one Radicle profile at a time, so a singleton is
 //! the honest shape — a second `start` without `shutdown` is an error.
 
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use napi::bindgen_prelude::AsyncTask;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Result, Task};
 use napi_derive::napi;
 
-use libradicle::{Embedded, Network, Options};
+use libradicle::{CancelToken, Embedded, FetchPolicy, Network, Options, Progress};
 
 static NODE: Mutex<Option<Embedded>> = Mutex::new(None);
+
+/// In-flight clone cancellation tokens, keyed by full RID. Registered when
+/// a progress clone starts and removed when it finishes; `cancel_clone`
+/// flips the matching token.
+static CANCELS: LazyLock<Mutex<HashMap<String, CancelToken>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A JS `(event: string) => void` progress callback. Non-callee-handled:
+/// JS receives the JSON string directly, no error tuple.
+type ProgressCb = ThreadsafeFunction<String, (), String, napi::Status, false>;
 
 fn err_json(e: impl std::fmt::Display) -> String {
     serde_json::json!({ "error": e.to_string() }).to_string()
@@ -70,6 +82,27 @@ fn network() -> std::result::Result<Network, String> {
 
 fn parse_rid(rid: &str) -> std::result::Result<radicle::identity::RepoId, String> {
     rid.parse().map_err(|e| format!("invalid RID {rid:?}: {e}"))
+}
+
+/// Render a [`Progress`] event as a flat `{ "phase": ..., ... }` JSON string.
+fn progress_json(p: &Progress) -> String {
+    use serde_json::json;
+    let mut v = match p {
+        Progress::Resolving { candidates } => json!({ "candidates": candidates }),
+        Progress::Connecting { nid, addr, index, total } => {
+            json!({ "nid": nid, "addr": addr, "index": index, "total": total })
+        }
+        Progress::Fetching { nid, index, total } => {
+            json!({ "nid": nid, "index": index, "total": total })
+        }
+        Progress::PeerFailed { nid, index, total, reason } => {
+            json!({ "nid": nid, "index": index, "total": total, "reason": reason })
+        }
+        Progress::Failed { reason } => json!({ "reason": reason }),
+        Progress::Done | Progress::Cancelled => json!({}),
+    };
+    v["phase"] = serde_json::Value::from(p.phase());
+    v.to_string()
 }
 
 fn comment_json<L>(
@@ -211,6 +244,61 @@ pub fn clone_repo(rid: String, timeout_ms: u32) -> AsyncTask<BlockingJson> {
             Err(e) => err_json(e),
         }
     })
+}
+
+/// Seed + fetch a repository, pushing progress events to `on_progress`
+/// (a `(event: string) => void` callback receiving one JSON object per
+/// event: `{phase, ...}`). Resolves to `{"ok":true}`, `{"cancelled":true}`,
+/// or `{"error":...}`. Cancel mid-flight with `cancelClone(rid)`.
+#[napi]
+pub fn clone_repo_with_progress(
+    rid: String,
+    timeout_ms: u32,
+    on_progress: ProgressCb,
+) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let parsed = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        let mut network = match network() {
+            Ok(network) => network,
+            Err(e) => return err_json(e),
+        };
+
+        // Register a cancel token under the RID for the duration.
+        let cancel = CancelToken::new();
+        if let Ok(mut map) = CANCELS.lock() {
+            map.insert(rid.clone(), cancel.clone());
+        }
+
+        let policy = FetchPolicy::from_timeout(Duration::from_millis(timeout_ms.into()));
+        let mut emit = |p: Progress| {
+            on_progress.call(progress_json(&p), ThreadsafeFunctionCallMode::NonBlocking);
+        };
+        let result = network.clone_repo_with(parsed, &policy, &cancel, &mut emit);
+
+        if let Ok(mut map) = CANCELS.lock() {
+            map.remove(&rid);
+        }
+        match result {
+            Ok(()) => r#"{"ok":true}"#.to_string(),
+            Err(libradicle::Error::Cancelled) => r#"{"cancelled":true}"#.to_string(),
+            Err(e) => err_json(e),
+        }
+    })
+}
+
+/// Request cancellation of an in-flight `cloneRepoWithProgress` for `rid`.
+/// Returns `{"cancelled": bool}` — false if no clone was running.
+#[napi]
+pub fn cancel_clone(rid: String) -> String {
+    let found = CANCELS
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&rid).map(|t| t.cancel()))
+        .is_some();
+    serde_json::json!({ "cancelled": found }).to_string()
 }
 
 /// Stop seeding a repository. Resolves to `{"unseeded": bool}`.

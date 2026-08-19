@@ -1,6 +1,6 @@
 [package]
 name = "libradicle"
-version = "0.2.3"
+version = "0.3.0"
 description = "Embeddable Radicle facade: profile + in-process node + storage reads, one crate for desktop (napi) and iOS (uniffi) bindings"
 edition = "2021"
 license = "MIT OR Apache-2.0"

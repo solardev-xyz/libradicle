@@ -27,6 +27,13 @@ let node = Embedded::start(Options {
 })?;
 node.connect_preferred_seeds(Duration::from_secs(15))?;
 node.clone_repo(rid, Duration::from_secs(120))?;   // seed + fetch, bare storage only
+
+// …or stream progress and support cancellation:
+let cancel = CancelToken::new();                   // cancel.cancel() from another thread
+node.clone_repo_with(rid, &FetchPolicy::default(), &cancel, &mut |p| {
+    eprintln!("{}: {:?}", p.phase(), p);           // resolving/connecting/fetching/…
+})?;
+
 let repos = node.list_repos()?;                    // currently seeded repositories
 let info  = node.repo_info(rid)?;                  // payload, head, COB counts
 let tree  = node.tree(rid, "src")?;                // browse at head
@@ -43,6 +50,12 @@ The napi binding (`napi/src/lib.rs`) exposes node lifecycle, identity,
 repository import/list/seed/unseed, storage reads, and issue/patch mutations
 to Node.js / Electron as JSON-string-returning async functions;
 `napi/smoke.mjs` is a live-network end-to-end test.
+
+`cloneRepoWithProgress(rid, timeoutMs, cb)` pushes one JSON progress event
+per phase to a `(event: string) => void` callback (via a napi
+ThreadsafeFunction) and can be cancelled mid-flight with `cancelClone(rid)`;
+`napi/progress-smoke.mjs` exercises both. Event phases: `resolving`,
+`connecting`, `fetching`, `peer-failed`, `done`, `failed`, `cancelled`.
 
 ## Building
 

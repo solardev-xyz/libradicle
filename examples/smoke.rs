@@ -31,8 +31,12 @@ fn main() -> anyhow::Result<()> {
     let n = node.connect_preferred_seeds(Duration::from_secs(15))?;
     println!("connected to {n} preferred seed(s)");
 
-    println!("cloning {rid}…");
-    node.clone_repo(rid, Duration::from_secs(120))?;
+    println!("cloning {rid} (streaming progress)…");
+    let policy = libradicle::FetchPolicy::from_timeout(Duration::from_secs(120));
+    let cancel = libradicle::CancelToken::new();
+    node.clone_repo_with(rid, &policy, &cancel, &mut |p| {
+        println!("  progress: {} {:?}", p.phase(), p);
+    })?;
     println!("clone complete");
 
     let info = node.repo_info(rid)?;

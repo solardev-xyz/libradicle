@@ -29,6 +29,10 @@ pub enum Error {
     NoSeeds(RepoId),
     #[error("fetching {0} failed: {1}")]
     FetchFailed(RepoId, String),
+    #[error("fetching {0} timed out")]
+    Timeout(RepoId),
+    #[error("clone cancelled")]
+    Cancelled,
     #[error("node thread: {0}")]
     NodeThread(String),
     #[error("invalid collaborative object id {0:?}")]
