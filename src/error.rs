@@ -22,6 +22,8 @@ pub enum Error {
     #[error(transparent)]
     Repository(#[from] radicle::storage::RepositoryError),
     #[error(transparent)]
+    Surf(#[from] radicle_surf::Error),
+    #[error(transparent)]
     Git(#[from] radicle::git::raw::Error),
     #[error(transparent)]
     Doc(#[from] radicle::identity::doc::DocError),
@@ -35,6 +37,8 @@ pub enum Error {
     Timeout(RepoId),
     #[error("clone cancelled")]
     Cancelled,
+    #[error("announce refs failed: {0}")]
+    Announce(String),
     #[error("node thread: {0}")]
     NodeThread(String),
     #[error("invalid collaborative object id {0:?}")]

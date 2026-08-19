@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 radicle = { git = "https://github.com/solardev-xyz/heartwood", rev = "277dbb8cd1efb921e881b86720b1aced298da97d" }
 radicle-node = { git = "https://github.com/solardev-xyz/heartwood", rev = "277dbb8cd1efb921e881b86720b1aced298da97d" }
+radicle-surf = { git = "https://github.com/solardev-xyz/heartwood", rev = "277dbb8cd1efb921e881b86720b1aced298da97d", features = ["serde"] }
 getrandom = "0.4"
 git2 = { version = "0.21", default-features = false }
 radicle-signals = { git = "https://github.com/solardev-xyz/heartwood", rev = "277dbb8cd1efb921e881b86720b1aced298da97d" }

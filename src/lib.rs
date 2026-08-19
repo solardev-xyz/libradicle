@@ -61,6 +61,15 @@ pub struct RepoInfo {
     pub patches_open: usize,
 }
 
+/// A repository covered by an explicit allow-seeding policy. Metadata is
+/// present once the repository has successfully landed in local storage.
+#[derive(Debug, Clone)]
+pub struct SeededRepoInfo {
+    pub rid: RepoId,
+    pub name: Option<String>,
+    pub description: Option<String>,
+}
+
 /// One entry in a repository tree listing.
 #[derive(Debug, Clone)]
 pub struct TreeEntry {
@@ -93,6 +102,14 @@ pub struct CommitInfo {
     pub description: String,
     pub author: CommitSignature,
     pub committer: CommitSignature,
+}
+
+/// One commit and its diff against its first parent (or the empty tree for
+/// an initial commit), in the same schema Radicle's HTTP API exposes.
+#[derive(Debug, Clone)]
+pub struct CommitDetail {
+    pub commit: radicle_surf::Commit,
+    pub diff: radicle_surf::diff::Diff,
 }
 
 /// One signed Radicle remote and its published branch heads.
@@ -553,15 +570,48 @@ impl Embedded {
         Ok(repos)
     }
 
+    /// List explicit allow-seeding policies, including repositories whose
+    /// first fetch has not succeeded yet.
+    pub fn list_seeded_repos(&self) -> Result<Vec<SeededRepoInfo>, Error> {
+        let policies = self.profile.policies()?;
+        let mut repos = self
+            .list_repos()?
+            .into_iter()
+            .map(|repo| {
+                (
+                    repo.rid,
+                    SeededRepoInfo {
+                        rid: repo.rid,
+                        name: Some(repo.name),
+                        description: Some(repo.description),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for policy in policies.seed_policies()? {
+            let policy = policy?;
+            if !policy.policy.is_allow() {
+                continue;
+            }
+            repos.entry(policy.rid).or_insert(SeededRepoInfo {
+                rid: policy.rid,
+                name: None,
+                description: None,
+            });
+        }
+        Ok(repos.into_values().collect())
+    }
+
     fn signer(&self) -> Result<Signer, Error> {
         Ok(self.profile.signer()?)
     }
 
-    fn announce_refs(&self, rid: RepoId) {
+    fn announce_refs(&self, rid: RepoId) -> Result<(), Error> {
         let mut handle = self.handle.clone();
-        if let Err(err) = handle.announce_refs_for(rid, [*self.profile.did()]) {
-            log::warn!(target: "libradicle", "announce refs for {rid}: {err}");
-        }
+        handle
+            .announce_refs_for(rid, [*self.profile.did()])
+            .map(|_| ())
+            .map_err(|err| Error::Announce(err.to_string()))
     }
 
     /// Create an issue directly in the repository's COB store.
@@ -583,7 +633,7 @@ impl Embedded {
             .map_err(|e| Error::NodeThread(e.to_string()))?;
         let issue = issues.create(title, description, &labels, &[], [])?;
         let id = issue.id().to_string();
-        self.announce_refs(rid);
+        self.announce_refs(rid)?;
         Ok(id)
     }
 
@@ -609,7 +659,7 @@ impl Embedded {
             None => *issue.root().0,
         };
         let id = issue.comment(body, parent, [])?.to_string();
-        self.announce_refs(rid);
+        self.announce_refs(rid)?;
         Ok(id)
     }
 
@@ -637,7 +687,7 @@ impl Embedded {
         };
         let mut issue = issues.get_mut(&issue_id)?;
         issue.lifecycle(state)?;
-        self.announce_refs(rid);
+        self.announce_refs(rid)?;
         Ok(issue_id.to_string())
     }
 
@@ -661,7 +711,7 @@ impl Embedded {
         let id = patch
             .comment(revision_id, body, None, None, [])?
             .to_string();
-        self.announce_refs(rid);
+        self.announce_refs(rid)?;
         Ok(id)
     }
 
@@ -689,7 +739,7 @@ impl Embedded {
         )?;
         self.handle.seed(rid, Scope::All)?;
         self.handle.add_inventory(rid)?;
-        self.announce_refs(rid);
+        self.announce_refs(rid)?;
         Ok(rid)
     }
 
@@ -807,6 +857,38 @@ impl Embedded {
     ) -> Result<git2::Commit<'repo>, Error> {
         let oid = parse_revision(revision)?;
         Ok(repo.backend.find_commit(oid)?)
+    }
+
+    fn surf_repo(&self, rid: RepoId) -> Result<radicle_surf::Repository, Error> {
+        let repo = self.profile.storage.repository(rid)?;
+        Ok(radicle_surf::Repository::open(repo.backend.path())?)
+    }
+
+    /// Paginated commit history reachable from `parent`.
+    pub fn commits(
+        &self,
+        rid: RepoId,
+        parent: &str,
+        page: usize,
+        per_page: usize,
+    ) -> Result<Vec<radicle_surf::Commit>, Error> {
+        let oid = parse_revision(parent)?;
+        let repo = self.surf_repo(rid)?;
+        let history = repo.history(radicle_surf::Oid::from(oid))?;
+        history
+            .skip(page.saturating_mul(per_page))
+            .take(per_page)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Error::from)
+    }
+
+    /// Commit metadata plus a structured diff against its first parent.
+    pub fn commit(&self, rid: RepoId, revision: &str) -> Result<CommitDetail, Error> {
+        let oid = parse_revision(revision)?;
+        let repo = self.surf_repo(rid)?;
+        let commit = repo.commit(radicle_surf::Oid::from(oid))?;
+        let diff = repo.diff_commit(commit.id)?;
+        Ok(CommitDetail { commit, diff })
     }
 
     fn commit_info(commit: &git2::Commit<'_>) -> CommitInfo {

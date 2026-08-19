@@ -361,6 +361,26 @@ pub fn list_repos() -> AsyncTask<BlockingJson> {
     })
 }
 
+/// Explicit allow-seeding policies, including repositories still awaiting a
+/// successful first fetch.
+#[napi]
+pub fn list_seeded_repos() -> AsyncTask<BlockingJson> {
+    blocking(|| {
+        with_node(|node| match node.list_seeded_repos() {
+            Ok(repos) => serde_json::json!(repos
+                .into_iter()
+                .map(|repo| serde_json::json!({
+                    "rid": repo.rid.to_string(),
+                    "name": repo.name,
+                    "description": repo.description,
+                }))
+                .collect::<Vec<_>>())
+            .to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
 /// All issues in a repository, in radicle-httpd-compatible JSON shape.
 #[napi]
 pub fn issues(rid: String) -> AsyncTask<BlockingJson> {
@@ -550,6 +570,45 @@ pub fn repo_info(rid: String) -> AsyncTask<BlockingJson> {
                 "visibility": info.visibility,
                 "issuesOpen": info.issues_open,
                 "patchesOpen": info.patches_open,
+            })
+            .to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// Paginated commit history reachable from a validated full commit id.
+#[napi]
+pub fn commits(rid: String, parent: String, page: u32, per_page: u32) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        with_node(
+            |node| match node.commits(rid, &parent, page as usize, per_page as usize) {
+                Ok(commits) => match serde_json::to_string(&commits) {
+                    Ok(json) => json,
+                    Err(e) => err_json(e),
+                },
+                Err(e) => err_json(e),
+            },
+        )
+    })
+}
+
+/// Commit metadata plus its structured first-parent diff.
+#[napi]
+pub fn commit(rid: String, revision: String) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        with_node(|node| match node.commit(rid, &revision) {
+            Ok(detail) => serde_json::json!({
+                "commit": detail.commit,
+                "diff": detail.diff,
             })
             .to_string(),
             Err(e) => err_json(e),
