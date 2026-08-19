@@ -1,0 +1,24 @@
+[package]
+name = "libradicle-uniffi"
+version = "0.5.0"
+description = "UniFFI (Swift/iOS) binding over libradicle — the iOS half of Freedom Browser's Radicle integration"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "libradicle_uniffi"
+# `lib`/`rlib` for host unit tests + the bindgen library scan; `staticlib` for
+# the iOS device/simulator archives; `cdylib` for host/desktop dynamic loads.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+libradicle = { path = ".." }
+radicle = { git = "https://github.com/solardev-xyz/heartwood", rev = "394aa12d00855f09eb07638221993b4514682f6e" }
+serde_json = "1"
+uniffi = "0.32"
+
+[features]
+## Make the embedded node spawn-free (serve fetches in-process, skip git gc).
+## iOS builds enable this; it is the whole reason the iOS node can publish.
+no-spawn = ["libradicle/no-spawn"]
