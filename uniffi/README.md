@@ -29,9 +29,11 @@ into storage in-process.
 #    and an --target for device/simulator archives).
 cargo build -p libradicle-uniffi
 
-# 2. Generate the Swift glue from the built library.
+# 2. Generate the Swift glue from the built staticlib (uniffi library mode
+#    reads the metadata straight out of the archive — there is deliberately
+#    no cdylib target, see Cargo.toml).
 cargo run -p uniffi-bindgen -- generate \
-  --library target/debug/liblibradicle_uniffi.{so,dylib} \
+  --library target/debug/liblibradicle_uniffi.a \
   --language swift --out-dir generated/
 
 # Produces:

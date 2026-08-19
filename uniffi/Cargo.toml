@@ -8,9 +8,13 @@ publish = false
 
 [lib]
 name = "libradicle_uniffi"
-# `lib`/`rlib` for host unit tests + the bindgen library scan; `staticlib` for
-# the iOS device/simulator archives; `cdylib` for host/desktop dynamic loads.
-crate-type = ["lib", "cdylib", "staticlib"]
+# `lib`/`rlib` for host unit tests; `staticlib` for the iOS device/simulator
+# archives AND the bindgen library scan (uniffi library mode reads the
+# metadata straight out of the archive). Deliberately NO `cdylib`: a dylib
+# link demands every native symbol resolved within this crate's own graph,
+# but aggregator consumers (freedom-mobile-ffi) satisfy some native deps —
+# SQLite — only at final app link, from a sibling member's bundled copy.
+crate-type = ["lib", "staticlib"]
 
 [dependencies]
 libradicle = { path = ".." }
