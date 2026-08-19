@@ -7,19 +7,22 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-radicle = { git = "https://github.com/solardev-xyz/heartwood", rev = "277dbb8cd1efb921e881b86720b1aced298da97d" }
-radicle-node = { git = "https://github.com/solardev-xyz/heartwood", rev = "277dbb8cd1efb921e881b86720b1aced298da97d" }
-radicle-surf = { git = "https://github.com/solardev-xyz/heartwood", rev = "277dbb8cd1efb921e881b86720b1aced298da97d", features = ["serde"] }
+radicle = { git = "https://github.com/solardev-xyz/heartwood", rev = "394aa12d00855f09eb07638221993b4514682f6e" }
+radicle-node = { git = "https://github.com/solardev-xyz/heartwood", rev = "394aa12d00855f09eb07638221993b4514682f6e" }
+radicle-surf = { git = "https://github.com/solardev-xyz/heartwood", rev = "394aa12d00855f09eb07638221993b4514682f6e", features = ["serde"] }
 getrandom = "0.4"
 git2 = { version = "0.21", default-features = false }
-radicle-signals = { git = "https://github.com/solardev-xyz/heartwood", rev = "277dbb8cd1efb921e881b86720b1aced298da97d" }
+radicle-signals = { git = "https://github.com/solardev-xyz/heartwood", rev = "394aa12d00855f09eb07638221993b4514682f6e" }
 log = "0.4"
 thiserror = "2"
 
 [features]
-## No child processes anywhere: decline serving fetches, skip git gc.
-## Required for iOS; leave off for desktop, which serves and publishes.
-no-spawn = ["radicle-node/no-serve", "radicle-node/no-gc"]
+## No child processes anywhere: serve fetches in-process (libgit2 + a
+## hand-written packfile, no `git upload-pack`) and skip `git gc`. Required
+## for iOS, which cannot spawn children — and, unlike the old decline-to-serve
+## behaviour, this lets a no-spawn node publish: peers can fetch its refs.
+## Leave off for desktop, which serves via `git upload-pack` as before.
+no-spawn = ["radicle-node/serve-in-process", "radicle-node/no-gc"]
 
 [dev-dependencies]
 anyhow = "1"
