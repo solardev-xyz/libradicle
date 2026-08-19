@@ -89,13 +89,23 @@ fn progress_json(p: &Progress) -> String {
     use serde_json::json;
     let mut v = match p {
         Progress::Resolving { candidates } => json!({ "candidates": candidates }),
-        Progress::Connecting { nid, addr, index, total } => {
+        Progress::Connecting {
+            nid,
+            addr,
+            index,
+            total,
+        } => {
             json!({ "nid": nid, "addr": addr, "index": index, "total": total })
         }
         Progress::Fetching { nid, index, total } => {
             json!({ "nid": nid, "index": index, "total": total })
         }
-        Progress::PeerFailed { nid, index, total, reason } => {
+        Progress::PeerFailed {
+            nid,
+            index,
+            total,
+            reason,
+        } => {
             json!({ "nid": nid, "index": index, "total": total, "reason": reason })
         }
         Progress::Failed { reason } => json!({ "reason": reason }),

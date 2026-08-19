@@ -145,7 +145,6 @@ impl Progress {
             Progress::Cancelled => "cancelled",
         }
     }
-
 }
 
 /// Retry and timeout policy for a clone/fetch.
@@ -335,7 +334,11 @@ impl Network {
                 // Emit "fetching" once per peer; the "not connected" retries
                 // below are handshake waiting, not repeated fetches.
                 if !announced_fetching {
-                    progress(Progress::Fetching { nid: nid.to_string(), index, total });
+                    progress(Progress::Fetching {
+                        nid: nid.to_string(),
+                        index,
+                        total,
+                    });
                     announced_fetching = true;
                 }
 
@@ -493,7 +496,8 @@ impl Embedded {
         cancel: &CancelToken,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<(), Error> {
-        self.network().clone_repo_with(rid, policy, cancel, progress)
+        self.network()
+            .clone_repo_with(rid, policy, cancel, progress)
     }
 
     /// Stop seeding a repository. The bare repository remains in storage.
