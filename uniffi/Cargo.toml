@@ -18,7 +18,7 @@ crate-type = ["lib", "staticlib"]
 
 [dependencies]
 libradicle = { path = ".." }
-radicle = { git = "https://github.com/solardev-xyz/heartwood", rev = "394aa12d00855f09eb07638221993b4514682f6e" }
+radicle = { git = "https://github.com/solardev-xyz/heartwood", rev = "c208df3ac7626402db60752f1f38d31465731f01" }
 serde_json = "1"
 uniffi = "0.32"
 

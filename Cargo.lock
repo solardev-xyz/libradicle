@@ -2669,7 +2669,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "radicle"
 version = "0.25.1"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "base64 0.21.7",
  "bytesize",
@@ -2703,7 +2703,7 @@ dependencies = [
 [[package]]
 name = "radicle-cob"
 version = "0.21.1"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "fastrand",
  "git2",
@@ -2722,7 +2722,7 @@ dependencies = [
 [[package]]
 name = "radicle-core"
 version = "0.4.1"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "git2",
  "multibase",
@@ -2737,7 +2737,7 @@ dependencies = [
 [[package]]
 name = "radicle-crypto"
 version = "0.19.0"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "curve25519-dalek",
  "cyphernet",
@@ -2758,7 +2758,7 @@ dependencies = [
 [[package]]
 name = "radicle-dag"
 version = "0.10.0"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "fastrand",
 ]
@@ -2766,7 +2766,7 @@ dependencies = [
 [[package]]
 name = "radicle-fetch"
 version = "0.21.1"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "bstr",
  "either",
@@ -2785,7 +2785,7 @@ dependencies = [
 [[package]]
 name = "radicle-git-metadata"
 version = "0.2.1"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "git2",
  "thiserror 2.0.20",
@@ -2794,7 +2794,7 @@ dependencies = [
 [[package]]
 name = "radicle-git-ref-format"
 version = "0.2.0"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "bstr",
  "serde",
@@ -2804,7 +2804,7 @@ dependencies = [
 [[package]]
 name = "radicle-localtime"
 version = "0.1.0"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "serde",
 ]
@@ -2812,7 +2812,7 @@ dependencies = [
 [[package]]
 name = "radicle-log"
 version = "0.2.0"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "chrono",
  "colored",
@@ -2823,7 +2823,7 @@ dependencies = [
 [[package]]
 name = "radicle-node"
 version = "0.21.1"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "backtrace",
  "bytes",
@@ -2859,7 +2859,7 @@ dependencies = [
 [[package]]
 name = "radicle-oid"
 version = "0.2.2"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "git2",
  "gix-hash",
@@ -2869,7 +2869,7 @@ dependencies = [
 [[package]]
 name = "radicle-protocol"
 version = "0.9.1"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "bloomy",
  "bytes",
@@ -2890,7 +2890,7 @@ dependencies = [
 [[package]]
 name = "radicle-signals"
 version = "0.12.1"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "libc",
  "signals_receipts",
@@ -2900,7 +2900,7 @@ dependencies = [
 [[package]]
 name = "radicle-surf"
 version = "0.29.0"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "base64 0.21.7",
  "git2",
@@ -2917,7 +2917,7 @@ dependencies = [
 [[package]]
 name = "radicle-systemd"
 version = "0.13.0"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "log",
  "systemd-journal-logger",
@@ -2926,7 +2926,7 @@ dependencies = [
 [[package]]
 name = "radicle-windows"
 version = "0.1.0"
-source = "git+https://github.com/solardev-xyz/heartwood?rev=394aa12d00855f09eb07638221993b4514682f6e#394aa12d00855f09eb07638221993b4514682f6e"
+source = "git+https://github.com/solardev-xyz/heartwood?rev=c208df3ac7626402db60752f1f38d31465731f01#c208df3ac7626402db60752f1f38d31465731f01"
 dependencies = [
  "thiserror 2.0.20",
  "windows 0.62.2",
