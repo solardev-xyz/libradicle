@@ -595,6 +595,43 @@ pub fn tree(rid: String, path: String) -> AsyncTask<BlockingJson> {
     })
 }
 
+/// Tree entries at a validated full commit id, including commit metadata.
+#[napi]
+pub fn tree_at(rid: String, revision: String, path: String) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        with_node(|node| match node.tree_at(rid, &revision, &path) {
+            Ok((entries, commit)) => serde_json::json!({
+                "entries": entries.iter().map(|e| serde_json::json!({
+                    "name": e.name,
+                    "path": e.path,
+                    "kind": e.kind,
+                })).collect::<Vec<_>>(),
+                "lastCommit": {
+                    "id": commit.id,
+                    "summary": commit.summary,
+                    "description": commit.description,
+                    "author": {
+                        "name": commit.author.name,
+                        "email": commit.author.email,
+                        "time": commit.author.time,
+                    },
+                    "committer": {
+                        "name": commit.committer.name,
+                        "email": commit.committer.email,
+                        "time": commit.committer.time,
+                    },
+                },
+            })
+            .to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
 /// Blob at the head of the default branch, httpd-shaped:
 /// `{"binary":bool,"content":"...","name":"..."}`. Binary blobs omit
 /// content (the viewer renders a placeholder for them).
@@ -616,6 +653,76 @@ pub fn blob(rid: String, path: String) -> AsyncTask<BlockingJson> {
                 "binary": false,
                 "name": name,
                 "content": String::from_utf8_lossy(&b.content),
+            })
+            .to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// Blob at a validated full commit id.
+#[napi]
+pub fn blob_at(rid: String, revision: String, path: String) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        with_node(|node| match node.read_blob_at(rid, &revision, &path) {
+            Ok(b) if b.binary => serde_json::json!({
+                "binary": true,
+                "name": name,
+            })
+            .to_string(),
+            Ok(b) => serde_json::json!({
+                "binary": false,
+                "name": name,
+                "content": String::from_utf8_lossy(&b.content),
+            })
+            .to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// Signed remotes and their branch heads.
+#[napi]
+pub fn remotes(rid: String) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        with_node(|node| match node.remotes(rid) {
+            Ok(remotes) => serde_json::json!(remotes
+                .iter()
+                .map(|remote| serde_json::json!({
+                    "id": remote.id,
+                    "did": remote.did,
+                    "delegate": remote.delegate,
+                    "heads": remote.heads,
+                }))
+                .collect::<Vec<_>>())
+            .to_string(),
+            Err(e) => err_json(e),
+        })
+    })
+}
+
+/// Repository history statistics reachable from a validated full commit id.
+#[napi]
+pub fn repo_stats(rid: String, revision: String) -> AsyncTask<BlockingJson> {
+    blocking(move || {
+        let rid = match parse_rid(&rid) {
+            Ok(r) => r,
+            Err(e) => return err_json(e),
+        };
+        with_node(|node| match node.repo_stats(rid, &revision) {
+            Ok(stats) => serde_json::json!({
+                "commits": stats.commits,
+                "branches": stats.branches,
+                "contributors": stats.contributors,
             })
             .to_string(),
             Err(e) => err_json(e),

@@ -8,6 +8,7 @@
 //! This is the shared core for the Freedom Browser desktop (napi-rs)
 //! and iOS (UniFFI) bindings.
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -74,6 +75,41 @@ pub struct TreeEntry {
 pub struct Blob {
     pub binary: bool,
     pub content: Vec<u8>,
+}
+
+/// Git signature information exposed with a commit.
+#[derive(Debug, Clone)]
+pub struct CommitSignature {
+    pub name: String,
+    pub email: String,
+    pub time: i64,
+}
+
+/// Commit metadata used by repository browsers.
+#[derive(Debug, Clone)]
+pub struct CommitInfo {
+    pub id: String,
+    pub summary: String,
+    pub description: String,
+    pub author: CommitSignature,
+    pub committer: CommitSignature,
+}
+
+/// One signed Radicle remote and its published branch heads.
+#[derive(Debug, Clone)]
+pub struct RemoteInfo {
+    pub id: String,
+    pub did: String,
+    pub delegate: bool,
+    pub heads: BTreeMap<String, String>,
+}
+
+/// Repository history statistics at a specific revision.
+#[derive(Debug, Clone)]
+pub struct RepoStats {
+    pub commits: usize,
+    pub branches: usize,
+    pub contributors: usize,
 }
 
 /// Public identity exposed to the browser provider.
@@ -765,12 +801,47 @@ impl Embedded {
         Ok(self.handle.seeds_for(rid, [*self.profile.did()])?.len())
     }
 
-    /// Entries of the tree at the head of the default branch, under
-    /// `path` (empty = repository root).
-    pub fn tree(&self, rid: RepoId, path: &str) -> Result<Vec<TreeEntry>, Error> {
+    fn commit_at<'repo>(
+        repo: &'repo radicle::storage::git::Repository,
+        revision: &str,
+    ) -> Result<git2::Commit<'repo>, Error> {
+        let oid = parse_revision(revision)?;
+        Ok(repo.backend.find_commit(oid)?)
+    }
+
+    fn commit_info(commit: &git2::Commit<'_>) -> CommitInfo {
+        fn signature(value: git2::Signature<'_>) -> CommitSignature {
+            CommitSignature {
+                name: value.name().unwrap_or_default().to_string(),
+                email: value.email().unwrap_or_default().to_string(),
+                time: value.when().seconds(),
+            }
+        }
+
+        let message = commit.message().unwrap_or_default();
+        let mut lines = message.lines();
+        let summary = lines.next().unwrap_or_default().to_string();
+        let description = lines.collect::<Vec<_>>().join("\n");
+        CommitInfo {
+            id: commit.id().to_string(),
+            summary,
+            description,
+            author: signature(commit.author()),
+            committer: signature(commit.committer()),
+        }
+    }
+
+    /// Entries of the tree at a specific commit, under `path`
+    /// (empty = repository root).
+    pub fn tree_at(
+        &self,
+        rid: RepoId,
+        revision: &str,
+        path: &str,
+    ) -> Result<(Vec<TreeEntry>, CommitInfo), Error> {
         let repo = self.profile.storage.repository(rid)?;
-        let (_, head) = repo.head()?;
-        let commit = repo.backend.find_commit(head.into())?;
+        let commit = Self::commit_at(&repo, revision)?;
+        let commit_info = Self::commit_info(&commit);
         let root = commit.tree()?;
         let tree = if path.is_empty() {
             root
@@ -786,7 +857,7 @@ impl Embedded {
         } else {
             format!("{}/", path.trim_end_matches('/'))
         };
-        Ok(tree
+        let entries = tree
             .iter()
             .map(|e| {
                 let name = e.name().unwrap_or("?").to_string();
@@ -801,14 +872,22 @@ impl Embedded {
                     kind: kind.to_string(),
                 }
             })
-            .collect())
+            .collect();
+        Ok((entries, commit_info))
     }
 
-    /// Blob content at the head of the default branch.
-    pub fn read_blob(&self, rid: RepoId, path: &str) -> Result<Blob, Error> {
+    /// Entries of the tree at the head of the default branch, under
+    /// `path` (empty = repository root).
+    pub fn tree(&self, rid: RepoId, path: &str) -> Result<Vec<TreeEntry>, Error> {
         let repo = self.profile.storage.repository(rid)?;
         let (_, head) = repo.head()?;
-        let commit = repo.backend.find_commit(head.into())?;
+        Ok(self.tree_at(rid, &head.to_string(), path)?.0)
+    }
+
+    /// Blob content at a specific commit.
+    pub fn read_blob_at(&self, rid: RepoId, revision: &str, path: &str) -> Result<Blob, Error> {
+        let repo = self.profile.storage.repository(rid)?;
+        let commit = Self::commit_at(&repo, revision)?;
         let entry = commit.tree()?.get_path(std::path::Path::new(path))?;
         let blob = entry
             .to_object(&repo.backend)?
@@ -817,6 +896,71 @@ impl Embedded {
         Ok(Blob {
             binary: blob.is_binary(),
             content: blob.content().to_vec(),
+        })
+    }
+
+    /// Blob content at the head of the default branch.
+    pub fn read_blob(&self, rid: RepoId, path: &str) -> Result<Blob, Error> {
+        let repo = self.profile.storage.repository(rid)?;
+        let (_, head) = repo.head()?;
+        self.read_blob_at(rid, &head.to_string(), path)
+    }
+
+    /// Signed repository remotes and their published branch heads.
+    pub fn remotes(&self, rid: RepoId) -> Result<Vec<RemoteInfo>, Error> {
+        let repo = self.profile.storage.repository(rid)?;
+        let doc = repo.identity_doc()?;
+        let mut result = Vec::new();
+        for remote in repo.remotes()? {
+            let (id, remote) = remote?;
+            let heads = remote
+                .iter()
+                .filter_map(|(name, oid)| {
+                    name.as_str()
+                        .strip_prefix("refs/heads/")
+                        .map(|branch| (branch.to_string(), oid.to_string()))
+                })
+                .collect();
+            result.push(RemoteInfo {
+                id: id.to_string(),
+                did: radicle::identity::Did::from(id).to_string(),
+                delegate: doc.is_delegate(&id.into()),
+                heads,
+            });
+        }
+        result.sort_by(|a, b| b.delegate.cmp(&a.delegate).then_with(|| a.id.cmp(&b.id)));
+        Ok(result)
+    }
+
+    /// Commit, branch, and contributor counts reachable from `revision`.
+    pub fn repo_stats(&self, rid: RepoId, revision: &str) -> Result<RepoStats, Error> {
+        let repo = self.profile.storage.repository(rid)?;
+        let commit = Self::commit_at(&repo, revision)?;
+        let mut walk = repo.backend.revwalk()?;
+        walk.push(commit.id())?;
+
+        let mut commits = 0;
+        let mut contributors = HashSet::new();
+        for oid in walk {
+            let commit = repo.backend.find_commit(oid?)?;
+            let author = commit.author();
+            contributors.insert((
+                author.name().unwrap_or_default().to_string(),
+                author.email().unwrap_or_default().to_string(),
+            ));
+            commits += 1;
+        }
+
+        let branches = self
+            .remotes(rid)?
+            .into_iter()
+            .flat_map(|remote| remote.heads.into_keys())
+            .collect::<HashSet<_>>()
+            .len();
+        Ok(RepoStats {
+            commits,
+            branches,
+            contributors: contributors.len(),
         })
     }
 
@@ -881,6 +1025,13 @@ fn validate_cob_id(id: &str) -> Result<(), Error> {
     }
 }
 
+fn parse_revision(revision: &str) -> Result<git2::Oid, Error> {
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::InvalidRevision(revision.to_string()));
+    }
+    git2::Oid::from_str(revision).map_err(|_| Error::InvalidRevision(revision.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -890,7 +1041,7 @@ mod tests {
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{prepare_control_socket, validate_cob_id};
+    use super::{parse_revision, prepare_control_socket, validate_cob_id};
     use super::{CancelToken, FetchPolicy, Progress};
     use std::time::{Duration, Instant};
 
@@ -996,6 +1147,21 @@ mod tests {
             "éééééé",
         ] {
             assert!(validate_cob_id(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn revisions_accept_only_full_commit_object_ids() {
+        assert!(parse_revision("0123456789abcdef0123456789abcdef01234567").is_ok());
+
+        for invalid in [
+            "HEAD",
+            "main~3",
+            "0123456",
+            "0123456789abcdef0123456789abcdef012345678",
+            "0123456789abcdef0123456789abcdef0123456g",
+        ] {
+            assert!(parse_revision(invalid).is_err(), "accepted {invalid:?}");
         }
     }
 }

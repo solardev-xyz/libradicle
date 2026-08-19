@@ -18,6 +18,8 @@ pub enum Error {
     #[error(transparent)]
     Storage(#[from] radicle::storage::Error),
     #[error(transparent)]
+    StorageRefs(#[from] radicle::storage::refs::Error),
+    #[error(transparent)]
     Repository(#[from] radicle::storage::RepositoryError),
     #[error(transparent)]
     Git(#[from] radicle::git::raw::Error),
@@ -41,6 +43,8 @@ pub enum Error {
     NotATree(String),
     #[error("not a file: {0}")]
     NotABlob(String),
+    #[error("invalid commit revision {0:?}")]
+    InvalidRevision(String),
     #[error(transparent)]
     Cob(#[from] radicle::cob::store::Error),
     #[error(transparent)]

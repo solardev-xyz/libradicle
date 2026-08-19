@@ -38,6 +38,9 @@ let repos = node.list_repos()?;                    // currently seeded repositor
 let info  = node.repo_info(rid)?;                  // payload, head, COB counts
 let tree  = node.tree(rid, "src")?;                // browse at head
 let blob  = node.read_blob(rid, "README.md")?;
+let old   = node.tree_at(rid, &info.head, "src")?; // browse a pinned commit
+let peers = node.remotes(rid)?;                    // signed remote branch heads
+let stats = node.repo_stats(rid, &info.head)?;      // commits/branches/contributors
 let issue = node.create_issue(rid, "Title", "Body", vec![])?;
 node.shutdown()?;
 ```
@@ -56,6 +59,11 @@ per phase to a `(event: string) => void` callback (via a napi
 ThreadsafeFunction) and can be cancelled mid-flight with `cancelClone(rid)`;
 `napi/progress-smoke.mjs` exercises both. Event phases: `resolving`,
 `connecting`, `fetching`, `peer-failed`, `done`, `failed`, `cancelled`.
+
+`treeAt`, `blobAt`, `remotes`, and `repoStats` provide the revision-pinned
+repository-browser surface. Run `node napi/repository-smoke.mjs` after a
+release build to verify historical reads and signed remote/stat shapes against
+a temporary two-commit repository.
 
 ## Building
 
