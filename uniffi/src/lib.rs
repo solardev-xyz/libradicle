@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use libradicle::{CancelToken, Embedded, FetchPolicy, Network, Options, Progress};
+use libradicle::{
+    CancelToken, Embedded, FetchPolicy, Network, Options, Progress, SeedConnectReport,
+};
 
 uniffi::setup_scaffolding!();
 
@@ -35,6 +37,22 @@ pub trait ProgressListener: Send + Sync {
 
 fn err_json(e: impl std::fmt::Display) -> String {
     serde_json::json!({ "error": e.to_string() }).to_string()
+}
+
+fn seed_report_json(report: SeedConnectReport) -> String {
+    serde_json::json!({
+        "attempted": report.attempted,
+        "connected": report.connected,
+        "target": report.target,
+        "targetReached": report.target_reached,
+        "elapsedMs": report.elapsed.as_millis(),
+        "failures": report.failures.into_iter().map(|failure| serde_json::json!({
+            "nid": failure.nid,
+            "addr": failure.addr,
+            "reason": failure.reason,
+        })).collect::<Vec<_>>(),
+    })
+    .to_string()
 }
 
 fn with_node(f: impl FnOnce(&mut Embedded) -> String) -> String {
@@ -192,15 +210,16 @@ pub fn start(home: String, alias: String) -> String {
     }
 }
 
-/// Connect to the profile's preferred seeds. `{"connected": n}`.
+/// Concurrently bootstrap from the effective seed book. The response retains
+/// `connected` and adds attempt/readiness diagnostics.
 #[uniffi::export]
 pub fn connect_seeds(timeout_ms: u32) -> String {
     let mut network = match network() {
         Ok(network) => network,
         Err(e) => return err_json(e),
     };
-    match network.connect_preferred_seeds(Duration::from_millis(timeout_ms.into())) {
-        Ok(n) => serde_json::json!({ "connected": n }).to_string(),
+    match network.connect_seed_book(Duration::from_millis(timeout_ms.into())) {
+        Ok(report) => seed_report_json(report),
         Err(e) => err_json(e),
     }
 }

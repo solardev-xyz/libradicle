@@ -15,7 +15,9 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Result, Task};
 use napi_derive::napi;
 
-use libradicle::{CancelToken, Embedded, FetchPolicy, Network, Options, Progress};
+use libradicle::{
+    CancelToken, Embedded, FetchPolicy, Network, Options, Progress, SeedConnectReport,
+};
 
 static NODE: Mutex<Option<Embedded>> = Mutex::new(None);
 
@@ -31,6 +33,22 @@ type ProgressCb = ThreadsafeFunction<String, (), String, napi::Status, false>;
 
 fn err_json(e: impl std::fmt::Display) -> String {
     serde_json::json!({ "error": e.to_string() }).to_string()
+}
+
+fn seed_report_json(report: SeedConnectReport) -> String {
+    serde_json::json!({
+        "attempted": report.attempted,
+        "connected": report.connected,
+        "target": report.target,
+        "targetReached": report.target_reached,
+        "elapsedMs": report.elapsed.as_millis(),
+        "failures": report.failures.into_iter().map(|failure| serde_json::json!({
+            "nid": failure.nid,
+            "addr": failure.addr,
+            "reason": failure.reason,
+        })).collect::<Vec<_>>(),
+    })
+    .to_string()
 }
 
 /// One blocking call scheduled on the libuv thread pool (myotis pattern).
@@ -222,7 +240,8 @@ pub fn start(home: String, alias: String) -> AsyncTask<BlockingJson> {
     })
 }
 
-/// Connect to the profile's preferred seeds. Resolves to `{"connected": n}`.
+/// Concurrently bootstrap from the effective seed book. The response retains
+/// `connected` and adds attempt/readiness diagnostics.
 #[napi]
 pub fn connect_seeds(timeout_ms: u32) -> AsyncTask<BlockingJson> {
     blocking(move || {
@@ -230,8 +249,8 @@ pub fn connect_seeds(timeout_ms: u32) -> AsyncTask<BlockingJson> {
             Ok(network) => network,
             Err(e) => return err_json(e),
         };
-        match network.connect_preferred_seeds(Duration::from_millis(timeout_ms.into())) {
-            Ok(n) => serde_json::json!({ "connected": n }).to_string(),
+        match network.connect_seed_book(Duration::from_millis(timeout_ms.into())) {
+            Ok(report) => seed_report_json(report),
             Err(e) => err_json(e),
         }
     })

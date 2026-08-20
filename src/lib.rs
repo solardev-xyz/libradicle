@@ -8,10 +8,10 @@
 //! This is the shared core for the Freedom Browser desktop (napi-rs)
 //! and iOS (UniFFI) bindings.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,7 @@ use radicle_node::runtime::Runtime;
 
 pub mod error;
 pub use error::Error;
+mod seeds;
 
 /// Options for starting an embedded Radicle stack.
 #[derive(Debug, Clone)]
@@ -146,6 +147,27 @@ pub struct Identity {
 pub struct Network {
     profile: Profile,
     handle: NodeHandle,
+    seed_book: Arc<Vec<seeds::Candidate>>,
+}
+
+/// One failed seed dial observed before bootstrap reached its readiness target
+/// or exhausted its overall time budget.
+#[derive(Debug, Clone)]
+pub struct SeedConnectFailure {
+    pub nid: String,
+    pub addr: String,
+    pub reason: String,
+}
+
+/// Diagnostics for one concurrent seed bootstrap pass.
+#[derive(Debug, Clone)]
+pub struct SeedConnectReport {
+    pub attempted: usize,
+    pub connected: usize,
+    pub target: usize,
+    pub target_reached: bool,
+    pub elapsed: Duration,
+    pub failures: Vec<SeedConnectFailure>,
 }
 
 /// A progress event emitted while cloning/fetching a repository.
@@ -255,25 +277,160 @@ impl CancelToken {
 }
 
 impl Network {
-    /// Connect to the profile's configured preferred seeds.
-    /// Returns the number of seeds successfully connected.
-    pub fn connect_preferred_seeds(&mut self, timeout: Duration) -> Result<usize, Error> {
-        let mut connected = 0;
-        let seeds = self.profile.config.preferred_seeds.clone();
-        for seed in seeds {
-            let opts = ConnectOptions {
-                persistent: true,
-                timeout,
-            };
-            match self.handle.connect(seed.id, seed.addr.clone(), opts) {
-                Ok(ConnectResult::Connected) => connected += 1,
-                Ok(ConnectResult::Disconnected { reason }) => {
-                    log::warn!(target: "libradicle", "connect {}: {reason}", seed.addr);
-                }
-                Err(e) => log::warn!(target: "libradicle", "connect {}: {e}", seed.addr),
+    fn connected_seed_ids(&mut self) -> Result<HashSet<NodeId>, Error> {
+        let seed_ids = self
+            .seed_book
+            .iter()
+            .map(seeds::Candidate::nid)
+            .collect::<HashSet<_>>();
+        Ok(self
+            .handle
+            .sessions()?
+            .into_iter()
+            .filter(|session| seed_ids.contains(&session.nid))
+            .filter(|session| matches!(session.state, radicle::node::State::Connected { .. }))
+            .map(|session| session.nid)
+            .collect())
+    }
+
+    /// Dial the device-ranked seed book with bounded concurrency. Each dial
+    /// gets at most five seconds; the pass returns as soon as four seed
+    /// sessions stand, while already in-flight attempts finish in the
+    /// background and Heartwood maintains persistent successes.
+    pub fn connect_seed_book(&mut self, timeout: Duration) -> Result<SeedConnectReport, Error> {
+        struct DialResult {
+            candidate: seeds::Candidate,
+            error: Option<String>,
+        }
+
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let target = seeds::READY_TARGET.min(self.seed_book.len());
+        let sessions = self.handle.sessions()?;
+        let seed_ids = self
+            .seed_book
+            .iter()
+            .map(seeds::Candidate::nid)
+            .collect::<HashSet<_>>();
+        let occupied = sessions
+            .iter()
+            .map(|session| session.nid)
+            .collect::<HashSet<_>>();
+        let initially_connected = sessions
+            .iter()
+            .filter(|session| seed_ids.contains(&session.nid))
+            .filter(|session| matches!(session.state, radicle::node::State::Connected { .. }))
+            .count();
+        if initially_connected >= target || target == 0 {
+            return Ok(SeedConnectReport {
+                attempted: 0,
+                connected: initially_connected,
+                target,
+                target_reached: initially_connected >= target,
+                elapsed: started.elapsed(),
+                failures: Vec::new(),
+            });
+        }
+
+        let queue = Arc::new(Mutex::new(
+            self.seed_book
+                .iter()
+                .filter(|candidate| !occupied.contains(&candidate.nid()))
+                .cloned()
+                .collect::<VecDeque<_>>(),
+        ));
+        let successes = Arc::new(AtomicUsize::new(initially_connected));
+        let attempted = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (send, recv) = mpsc::channel::<DialResult>();
+
+        for worker in 0..seeds::DIAL_CONCURRENCY.min(self.seed_book.len()) {
+            let queue = Arc::clone(&queue);
+            let successes = Arc::clone(&successes);
+            let attempted = Arc::clone(&attempted);
+            let stop = Arc::clone(&stop);
+            let send = send.clone();
+            let mut handle = self.handle.clone();
+            std::thread::Builder::new()
+                .name(format!("radicle-seed-{worker}"))
+                .spawn(move || {
+                    while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                        let candidate = match queue.lock() {
+                            Ok(mut queue) => queue.pop_front(),
+                            Err(_) => None,
+                        };
+                        let Some(candidate) = candidate else {
+                            break;
+                        };
+                        attempted.fetch_add(1, Ordering::AcqRel);
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        let opts = ConnectOptions {
+                            persistent: true,
+                            timeout: remaining.min(Duration::from_secs(5)),
+                        };
+                        let result = handle.connect(
+                            candidate.address.id,
+                            candidate.address.addr.clone(),
+                            opts,
+                        );
+                        let error = match result {
+                            Ok(ConnectResult::Connected) => {
+                                let ready = successes.fetch_add(1, Ordering::AcqRel) + 1;
+                                if ready >= target {
+                                    stop.store(true, Ordering::Release);
+                                }
+                                None
+                            }
+                            Ok(ConnectResult::Disconnected { reason }) => Some(reason),
+                            Err(err) => Some(err.to_string()),
+                        };
+                        if send.send(DialResult { candidate, error }).is_err() {
+                            break;
+                        }
+                    }
+                })?;
+        }
+        drop(send);
+
+        let mut failures = Vec::new();
+        while successes.load(Ordering::Acquire) < target {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match recv.recv_timeout(remaining) {
+                Ok(DialResult {
+                    candidate,
+                    error: Some(reason),
+                }) => failures.push(SeedConnectFailure {
+                    nid: candidate.nid().to_string(),
+                    addr: candidate.address.addr.to_string(),
+                    reason,
+                }),
+                Ok(DialResult { error: None, .. }) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        Ok(connected)
+        stop.store(true, Ordering::Release);
+
+        let connected = successes.load(Ordering::Acquire);
+        Ok(SeedConnectReport {
+            attempted: attempted.load(Ordering::Acquire),
+            connected,
+            target,
+            target_reached: connected >= target,
+            elapsed: started.elapsed(),
+            failures,
+        })
+    }
+
+    /// Compatibility entry point returning only the connected seed count.
+    pub fn connect_preferred_seeds(&mut self, timeout: Duration) -> Result<usize, Error> {
+        Ok(self.connect_seed_book(timeout)?.connected)
     }
 
     /// Seed + fetch a repository from the network into local storage.
@@ -324,17 +481,24 @@ impl Network {
         // Try nodes that are known to seed this repo, preferring connected ones.
         let seeds = self.handle.seeds_for(rid, [*self.profile.did()])?;
         let (connected, disconnected) = seeds.partition();
-        let mut candidates: Vec<_> = connected
-            .into_iter()
-            .map(|s| s.nid)
-            .chain(disconnected.into_iter().map(|s| s.nid))
-            .collect();
+        let mut candidates: Vec<_> = connected.into_iter().map(|seed| seed.nid).collect();
 
-        // A fresh node has an empty routing table until gossip arrives;
-        // fall back to the configured preferred seeds (same as `rad clone`).
-        for seed in &self.profile.config.preferred_seeds {
-            if !candidates.contains(&seed.id) {
-                candidates.push(seed.id);
+        // A fresh node has an empty routing table until gossip arrives. Fall
+        // back to the effective seed book, but only to sessions that are
+        // actually connected; an undialed seed would otherwise consume the
+        // clone's retry budget while reporting "not connected".
+        let connected_sessions = self.connected_seed_ids()?;
+        for seed in self.seed_book.iter() {
+            if connected_sessions.contains(&seed.nid()) && !candidates.contains(&seed.nid()) {
+                candidates.push(seed.nid());
+            }
+        }
+        // Known-but-disconnected repository seeders remain useful as a last
+        // resort, after every live candidate. This avoids spending the whole
+        // handshake retry budget before trying an already-connected seed.
+        for seed in disconnected {
+            if !candidates.contains(&seed.nid) {
+                candidates.push(seed.nid);
             }
         }
 
@@ -347,12 +511,10 @@ impl Network {
 
         // Addresses for nicer "Connecting to <host>" progress labels.
         let addr_of = |nid: &NodeId| -> String {
-            self.profile
-                .config
-                .preferred_seeds
+            self.seed_book
                 .iter()
-                .find(|s| s.id == *nid)
-                .map(|s| s.addr.to_string())
+                .find(|seed| seed.nid() == *nid)
+                .map(|seed| seed.address.addr.to_string())
                 .unwrap_or_else(|| nid.to_string())
         };
 
@@ -451,6 +613,7 @@ fn cancel_sleep(dur: &Duration, cancel: &CancelToken) -> bool {
 pub struct Embedded {
     profile: Profile,
     handle: NodeHandle,
+    seed_book: Arc<Vec<seeds::Candidate>>,
     node_thread: Option<JoinHandle<Result<(), radicle_node::runtime::Error>>>,
     /// Keeps the node's signal channel open for the runtime's lifetime.
     _signals: mpsc::Sender<radicle_signals::Signal>,
@@ -476,6 +639,7 @@ impl Embedded {
             });
             Profile::init(home.clone(), alias, None, seed)?
         };
+        let seed_book = Arc::new(seeds::effective(&profile)?);
 
         // In-process signer: load the (unencrypted) secret key.
         let keystore = Keystore::from_secret_path(&profile.home.keys().join("radicle"));
@@ -495,6 +659,9 @@ impl Embedded {
             sig_rx,
             signer,
         )?;
+        if !seed_book.is_empty() {
+            seeds::install(&profile)?;
+        }
         let handle = runtime.handle.clone();
         let node_thread = std::thread::Builder::new()
             .name("radicle-node".to_string())
@@ -503,6 +670,7 @@ impl Embedded {
         Ok(Self {
             profile,
             handle,
+            seed_book,
             node_thread: Some(node_thread),
             _signals: sig_tx,
         })
@@ -527,10 +695,16 @@ impl Embedded {
         Network {
             profile: self.profile.clone(),
             handle: self.handle.clone(),
+            seed_book: Arc::clone(&self.seed_book),
         }
     }
 
-    /// Connect to the profile's configured preferred seeds.
+    /// Connect to the effective seed book and return detailed diagnostics.
+    pub fn connect_seed_book(&self, timeout: Duration) -> Result<SeedConnectReport, Error> {
+        self.network().connect_seed_book(timeout)
+    }
+
+    /// Compatibility entry point returning only the connected seed count.
     pub fn connect_preferred_seeds(&self, timeout: Duration) -> Result<usize, Error> {
         self.network().connect_preferred_seeds(timeout)
     }

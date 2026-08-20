@@ -25,7 +25,8 @@ let node = Embedded::start(Options {
     alias: "my-app".into(),
     listen: vec![],            // outbound-only
 })?;
-node.connect_preferred_seeds(Duration::from_secs(15))?;
+let bootstrap = node.connect_seed_book(Duration::from_secs(15))?;
+assert!(bootstrap.target_reached); // four peers ready; dials run concurrently
 node.clone_repo(rid, Duration::from_secs(120))?;   // seed + fetch, bare storage only
 
 // …or stream progress and support cancellation:
@@ -54,6 +55,14 @@ repository import/list/seed/unseed, storage reads, and issue/patch mutations
 to Node.js / Electron as JSON-string-returning async functions;
 `napi/smoke.mjs` is a live-network end-to-end test.
 
+Cold starts merge explicit user seeds with a shipped, independents-first
+14-node DNS seed book. Six dials run concurrently with a five-second per-seed
+timeout and stop pulling new candidates when four connections stand. Successful
+outcomes are retained by Heartwood's local `node.db`, so later starts promote
+the seeds that work from that device's network position. Setting
+`preferredSeeds` to an empty list remains an explicit opt-out for isolated
+profiles.
+
 `cloneRepoWithProgress(rid, timeoutMs, cb)` pushes one JSON progress event
 per phase to a `(event: string) => void` callback (via a napi
 ThreadsafeFunction) and can be cancelled mid-flight with `cancelClone(rid)`;
@@ -66,6 +75,9 @@ release build to verify historical reads and signed remote/stat shapes against
 a temporary two-commit repository.
 
 ## Building
+
+The workspace pins Rust 1.94 because the Heartwood revision used by the
+embedded runtime does not compile with older Rust releases.
 
 ```bash
 cargo build --release -p libradicle-napi
