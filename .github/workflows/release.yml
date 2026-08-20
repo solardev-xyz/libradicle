@@ -26,6 +26,9 @@ jobs:
             }
           - { os: ubuntu-22.04, key: linux-x64, lib: liblibradicle_napi.so }
           - { os: ubuntu-24.04-arm, key: linux-arm64, lib: liblibradicle_napi.so }
+          # Windows: the cdylib has no `lib` prefix and a `.dll` suffix.
+          # `napi_build::setup()` (napi/build.rs) handles the delay-load link.
+          - { os: windows-latest, key: win-x64, lib: libradicle_napi.dll }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -33,8 +36,10 @@ jobs:
           targets: ${{ matrix.target || '' }}
       - uses: Swatinem/rust-cache@v2
       - name: Build napi addon
+        shell: bash
         run: cargo build --release -p libradicle-napi ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
       - name: Rename artifact
+        shell: bash
         run: cp target/${{ matrix.target && format('{0}/', matrix.target) || '' }}release/${{ matrix.lib }} libradicle-${{ matrix.key }}.node
       - uses: actions/upload-artifact@v4
         with:

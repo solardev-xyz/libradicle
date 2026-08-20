@@ -1,0 +1,25 @@
+name: windows-check
+
+# One-off de-risking: confirm the full embedded stack (vendored libgit2, gix,
+# flate2/sha1, the serve-in-process module) links on windows-msvc before we
+# add Windows to the release matrix. Trigger manually: `gh workflow run
+# windows-check.yml`.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build napi addon (msvc, default features)
+        shell: bash
+        run: cargo build --release -p libradicle-napi
+      - name: Build napi addon (serve-in-process)
+        shell: bash
+        run: cargo build --release -p libradicle-napi --features libradicle/no-spawn
+      - name: Confirm the dll was produced
+        shell: bash
+        run: ls -la target/release/libradicle_napi.dll
