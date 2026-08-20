@@ -1,0 +1,514 @@
+[
+  {
+    "address": "z6MktPgLsgsww5zavvM4UownrwhFK2AkwZLjnzDPbhngbJWC@radicle-seed.b4mad.industries:8776",
+    "alias": "radicle-seed.b4mad.industries",
+    "agent": "radicle:1",
+    "seededRepos": 3215,
+    "lastSuccessHoursAgo": 6,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkgcsJQsnEZy66CbJh8LpCL31JEmooNrKjTNR5J4dzx57K@radicle.pastilhas.dev:8776",
+    "alias": "radicle.pastilhas.dev",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 3007,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkjDYUKMUeY58Vtr8dGJrHRvnTfjKWVGCBYJDVTHXsXzm5@seed.radicle.at:8776",
+    "alias": "radicle.at",
+    "agent": "radicle:1.0.0-rc.12",
+    "seededRepos": 2990,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6Mkq9eUruFTBtgqqLAHGR8gmsnC556ftMQsNuNravqYL4Dw@radicle.spacetime.technology:8776",
+    "alias": "radicle.spacetime.technology",
+    "agent": "radicle:1.0.0-rc.12",
+    "seededRepos": 2978,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkmvNrdsAihAGD4vz3wN7U8hy7SmZpBoDe28K1m3GFjkf2@seed.cielago.xyz:8776",
+    "alias": "seed.cielago.xyz",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 2977,
+    "lastSuccessHoursAgo": 6,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6Mkif1kaohyuJFSZ43d4V6HFJWwQo7rvLFHbkanRYSt9EL5@seed.kat5.dev:8776",
+    "alias": "seed.kat5.dev",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 2975,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkmXdBVkNiieUuEAgS6Td4qMzqP969tFfTpe3Lx79iS2Wf@seed.pipapo.org:8776",
+    "alias": "seed.pipapo.org",
+    "agent": "radicle:1",
+    "seededRepos": 2975,
+    "lastSuccessHoursAgo": 2,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkveTP2pCvbQ2VRexSdUG7kmEXWkuFYH5Aj1hKMwD3Gcx4@seed.moist.place:8776",
+    "alias": "seed.moist.place",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 2974,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkhHXZVv2g2Edg9WNBDrAY8r6VTvCeqX3q8BpSfxfptYL9@seed.petal.cafe:8776",
+    "alias": "seed.petal.cafe",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 2974,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6Mkmqogy2qEM2ummccUthFEaaHvyYmYBYh3dbe9W4ebScxo@rosa.radicle.network:58776",
+    "alias": "rosa.radicle.network",
+    "agent": "radicle:1.10.0-rc.2",
+    "seededRepos": 2973,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7@iris.radicle.network:58776",
+    "alias": "iris.radicle.network",
+    "agent": "radicle:1.10.0-rc.2",
+    "seededRepos": 2973,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkiwJ4Y9Zuwx8oeTftuqQNdBDd9g6M8XCUoQXPz6bgkbQ7@seed.heptapod.dev:8776",
+    "alias": "seed.heptapod.dev",
+    "agent": "radicle:1.10.1",
+    "seededRepos": 2973,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkwfrBy9mKTfcVELcV4wc6zfN379FPMnAqsxnwt4j2TdQ2@radicle.jarg.io:8776",
+    "alias": "radicle.jarg.io",
+    "agent": "radicle:1.10.1-4-gf92d512c",
+    "seededRepos": 2973,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkvswafXNZe3VeZG8yAuxbXiwMV4paK19nZQLptxs6r7pE@seed.thefarshore.dev:8776",
+    "alias": "seed.thefarshore.dev",
+    "agent": "radicle:1.10.1",
+    "seededRepos": 2727,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6Mkm3QV7chqdCrksAYoJDWpwLg1yoXbU52NZFgWq13bv3gp@radicle.thalheim.io:8776",
+    "alias": "radicle-mirror",
+    "agent": "radicle:1.10.1",
+    "seededRepos": 223,
+    "lastSuccessHoursAgo": 12,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6Mkfg8bP9CVPHYfHKiT4bkgrTdJvwFfxZCo48nYLjWmBvEp@radicle.defelo.de:8776",
+    "alias": "radicle.defelo.de",
+    "agent": "radicle:1.10.1",
+    "seededRepos": 66,
+    "lastSuccessHoursAgo": 12,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6Mkondm5dgAxsQnV3iuvZBCGMAQgfAg4zSdJWoNVJr7i7wp@defelo.de:58776",
+    "alias": "Defelo",
+    "agent": "radicle:1.10.1",
+    "seededRepos": 46,
+    "lastSuccessHoursAgo": 23,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MknwwMpmZET1PcvQjPYhA6hGY7wkYzxb9YtSRh5j2qSQdG@rad.hardenedbsd.org:8776",
+    "alias": "HardenedBSD-Sync-Server-01",
+    "agent": "radicle:1.10.1",
+    "seededRepos": 32,
+    "lastSuccessHoursAgo": 22,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MktbmhQxBYWcqE6MTRd4XEp8gKtfrxafmqiotqjyxphc5P@radicle.dpc.pw:8776",
+    "alias": "radicle.dpc.pw",
+    "agent": "radicle:1.10.1",
+    "seededRepos": 30,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkfcdTENM9siHRRPZKstq7n5jyD3ZXvgp6fG2MKuPkMQeG@seed.kaiyak.de:8776",
+    "alias": "seed.kaiyak.de",
+    "agent": "radicle:1.10.1",
+    "seededRepos": 20,
+    "lastSuccessHoursAgo": 23,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6Mkv4cJuPNpjK33WiVhQYLBPpFirAPGdGV7A3mqcDUh8KSb@radicle.norman.life:58003",
+    "alias": "daniel",
+    "agent": "radicle:1.9.1-51-g3066c10e",
+    "seededRepos": 17,
+    "lastSuccessHoursAgo": 22,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6Mkk5qPPUNU7BwsjnF8QjgyXano7kLTcNV6cZLNAaXcii3T@rad.tsimnet.eu:8776",
+    "alias": "rad.tsimnet.eu",
+    "agent": "radicle:1.10.0-rc.2",
+    "seededRepos": 16,
+    "lastSuccessHoursAgo": 22,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkhJKKVmjsA2MVrMMqMe2Au7bx8bUVtzWh2A9J3JWTeZAB@seed.boers.email:8776",
+    "alias": "shoryuken",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 15,
+    "lastSuccessHoursAgo": 22,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkjppmhbrerkW4S31ijRVfBJpyyfTza6c4i9weqF5phLWk@rad.teleghosts.app:8776",
+    "alias": "rad.teleghosts.app",
+    "agent": "radicle:1.10.1",
+    "seededRepos": 12,
+    "lastSuccessHoursAgo": 17,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6Mkhoauq6SekMBoRYWLJhbD4ZdTiKKAKeM8UR2x5vQGM3qR@radicle-mermet.sourcephile.fr:8776",
+    "alias": "radicle-mermet.sourcephile.fr",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 10,
+    "lastSuccessHoursAgo": 17,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6Mkqb7xEU6G6Ru66EVhTr7uhHyW8f1uT99n8BnKVeSjXRq5@xbx.ovh:8776",
+    "alias": "xbx.ovh",
+    "agent": "radicle:1.10.1",
+    "seededRepos": 8,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkgAtMovNPMasEowZWiBJPSgdKU6ecDZKmV3pQgC6fteby@kristoff.radicle.garden:58014",
+    "alias": "kristoff",
+    "agent": "radicle:1",
+    "seededRepos": 8,
+    "lastSuccessHoursAgo": 23,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkeiacB2PjqgAc9Hyi1oGW5U43RRXVMBBgJ3586gYdXTtU@46.224.149.156:8776",
+    "alias": "jenkins1",
+    "agent": "radicle:1.10.1",
+    "seededRepos": 5,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "ipv4"
+  },
+  {
+    "address": "z6MkuTwHXrp393zFN62o8KSixWGf38wxi47VBZkKoAF8RW3K@radicle.grizz.top:8776",
+    "alias": "radicle.grizz.top",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 5,
+    "lastSuccessHoursAgo": 6,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkkV8YjYkBowG8oFyMqwe1Lnp3B9TmJtTSjNNFY6mcxGJY@64.176.225.253:8776",
+    "alias": "taps",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 5,
+    "lastSuccessHoursAgo": 22,
+    "addrType": "ipv4"
+  },
+  {
+    "address": "z6MkebT3MM43SoWGGn5koi1pEWwjjowraSbTfo81fwtQPdu3@51.83.76.76:8776",
+    "alias": "cedev-node",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 4,
+    "lastSuccessHoursAgo": 17,
+    "addrType": "ipv4"
+  },
+  {
+    "address": "z6MkknA8ZBs8bgdx8BozjrBY1c9u1PEBZYjAtTSfhGBxH9ap@[2a01:4f8:1c17:5cdf::16]:8776",
+    "alias": "omo",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 2,
+    "lastSuccessHoursAgo": 23,
+    "addrType": "ipv6"
+  },
+  {
+    "address": "z6Mkkzcwy92fr3t6b5T6uH4LGC54AY6S1UaMdb5SmqCmNaWT@radicle.kayh.dev:8776",
+    "alias": "radicle.kayh.dev",
+    "agent": "radicle:1",
+    "seededRepos": 2,
+    "lastSuccessHoursAgo": 24,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MksW9jjJurZz968iWAJJwdj7zJBDPXmcTdDxCA8je3UuX5@132-145-248-26.sslip.io:8776",
+    "alias": "smithy",
+    "agent": "radicle:1.1.0",
+    "seededRepos": 1,
+    "lastSuccessHoursAgo": 6,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkjUYRz3tnNcYD3mJLfDc5Qz5QikdkFVqVMYBsU4rAYZf2@seed.salted.fish:8776",
+    "alias": "seed.salted.fish",
+    "agent": "radicle:1.1.0",
+    "seededRepos": 1,
+    "lastSuccessHoursAgo": 12,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MknYm3iSpuY5hLCH93K5Ls5KG7cBK4fQwybqcHzxDsT2jU@nandi.radicle.garden:58019",
+    "alias": "nandi",
+    "agent": "radicle:1",
+    "seededRepos": 1,
+    "lastSuccessHoursAgo": 12,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MknNnpkpM31zKuvmjxm3HRNq9HyW1MvSm3GUq6P2Sn1ext@[2a11:6c7:f04:2a5::2]:8776",
+    "alias": "mwaddip",
+    "agent": "radicle:1.10.1",
+    "seededRepos": 1,
+    "lastSuccessHoursAgo": 12,
+    "addrType": "ipv6"
+  },
+  {
+    "address": "z6Mktu4SnDW2cvsvuJ3ZHDK28YxCj2aA6wZGVvLTcCc4w4kL@radicle.6j0.org:8776",
+    "alias": "radicle.6j0.org",
+    "agent": "radicle:1.10.1",
+    "seededRepos": 1,
+    "lastSuccessHoursAgo": 20,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkecV6fvxCYJuHxNfzm7QAWpzpJ5DPfJUmXViaHoP4RwXA@seed.flo-the.dev:8776",
+    "alias": "seed.flo-the.dev",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 1,
+    "lastSuccessHoursAgo": 22,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MknWo6qJ7hA67bhNrnLGpiHRhzPgvRcwXfhX14L8kqcNK1@radicle.temporus.me:8776",
+    "alias": "radicle.temporus.me",
+    "agent": "radicle:1.10.0",
+    "seededRepos": 1,
+    "lastSuccessHoursAgo": 22,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkvQ659oHhCEACN6DVzGYmBNjm4A7CtAVdhgVWZGGtms6H@radicle.marvin8.zone:8776",
+    "alias": "radicle.marvin8.zone",
+    "agent": "radicle:1.10.1",
+    "seededRepos": 1,
+    "lastSuccessHoursAgo": 23,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6Mkv4eWtAXYgN8jnFD3v7KpS1uRnF7iQ51rwkjvxRmxgokt@45.233.44.253:8776",
+    "alias": "sufficit-seed",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 1,
+    "lastSuccessHoursAgo": 69,
+    "addrType": "ipv4"
+  },
+  {
+    "address": "z6MkqdRJsqCZmQRGMqh5wz8oJnAv95wUPPk6HP2ZtuJXVvEp@seed.agnos.is:8776",
+    "alias": "seed.agnos.is",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6Mkvwz3RdysksDdnAPBQUgR6ZqyLsszHtE5HePvjFpZ374f@code.barton.de:8776",
+    "alias": "code.barton.de",
+    "agent": "radicle:1.10.0",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 0,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkpDTpjYX5bo6fMKgfkF4BsYgsjdjs7rwoymr5foUFWxV2@seed.pp0.co:8776",
+    "alias": "seed.pp0.co",
+    "agent": "radicle:1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 6,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MksQez4YdSUeq3Mm2jMprXArDCNCTu7LY4VjSTT8i9FJZo@radicle.tanti.org.uk:8776",
+    "alias": "empiria",
+    "agent": "radicle:1.9.1-dirty",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 6,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkmWr3rEHX447Vz8Ubfevcj6yQmRmutwoKrnuwEKb27rfa@madeorigin.radicle.garden:58018",
+    "alias": "madeorigin",
+    "agent": "radicle:1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 12,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkgCm6Cizoyzf8jg61pophzT1fJs87sd51cJNATRtatUZK@seed.jaryk.xyz:8776",
+    "alias": "seed.jaryk.xyz",
+    "agent": "radicle:1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 17,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6Mkk9MiV9BS8yBmBQZZXyL9Z7tNSpLsoweVg2eVy3JEq1ek@78.47.233.92:8776",
+    "alias": "willi-seed",
+    "agent": "radicle:1.10.0",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 17,
+    "addrType": "ipv4"
+  },
+  {
+    "address": "z6MkfhQiVgkf6qL9WJ7ChH37wcQ73CW2PsnfHYiSy9GkxkaH@seed.fatelectron.net:8776",
+    "alias": "seed.fatelectron.net",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 20,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkqZR1f3mEqNpnATy5mqqjyaKyKLkuP4SRREaSHEXJo5WW@radicle.neroots.net:8776",
+    "alias": "radicle.neroots.net",
+    "agent": "radicle:1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 20,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MknQtoxMc9E8yrGcqPL4b8Qe6C7QYbitLoXvNTh6HSSGSC@radicle.su3.io:8776",
+    "alias": "radicle.su3.io",
+    "agent": "radicle:1.10.0-rc.2-21-g71a91042",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 20,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkkCdmALKxPTAuGDFjtfMdGhxJ72GzsoYX8x4W7ZVEPsDd@primica.radicle.garden:58013",
+    "alias": "primica",
+    "agent": "radicle:1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 20,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkiwGBp1ji7LivURtp6t76E7KRWVjQNktNJkk9aFCaxUDm@radicle.nurbox01.mcrd.net:8776",
+    "alias": "radicle.nurbox01.mcrd.net",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 20,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkvCkpqmPDQ6aqg6L99k3PNCi6e3pYaET6AMzUJSPHQivV@sjaellandsg38.homeip.net:8776",
+    "alias": "alarm@ermedbz",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 22,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkrD3cU88eeqtUZaLJQnmEanBXLB8B2HmAEy7njHZrUNwV@seed.linusrogge.com:8776",
+    "alias": "seed.linusrogge.com",
+    "agent": "radicle:1.10.0",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 22,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkhtregaJgTc8qXAwymPnLfKSrnHMgU824w2YwuUsivtAd@apps.dark.fi:8776",
+    "alias": "x",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 22,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6Mkgbr32rdK7DwHJgePqTEnv8fUTV2kE2j83RaWkFEYtRNS@radicle.z572.online:8776",
+    "alias": "radicle.z572.online",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 22,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6Mkuut4Wv1PjiPK9sZP4rG1osM3SRokVAvbgmP3ofwosikZ@seed.softwerf.nl:8776",
+    "alias": "seed.softwerf.nl",
+    "agent": "radicle:1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 22,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkhnbBw4n4Mhqv3joXvYmnDRMJtrY3dNpnbebaaD26N5ui@bakery.radicle.garden:58012",
+    "alias": "bakery",
+    "agent": "radicle:1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 23,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MktoHHHW9PeuMofkmUE5uLmcaMdLie9pX3RU7REDnkXsSY@152.42.213.18:8776",
+    "alias": "gabriel-seeder",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 23,
+    "addrType": "ipv4"
+  },
+  {
+    "address": "z6MkfCRoDQzRiBgPQy4ktw3zhBmvzQR9PFeptxSqeGTkYMWp@ai.oli.kbt.io:8776",
+    "alias": "strk@ai.oli",
+    "agent": "radicle:1.10.0",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 24,
+    "addrType": "dns"
+  },
+  {
+    "address": "z6MkqmfBui5x8eW78nKHra4U6c4igHKdUswVgFLFV9RJJZmb@23.94.65.218:8776",
+    "alias": "lantian-colocrossing",
+    "agent": "radicle:1.9.1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 24,
+    "addrType": "ipv4"
+  },
+  {
+    "address": "z6MkwV59ZUMFfotX6kSv5iAaLCi3maiakSyrbPqtQUiEC6FL@tel.radicle.garden:58020",
+    "alias": "tel",
+    "agent": "radicle:1",
+    "seededRepos": 0,
+    "lastSuccessHoursAgo": 24,
+    "addrType": "dns"
+  }
+]
