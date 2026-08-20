@@ -37,7 +37,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build napi addon
         shell: bash
-        run: cargo build --release -p libradicle-napi ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+        # `no-spawn` on every platform: Freedom ships self-contained, with no
+        # system `git` dependency (serve in-process, skip git gc).
+        run: cargo build --release -p libradicle-napi --features no-spawn ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
       - name: Rename artifact
         shell: bash
         run: cp target/${{ matrix.target && format('{0}/', matrix.target) || '' }}release/${{ matrix.lib }} libradicle-${{ matrix.key }}.node
