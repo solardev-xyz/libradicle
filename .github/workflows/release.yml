@@ -29,6 +29,12 @@ jobs:
           # Windows: the cdylib has no `lib` prefix and a `.dll` suffix.
           # `napi_build::setup()` (napi/build.rs) handles the delay-load link.
           - { os: windows-latest, key: win-x64, lib: libradicle_napi.dll }
+          - {
+              os: windows-latest,
+              key: win-arm64,
+              lib: libradicle_napi.dll,
+              target: aarch64-pc-windows-msvc,
+            }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

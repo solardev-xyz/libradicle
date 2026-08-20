@@ -1,25 +1,46 @@
 name: windows-check
 
-# One-off de-risking: confirm the full embedded stack (vendored libgit2, gix,
-# flate2/sha1, the serve-in-process module) links on windows-msvc before we
-# add Windows to the release matrix. Trigger manually: `gh workflow run
-# windows-check.yml`.
+# Confirm the released no-spawn stack (vendored libgit2, gix, flate2/sha1,
+# and in-process upload-pack) links for every supported Windows architecture.
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/windows-check.yml"
+      - ".github/workflows/release.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "napi/**"
+      - "src/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/windows-check.yml"
+      - ".github/workflows/release.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "napi/**"
+      - "src/**"
 
 jobs:
   build:
+    name: build (${{ matrix.key }})
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { key: win-x64 }
+          - { key: win-arm64, target: aarch64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target || '' }}
       - uses: Swatinem/rust-cache@v2
-      - name: Build napi addon (msvc, default features)
+      - name: Build released napi addon
         shell: bash
-        run: cargo build --release -p libradicle-napi
-      - name: Build napi addon (serve-in-process)
-        shell: bash
-        run: cargo build --release -p libradicle-napi --features libradicle/no-spawn
+        run: cargo build --release -p libradicle-napi --features no-spawn ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
       - name: Confirm the dll was produced
         shell: bash
-        run: ls -la target/release/libradicle_napi.dll
+        run: ls -la target/${{ matrix.target && format('{0}/', matrix.target) || '' }}release/libradicle_napi.dll

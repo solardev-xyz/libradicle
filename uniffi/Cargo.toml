@@ -1,6 +1,6 @@
 [package]
 name = "libradicle-uniffi"
-version = "0.6.0"
+version = "0.6.1"
 description = "UniFFI (Swift/iOS) binding over libradicle — the iOS half of Freedom Browser's Radicle integration"
 edition = "2021"
 license = "MIT OR Apache-2.0"

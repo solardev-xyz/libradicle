@@ -101,7 +101,10 @@ fn comment_json<L>(
     })
 }
 
-fn issue_json(id: &radicle::cob::ObjectId, issue: &radicle::cob::issue::Issue) -> serde_json::Value {
+fn issue_json(
+    id: &radicle::cob::ObjectId,
+    issue: &radicle::cob::issue::Issue,
+) -> serde_json::Value {
     serde_json::json!({
         "id": id.to_string(),
         "author": issue.author(),
@@ -113,7 +116,10 @@ fn issue_json(id: &radicle::cob::ObjectId, issue: &radicle::cob::issue::Issue) -
     })
 }
 
-fn patch_json(id: &radicle::cob::ObjectId, patch: &radicle::cob::patch::Patch) -> serde_json::Value {
+fn patch_json(
+    id: &radicle::cob::ObjectId,
+    patch: &radicle::cob::patch::Patch,
+) -> serde_json::Value {
     let revisions = patch
         .revisions()
         .map(|(id, revision)| {
@@ -388,7 +394,12 @@ pub fn patch(rid: String, patch_id: String) -> String {
 
 /// Create an issue directly in the COB store. `labels_json` is a JSON string array.
 #[uniffi::export]
-pub fn create_issue(rid: String, title: String, description: String, labels_json: String) -> String {
+pub fn create_issue(
+    rid: String,
+    title: String,
+    description: String,
+    labels_json: String,
+) -> String {
     let rid = match parse_rid(&rid) {
         Ok(r) => r,
         Err(e) => return err_json(e),
@@ -407,7 +418,12 @@ pub fn create_issue(rid: String, title: String, description: String, labels_json
 
 /// Comment on an issue.
 #[uniffi::export]
-pub fn comment_issue(rid: String, issue_id: String, body: String, reply_to: Option<String>) -> String {
+pub fn comment_issue(
+    rid: String,
+    issue_id: String,
+    body: String,
+    reply_to: Option<String>,
+) -> String {
     let rid = match parse_rid(&rid) {
         Ok(r) => r,
         Err(e) => return err_json(e),
@@ -450,7 +466,12 @@ pub fn comment_patch(rid: String, revision_id: String, body: String) -> String {
 /// heartwood shells out to `git` to push a working copy, so this is unavailable
 /// on a no-spawn build.
 #[uniffi::export]
-pub fn import_repo(path: String, name: String, description: String, default_branch: String) -> String {
+pub fn import_repo(
+    path: String,
+    name: String,
+    description: String,
+    default_branch: String,
+) -> String {
     with_node(|node| {
         match node.import_repo(
             std::path::Path::new(&path),

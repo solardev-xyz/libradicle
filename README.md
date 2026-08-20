@@ -70,7 +70,17 @@ a temporary two-commit repository.
 ```bash
 cargo build --release -p libradicle-napi
 # → target/release/liblibradicle_napi.{so,dylib}  (rename to libradicle.node)
+
+# Cross-compile the Windows ARM64 addon from a Windows MSVC host:
+rustup target add aarch64-pc-windows-msvc
+cargo build --release -p libradicle-napi --features no-spawn \
+  --target aarch64-pc-windows-msvc
+# → target/aarch64-pc-windows-msvc/release/libradicle_napi.dll
 ```
+
+Tagged releases publish napi addons for macOS, Linux, and Windows on both x64
+and ARM64. The Windows assets are named `libradicle-win-x64.node` and
+`libradicle-win-arm64.node`.
 
 Depends on the `freedom/embed` branch of
 [`solardev-xyz/heartwood`](https://github.com/solardev-xyz/heartwood) — a
@@ -87,11 +97,9 @@ radicle-signals = { path = "../heartwood/crates/radicle-signals" }
 
 ## Features
 
-- `no-spawn` — the node runtime starts no child processes: it declines to
-  serve inbound fetches and skips `git gc`. Required on iOS; leave **off**
-  on desktop, where the node serves and publishes normally. Publishing
-  from a `no-spawn` build is not possible until in-process upload-pack
-  lands (follow-up work).
+- `no-spawn` — the node runtime starts no child processes: it serves inbound
+  fetches in-process and skips `git gc`. Required on iOS and used by Freedom's
+  self-contained desktop release addons.
 - `import_repo` is desktop-only: heartwood currently invokes the system
   `git` executable to push a working copy into storage. Omit this method from
   iOS bindings until that push is implemented in-process.
