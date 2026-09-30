@@ -1,6 +1,6 @@
 [package]
 name = "libradicle"
-version = "0.7.1"
+version = "0.8.0"
 description = "Embeddable Radicle facade: profile + in-process node + storage reads, one crate for desktop (napi) and iOS (uniffi) bindings"
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -15,6 +15,7 @@ git2 = { version = "0.21", default-features = false }
 radicle-signals = { git = "https://github.com/solardev-xyz/heartwood", rev = "c208df3ac7626402db60752f1f38d31465731f01" }
 log = "0.4"
 thiserror = "2"
+zeroize = "1"
 
 [features]
 ## No child processes anywhere: serve fetches in-process (libgit2 + a

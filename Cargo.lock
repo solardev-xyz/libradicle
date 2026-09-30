@@ -2099,7 +2099,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libradicle"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -2111,11 +2111,12 @@ dependencies = [
  "radicle-signals",
  "radicle-surf",
  "thiserror 2.0.20",
+ "zeroize",
 ]
 
 [[package]]
 name = "libradicle-napi"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "libradicle",
  "napi",
@@ -2127,7 +2128,7 @@ dependencies = [
 
 [[package]]
 name = "libradicle-uniffi"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "libradicle",
  "radicle",
