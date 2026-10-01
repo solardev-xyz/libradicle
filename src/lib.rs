@@ -658,9 +658,13 @@ impl HostKey {
     /// `None` if it isn't 32 bytes long.
     pub fn from_bytes(bytes: &mut [u8]) -> Option<Self> {
         use zeroize::Zeroize as _;
-        let key = <[u8; 32]>::try_from(&*bytes)
-            .ok()
-            .map(|seed| Self(zeroize::Zeroizing::new(seed)));
+        // Copy straight into the zeroizing buffer, never through a bare
+        // stack array that would outlive the call unwiped.
+        let key = (bytes.len() == 32).then(|| {
+            let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+            seed.copy_from_slice(bytes);
+            Self(seed)
+        });
         bytes.zeroize();
         key
     }
@@ -696,14 +700,24 @@ impl Embedded {
         let profile = if home.keys().join("radicle").exists() {
             Profile::load_from(home.clone())?
         } else {
-            let alias = Alias::new(&opts.alias);
             let seed = radicle::profile::env::seed().unwrap_or_else(|| {
                 use radicle::crypto::Seed;
                 let mut seed = [0; Seed::BYTES];
                 getrandom::fill(&mut seed).expect("failed to get OS randomness");
                 Seed::new(seed)
             });
-            Profile::init(home.clone(), alias, None, seed)?
+            if home.config().exists() {
+                // The home was created by `start_with_key`: it has a config
+                // (perhaps customized since) and databases, just no key file
+                // of its own. Add the key and keep the rest — `Profile::init`
+                // would overwrite config.json with defaults.
+                Keystore::new(&home.keys())
+                    .init("radicle", None, seed)
+                    .map_err(radicle::profile::Error::from)?;
+                Profile::load_from(home.clone())?
+            } else {
+                Profile::init(home.clone(), Alias::new(&opts.alias), None, seed)?
+            }
         };
         // In-process signer: load the (unencrypted) secret key.
         let keystore = Keystore::from_secret_path(&profile.home.keys().join("radicle"));
@@ -729,7 +743,11 @@ impl Embedded {
     /// seeded under the other.
     pub fn start_with_key(opts: Options, key: HostKey) -> Result<Self, Error> {
         let home = Home::new(opts.home.clone())?;
-        let signer = radicle::crypto::SigningKey::from_seed(radicle::crypto::Seed::new(*key.0));
+        // Expand the seed by reference: `Seed::new` takes the array by value,
+        // which would leave a bare copy of it on the stack. dalek's key
+        // zeroizes itself on drop.
+        let signer =
+            radicle::crypto::SigningKey::from(ed25519_dalek::SigningKey::from_bytes(&key.0));
         drop(key);
         let public_key = *AsRef::<radicle::crypto::PublicKey>::as_ref(&signer);
         let profile = host_profile(home, &opts.alias, public_key)?;

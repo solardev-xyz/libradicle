@@ -2102,6 +2102,7 @@ name = "libradicle"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "ed25519-dalek",
  "env_logger",
  "getrandom 0.4.3",
  "git2",

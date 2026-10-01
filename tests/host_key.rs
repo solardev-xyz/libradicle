@@ -20,15 +20,27 @@ fn key() -> HostKey {
 }
 
 fn opts(home: &str) -> Options {
-    Options { home: home.into(), alias: "host-key-test".into(), listen: vec![] }
+    Options {
+        home: home.into(),
+        alias: "host-key-test".into(),
+        listen: vec![],
+    }
 }
 
 #[test]
 fn host_key_runs_as_that_key_and_keeps_the_profiles_own() {
-    let home = format!("/tmp/radhk-{}", std::process::id());
+    // Under TMPDIR, so the control socket lands at its default place in the
+    // home (no process-wide RAD_SOCKET); fall back to /tmp only if TMPDIR is
+    // too deep for a Unix socket path.
+    let name = format!("radhk-{}", std::process::id());
+    let mut home = std::env::temp_dir().join(&name);
+    if home.join("node/control.sock").as_os_str().len() > 100 {
+        home = std::path::Path::new("/tmp").join(&name);
+    }
+    let home = home.to_str().expect("utf-8 temp dir").to_owned();
     let _ = std::fs::remove_dir_all(&home);
-    std::env::set_var("RAD_SOCKET", format!("/tmp/radhk-{}.sock", std::process::id()));
     let secret_file = std::path::Path::new(&home).join("keys/radicle");
+    let config_file = std::path::Path::new(&home).join("config.json");
 
     // A fresh home: the profile is created, but no key file is written.
     let node = Embedded::start_with_key(opts(&home), key()).expect("start with a host key");
@@ -36,13 +48,35 @@ fn host_key_runs_as_that_key_and_keeps_the_profiles_own() {
     node.shutdown().expect("clean shutdown");
     assert!(!secret_file.exists(), "no secret key file");
     let keys = std::path::Path::new(&home).join("keys");
-    assert!(!keys.exists() || std::fs::read_dir(&keys).unwrap().next().is_none(), "keys/ stays empty");
+    assert!(
+        !keys.exists() || std::fs::read_dir(&keys).unwrap().next().is_none(),
+        "keys/ stays empty"
+    );
 
-    // Without a host key the node makes (and keeps) its own.
+    // The host customizes the config created under the host identity.
+    let config = std::fs::read_to_string(&config_file).expect("config written");
+    assert!(config.contains("\"host-key-test\""));
+    std::fs::write(
+        &config_file,
+        config.replace("\"host-key-test\"", "\"customized\""),
+    )
+    .unwrap();
+
+    // Without a host key the node makes (and keeps) its own, and leaves the
+    // existing config alone.
     let node = Embedded::start(opts(&home)).expect("start with the profile's key");
     let device = node.did();
     assert_ne!(device, DID);
     node.shutdown().expect("clean shutdown");
+    let config = std::fs::read_to_string(&config_file).unwrap();
+    assert!(
+        config.contains("\"customized\""),
+        "config.json kept: {config}"
+    );
+    assert!(
+        !config.contains("\"host-key-test\""),
+        "config.json not reset: {config}"
+    );
     let device_key = std::fs::read(&secret_file).expect("device key written");
 
     // The host key again: its identity, the device key file untouched.

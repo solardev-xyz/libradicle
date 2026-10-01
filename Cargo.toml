@@ -16,6 +16,7 @@ radicle-signals = { git = "https://github.com/solardev-xyz/heartwood", rev = "c2
 log = "0.4"
 thiserror = "2"
 zeroize = "1"
+ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
 
 [features]
 ## No child processes anywhere: serve fetches in-process (libgit2 + a
