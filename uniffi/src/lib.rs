@@ -210,6 +210,46 @@ pub fn start(home: String, alias: String) -> String {
     }
 }
 
+/// Start the embedded node as `secret_key`, an identity the host keeps
+/// (a 32-byte Ed25519 secret seed), instead of the profile's own key file.
+/// Nothing secret is written to `home`. `{"did": "..."}` on success.
+///
+/// Only the Rust-side copy of `secret_key` is zeroed before this returns.
+/// The foreign array the host passed in (Kotlin `ByteArray`, Swift `Data`)
+/// and the buffer UniFFI copied it through are *not* wiped here — the host
+/// must clear its own array after the call and should keep the key out of
+/// long-lived managed objects.
+#[uniffi::export]
+pub fn start_with_key(home: String, alias: String, secret_key: Vec<u8>) -> String {
+    let mut secret_key = secret_key;
+    let key = libradicle::HostKey::from_bytes(&mut secret_key);
+    let Some(key) = key else {
+        return err_json("secret key must be 32 bytes");
+    };
+    let mut guard = match NODE.lock() {
+        Ok(g) => g,
+        Err(_) => return err_json("node lock poisoned"),
+    };
+    if guard.is_some() {
+        return err_json("node already started");
+    }
+    match Embedded::start_with_key(
+        Options {
+            home: home.into(),
+            alias,
+            listen: vec![],
+        },
+        key,
+    ) {
+        Ok(node) => {
+            let did = node.did();
+            *guard = Some(node);
+            serde_json::json!({ "did": did }).to_string()
+        }
+        Err(e) => err_json(e),
+    }
+}
+
 /// Concurrently bootstrap from the effective seed book. The response retains
 /// `connected` and adds attempt/readiness diagnostics.
 #[uniffi::export]

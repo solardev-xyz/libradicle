@@ -609,9 +609,79 @@ fn cancel_sleep(dur: &Duration, cancel: &CancelToken) -> bool {
     cancel.is_cancelled()
 }
 
+/// The profile at `home` for a node running as the host's key
+/// `public_key`: [`Profile::init`] without writing a key pair, or
+/// [`Profile::load_from`] without reading one. `keys/` is not touched.
+fn host_profile(home: Home, alias: &str, public_key: PublicKey) -> Result<Profile, Error> {
+    use radicle::profile::Config;
+    use radicle::storage::git::transport;
+
+    let config_path = home.config();
+    let config = if config_path.exists() {
+        Config::load(config_path.as_path()).map_err(radicle::profile::Error::from)?
+    } else {
+        Config::init(Alias::new(alias), config_path.as_path())
+            .map_err(radicle::profile::Error::from)?
+    };
+    let storage = radicle::Storage::open(
+        home.storage(),
+        radicle::git::UserInfo {
+            alias: config.alias().clone(),
+            key: public_key,
+        },
+    )?;
+    // What `Profile::init` creates for a fresh home; opening them again is harmless.
+    home.policies_mut()?;
+    home.notifications_mut()
+        .map_err(radicle::profile::Error::from)?;
+    home.cobs_db_mut()?
+        .migrate(radicle::cob::migrate::ignore)
+        .map_err(radicle::profile::Error::from)?;
+    transport::local::register(storage.clone());
+
+    Ok(Profile {
+        keystore: Keystore::new(&home.keys()),
+        home,
+        storage,
+        public_key,
+        config,
+    })
+}
+
+/// A node identity the host holds and hands in at start (see
+/// [`Embedded::start_with_key`]): the 32-byte Ed25519 secret seed, as
+/// RFC 8032 names it. Zeroed on drop, and never printed.
+pub struct HostKey(zeroize::Zeroizing<[u8; 32]>);
+
+impl HostKey {
+    /// Takes the 32-byte seed out of `bytes`, zeroing `bytes` either way.
+    /// `None` if it isn't 32 bytes long.
+    pub fn from_bytes(bytes: &mut [u8]) -> Option<Self> {
+        use zeroize::Zeroize as _;
+        // Copy straight into the zeroizing buffer, never through a bare
+        // stack array that would outlive the call unwiped.
+        let key = (bytes.len() == 32).then(|| {
+            let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+            seed.copy_from_slice(bytes);
+            Self(seed)
+        });
+        bytes.zeroize();
+        key
+    }
+}
+
+impl std::fmt::Debug for HostKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostKey(..)")
+    }
+}
+
 /// An embedded Radicle stack: profile + in-process node.
 pub struct Embedded {
     profile: Profile,
+    /// The signing key the host handed in ([`Embedded::start_with_key`]),
+    /// kept in memory only; `None` when the profile's own key file signs.
+    host_signer: Option<radicle::crypto::SigningKey>,
     handle: NodeHandle,
     seed_book: Arc<Vec<seeds::Candidate>>,
     node_thread: Option<JoinHandle<Result<(), radicle_node::runtime::Error>>>,
@@ -630,22 +700,67 @@ impl Embedded {
         let profile = if home.keys().join("radicle").exists() {
             Profile::load_from(home.clone())?
         } else {
-            let alias = Alias::new(&opts.alias);
             let seed = radicle::profile::env::seed().unwrap_or_else(|| {
                 use radicle::crypto::Seed;
                 let mut seed = [0; Seed::BYTES];
                 getrandom::fill(&mut seed).expect("failed to get OS randomness");
                 Seed::new(seed)
             });
-            Profile::init(home.clone(), alias, None, seed)?
+            if home.config().exists() {
+                // The home was created by `start_with_key`: it has a config
+                // (perhaps customized since) and databases, just no key file
+                // of its own. Add the key and keep the rest — `Profile::init`
+                // would overwrite config.json with defaults.
+                Keystore::new(&home.keys())
+                    .init("radicle", None, seed)
+                    .map_err(radicle::profile::Error::from)?;
+                Profile::load_from(home.clone())?
+            } else {
+                Profile::init(home.clone(), Alias::new(&opts.alias), None, seed)?
+            }
         };
-        let seed_book = Arc::new(seeds::effective(&profile)?);
-
         // In-process signer: load the (unencrypted) secret key.
         let keystore = Keystore::from_secret_path(&profile.home.keys().join("radicle"));
         let signer = keystore
             .secret_key(None)?
             .ok_or_else(|| Error::NodeThread("secret key not found in keystore".into()))?;
+        Self::run(profile, signer, None, opts)
+    }
+
+    /// Like [`Embedded::start`], but the node runs as `key`, an identity
+    /// the host keeps itself (Freedom derives it from the wallet's
+    /// recovery phrase and keeps it sealed) instead of the profile's own
+    /// key file.
+    ///
+    /// Nothing secret is written: the profile at `opts.home` (created if
+    /// there is none, with the node's config and databases) only gets the
+    /// public key, in memory, and every signature — the node's and the
+    /// issue/patch writes' — uses `key` from memory. A key file already in
+    /// `keys/` (the device's own identity, from an earlier [`Embedded::start`])
+    /// is left untouched, so starting without a host key later brings that
+    /// identity back. Storage, seeding policies and the address book are
+    /// shared by both identities: a repository seeded under one stays
+    /// seeded under the other.
+    pub fn start_with_key(opts: Options, key: HostKey) -> Result<Self, Error> {
+        let home = Home::new(opts.home.clone())?;
+        // Expand the seed by reference: `Seed::new` takes the array by value,
+        // which would leave a bare copy of it on the stack. dalek's key
+        // zeroizes itself on drop.
+        let signer =
+            radicle::crypto::SigningKey::from(ed25519_dalek::SigningKey::from_bytes(&key.0));
+        drop(key);
+        let public_key = *AsRef::<radicle::crypto::PublicKey>::as_ref(&signer);
+        let profile = host_profile(home, &opts.alias, public_key)?;
+        Self::run(profile, signer.clone(), Some(signer), opts)
+    }
+
+    fn run(
+        profile: Profile,
+        signer: radicle::crypto::SigningKey,
+        host_signer: Option<radicle::crypto::SigningKey>,
+        opts: Options,
+    ) -> Result<Self, Error> {
+        let seed_book = Arc::new(seeds::effective(&profile)?);
 
         let socket = profile.home.socket_from_env();
         prepare_control_socket(&socket)?;
@@ -669,6 +784,7 @@ impl Embedded {
 
         Ok(Self {
             profile,
+            host_signer,
             handle,
             seed_book,
             node_thread: Some(node_thread),
@@ -777,7 +893,10 @@ impl Embedded {
     }
 
     fn signer(&self) -> Result<Signer, Error> {
-        Ok(self.profile.signer()?)
+        match &self.host_signer {
+            Some(key) => Ok(Signer::Key(key.clone())),
+            None => Ok(self.profile.signer()?),
+        }
     }
 
     fn announce_refs(&self, rid: RepoId) -> Result<(), Error> {
