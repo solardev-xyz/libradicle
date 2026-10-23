@@ -90,6 +90,7 @@ fn fixture(name: &str) -> Fixture {
             home: home.to_str().expect("utf-8 temp dir").into(),
             alias: "blobs".into(),
             listen: vec![],
+            control_socket: true,
         },
         key(),
     )

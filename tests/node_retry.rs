@@ -1,6 +1,7 @@
-//! `Embedded::shutdown_within` past its deadline: the node stays the
-//! caller's, and a retry joins it. These tests have a binary of their own,
-//! so that they can count the node threads in the process.
+//! `Embedded::shutdown_within` past its deadline, and dropping an
+//! `Embedded`: the node stays the caller's, a retry joins it, and a drop
+//! leaves no thread behind. These tests have a binary of their own, so that
+//! they can count the node threads in the process.
 
 use std::time::{Duration, Instant};
 
@@ -40,11 +41,16 @@ fn home(name: &str) -> String {
 }
 
 fn start(home: &str) -> Embedded {
+    start_with(home, true)
+}
+
+fn start_with(home: &str, control_socket: bool) -> Embedded {
     Embedded::start_with_key(
         Options {
             home: home.into(),
             alias: "health".into(),
             listen: vec![],
+            control_socket,
         },
         key(),
     )
@@ -89,33 +95,36 @@ fn a_timed_out_shutdown_keeps_the_node_and_can_be_retried() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// While the stop request is held up (its connect to the control socket
-/// can't complete), each call still returns at its deadline, the node keeps
-/// running and stays the caller's, and once the request gets through a retry
-/// joins it.
-///
-/// Linux only: there, a connect to a Unix socket whose backlog is full blocks.
+/// Replaces the node's control socket at `home` with one that never accepts,
+/// and fills its backlog, so that a connect to it blocks. Linux only: there, a
+/// connect to a Unix socket whose backlog is full blocks. The socket is held
+/// until the returned guard is dropped.
 #[cfg(target_os = "linux")]
-#[test]
-fn a_held_up_stop_request_doesnt_hold_up_the_call() {
+fn wedge_control_socket(home: &str) -> impl Drop {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    let _serial = serial();
-    let home = home("radheld");
-    let mut node = start(&home);
+    struct Wedged {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Wedged {
+        fn drop(&mut self) {
+            drop(self.release.take());
+            for thread in self.threads.drain(..) {
+                thread.join().ok();
+            }
+        }
+    }
 
-    // The node's control socket is swapped for one that never accepts, and
-    // its backlog is filled, so the next connect, the request's, blocks.
-    let socket = std::path::Path::new(&home).join("node/control.sock");
+    let socket = std::path::Path::new(home).join("node/control.sock");
     std::fs::remove_file(&socket).unwrap();
     let held = UnixListener::bind(&socket).unwrap();
-    // The held socket goes when the test releases it, or after 5 s, so that a
-    // call that waits on the request returns late rather than never.
     let (release, released) = std::sync::mpsc::channel::<()>();
     let holder = std::thread::spawn(move || {
-        let _ = released.recv_timeout(Duration::from_secs(5));
+        // Until released, or 10 s at most, so a test that fails can't hang.
+        let _ = released.recv_timeout(Duration::from_secs(10));
         drop(held);
     });
     let queued = Arc::new(AtomicUsize::new(0));
@@ -134,40 +143,114 @@ fn a_held_up_stop_request_doesnt_hold_up_the_call() {
         last = queued.load(Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(200));
     }
-
-    for timeout in [Duration::ZERO, Duration::from_millis(300)] {
-        let started = Instant::now();
-        match node.shutdown_within(timeout) {
-            Err(Error::ShutdownTimeout(t)) => assert_eq!(t, timeout),
-            other => panic!("expected a timeout, got {other:?}"),
-        }
-        assert!(
-            started.elapsed() < timeout + Duration::from_secs(1),
-            "a {timeout:?} timeout took {:?}",
-            started.elapsed()
-        );
-        // Not asked yet: the request is still connecting.
-        assert!(node.node_alive());
+    Wedged {
+        release: Some(release),
+        threads: vec![holder, filler],
     }
+}
 
-    // The request gets through once the held socket goes, and the retry
-    // joins the node.
-    release.send(()).unwrap();
-    holder.join().unwrap();
-    filler.join().unwrap();
+/// A control socket that can't accept doesn't hold up a stop: the stop goes
+/// to the node's reactor directly.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_wedged_control_socket_doesnt_hold_up_the_stop() {
+    let _serial = serial();
+    let home = home("radwedged");
+    let mut node = start(&home);
+    let wedged = wedge_control_socket(&home);
+
+    let started = Instant::now();
     node.shutdown_within(Duration::from_secs(10))
-        .expect("stops once its request gets through");
+        .expect("stops while its control socket is wedged");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
     assert!(!node.node_alive());
     assert_eq!(node_threads(), 0);
+    drop(wedged);
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// This process's threads named as libradicle names the node's thread.
+/// Review of libradicle #5, round 2: dropping a node whose shutdown timed out,
+/// with its control socket wedged, leaves no thread behind.
 #[cfg(target_os = "linux")]
-fn node_threads() -> usize {
+#[test]
+fn dropping_a_timed_out_node_leaves_no_thread_behind() {
+    let _serial = serial();
+    let home = home("raddropped");
+    let mut node = start(&home);
+    let wedged = wedge_control_socket(&home);
+
+    assert!(matches!(
+        node.shutdown_within(Duration::ZERO),
+        Err(Error::ShutdownTimeout(_))
+    ));
+    let _ = node.shutdown_within(Duration::from_millis(300));
+    drop(node);
+    // Joined by `Drop`, with the control socket still wedged.
+    assert_eq!((stop_helpers(), node_threads()), (0, 0));
+    drop(wedged);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A node started without a control socket has none, stops through this
+/// handle alone, and leaves no thread behind when it is dropped.
+#[test]
+fn a_node_without_a_control_socket_is_dropped_cleanly() {
+    let _serial = serial();
+    let home = home("radsocketless");
+    let mut node = start_with(&home, false);
+    assert!(node.node_alive());
+    assert!(!std::path::Path::new(&home)
+        .join("node/control.sock")
+        .exists());
+
+    assert!(matches!(
+        node.shutdown_within(Duration::ZERO),
+        Err(Error::ShutdownTimeout(_))
+    ));
+    drop(node);
+    #[cfg(target_os = "linux")]
+    assert_eq!((stop_helpers(), node_threads()), (0, 0));
+    // Its home is free at once.
+    start_with(&home, false).shutdown().expect("clean shutdown");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Dropping a node that runs, with no shutdown asked for, stops and joins it.
+#[test]
+fn dropping_a_running_node_stops_it() {
+    let _serial = serial();
+    let home = home("radrunning");
+    let node = start(&home);
+    assert!(node.node_alive());
+    drop(node);
+    #[cfg(target_os = "linux")]
+    assert_eq!(node_threads(), 0);
+    start(&home).shutdown().expect("its home is free at once");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// This process's threads named `name` (as Linux keeps it, cut to 15 bytes).
+#[cfg(target_os = "linux")]
+fn threads_named(name: &str) -> usize {
     std::fs::read_dir("/proc/self/task")
         .unwrap()
         .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
-        .filter(|name| name.trim_end() == "radicle-node")
+        .filter(|comm| comm.trim_end() == name)
         .count()
+}
+
+/// The node's thread, as libradicle names it.
+#[cfg(target_os = "linux")]
+fn node_threads() -> usize {
+    threads_named("radicle-node")
+}
+
+/// Threads sending a stop request, as libradicle once named them.
+#[cfg(target_os = "linux")]
+fn stop_helpers() -> usize {
+    threads_named("radicle-node-st")
 }
