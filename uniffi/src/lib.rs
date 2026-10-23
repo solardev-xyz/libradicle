@@ -55,10 +55,27 @@ fn seed_report_json(report: SeedConnectReport) -> String {
     .to_string()
 }
 
+/// Run `f` on the started node, answering a panic with an `{"error": ...}`
+/// payload. UniFFI catches a panic too, but these exports do not throw, so
+/// the generated Swift calls them with `try!` and the app crashes; and a
+/// panic outside this catch, with the guard held, would poison `NODE` for
+/// every later call.
 fn with_node(f: impl FnOnce(&mut Embedded) -> String) -> String {
     match NODE.lock() {
         Ok(mut guard) => match guard.as_mut() {
-            Some(node) => f(node),
+            Some(node) => {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(node))) {
+                    Ok(json) => json,
+                    Err(payload) => err_json(format!(
+                        "libradicle panicked: {}",
+                        payload
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("unknown panic")
+                    )),
+                }
+            }
             None => err_json("node not started"),
         },
         Err(_) => err_json("node lock poisoned"),
@@ -587,6 +604,17 @@ pub fn commits(rid: String, parent: String, page: u32, per_page: u32) -> String 
     )
 }
 
+/// `{"commit": ..., "diff": ...}`, or an error payload if either fails to
+/// serialize, where `json!` would panic.
+fn commit_json(detail: &libradicle::CommitDetail) -> String {
+    let fields = serde_json::to_value(&detail.commit)
+        .and_then(|commit| Ok((commit, serde_json::to_value(&detail.diff)?)));
+    match fields {
+        Ok((commit, diff)) => serde_json::json!({ "commit": commit, "diff": diff }).to_string(),
+        Err(e) => err_json(format!("commit does not serialize: {e}")),
+    }
+}
+
 /// Commit metadata plus its structured first-parent diff.
 #[uniffi::export]
 pub fn commit(rid: String, revision: String) -> String {
@@ -595,11 +623,7 @@ pub fn commit(rid: String, revision: String) -> String {
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.commit(rid, &revision) {
-        Ok(detail) => serde_json::json!({
-            "commit": detail.commit,
-            "diff": detail.diff,
-        })
-        .to_string(),
+        Ok(detail) => commit_json(&detail),
         Err(e) => err_json(e),
     })
 }

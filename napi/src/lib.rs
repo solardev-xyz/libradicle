@@ -51,6 +51,30 @@ fn seed_report_json(report: SeedConnectReport) -> String {
     .to_string()
 }
 
+/// The text of a caught panic, for the error payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
+}
+
+/// Run `f`, answering a panic with an `{"error": ...}` payload instead.
+///
+/// A panic must not reach napi: `compute` runs on a libuv worker inside an
+/// `extern "C"` callback, where an unwinding panic aborts the process, and
+/// the process is the host application (the whole browser, for Freedom).
+fn guarded(f: impl FnOnce() -> String) -> String {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(json) => json,
+        Err(payload) => err_json(format!(
+            "libradicle panicked: {}",
+            panic_message(payload.as_ref())
+        )),
+    }
+}
+
 /// One blocking call scheduled on the libuv thread pool (myotis pattern).
 pub struct BlockingJson {
     run: Option<Box<dyn FnOnce() -> String + Send>>,
@@ -62,7 +86,7 @@ impl Task for BlockingJson {
 
     fn compute(&mut self) -> Result<Self::Output> {
         match self.run.take() {
-            Some(f) => Ok(f()),
+            Some(f) => Ok(guarded(f)),
             None => Ok(r#"{"error":"task already ran"}"#.to_string()),
         }
     }
@@ -78,10 +102,12 @@ fn blocking(f: impl FnOnce() -> String + Send + 'static) -> AsyncTask<BlockingJs
     })
 }
 
+/// Run `f` on the started node. A panic in `f` is caught here, while the
+/// guard is still held, so it does not poison `NODE` for every later call.
 fn with_node(f: impl FnOnce(&mut Embedded) -> String) -> String {
     match NODE.lock() {
         Ok(mut guard) => match guard.as_mut() {
-            Some(node) => f(node),
+            Some(node) => guarded(|| f(node)),
             None => err_json("node not started"),
         },
         Err(_) => err_json("node lock poisoned"),
@@ -616,6 +642,18 @@ pub fn commits(rid: String, parent: String, page: u32, per_page: u32) -> AsyncTa
     })
 }
 
+/// `{"commit": ..., "diff": ...}`, or an error payload if either fails to
+/// serialize. `json!` would unwrap that error, and a panic there takes the
+/// host process down.
+fn commit_json(detail: &libradicle::CommitDetail) -> String {
+    let fields = serde_json::to_value(&detail.commit)
+        .and_then(|commit| Ok((commit, serde_json::to_value(&detail.diff)?)));
+    match fields {
+        Ok((commit, diff)) => serde_json::json!({ "commit": commit, "diff": diff }).to_string(),
+        Err(e) => err_json(format!("commit does not serialize: {e}")),
+    }
+}
+
 /// Commit metadata plus its structured first-parent diff.
 #[napi]
 pub fn commit(rid: String, revision: String) -> AsyncTask<BlockingJson> {
@@ -625,11 +663,7 @@ pub fn commit(rid: String, revision: String) -> AsyncTask<BlockingJson> {
             Err(e) => return err_json(e),
         };
         with_node(|node| match node.commit(rid, &revision) {
-            Ok(detail) => serde_json::json!({
-                "commit": detail.commit,
-                "diff": detail.diff,
-            })
-            .to_string(),
+            Ok(detail) => commit_json(&detail),
             Err(e) => err_json(e),
         })
     })
@@ -850,4 +884,22 @@ pub fn shutdown() -> AsyncTask<BlockingJson> {
             None => err_json("node not started"),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::guarded;
+
+    #[test]
+    fn a_panic_becomes_an_error_payload() {
+        let json: serde_json::Value =
+            serde_json::from_str(&guarded(|| panic!("boom"))).expect("JSON");
+        assert_eq!(json["error"], "libradicle panicked: boom");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&guarded(|| panic!("{}", String::from("owned")))).unwrap();
+        assert_eq!(json["error"], "libradicle panicked: owned");
+
+        assert_eq!(guarded(|| "{}".to_string()), "{}");
+    }
 }
