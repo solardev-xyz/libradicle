@@ -685,6 +685,9 @@ pub struct Embedded {
     handle: NodeHandle,
     seed_book: Arc<Vec<seeds::Candidate>>,
     node_thread: Option<JoinHandle<Result<(), radicle_node::runtime::Error>>>,
+    /// The thread that sends [`Embedded::shutdown_within`]'s stop request,
+    /// once it has been started; kept until it is joined.
+    stop_request: Option<JoinHandle<()>>,
     /// Keeps the node's signal channel open for the runtime's lifetime.
     _signals: mpsc::Sender<radicle_signals::Signal>,
 }
@@ -788,6 +791,7 @@ impl Embedded {
             handle,
             seed_book,
             node_thread: Some(node_thread),
+            stop_request: None,
             _signals: sig_tx,
         })
     }
@@ -1359,32 +1363,70 @@ impl Embedded {
             .is_some_and(|thread| !thread.is_finished())
     }
 
-    /// [`Embedded::shutdown`], waiting at most `timeout` for the node's
-    /// thread to end. Past it, [`Error::ShutdownTimeout`]: the thread is left
-    /// to finish on its own, and the host decides what to do (exit, say).
+    /// Asks the node to stop, and waits at most `timeout` for its thread to
+    /// end. A `timeout` too large to add to the current time waits for as
+    /// long as the node takes.
     ///
-    /// A node that had already stopped by itself is joined for its own
-    /// result, its runtime's error if it ended with one, without waiting.
-    pub fn shutdown_within(mut self, timeout: std::time::Duration) -> Result<(), Error> {
-        let deadline = std::time::Instant::now() + timeout;
-        let Some(thread) = self.node_thread.take() else {
-            return Ok(self.handle.shutdown()?);
+    /// - **Stopped in time:** the node's thread is joined for its result,
+    ///   its runtime's error if it ended with one. A node that had already
+    ///   stopped by itself is joined at once, even with no time to wait.
+    /// - **Past the deadline:** [`Error::ShutdownTimeout`]. The node stays in
+    ///   `self`, still asked to stop: [`Embedded::node_alive`] tells when it
+    ///   has, and another call waits again and joins it. The request is sent
+    ///   only once.
+    /// - **Once joined,** a further call returns `Ok` at once.
+    ///
+    /// The request is sent from a thread of its own, since it connects to the
+    /// node's control socket: the call waits for it, as for the node, only
+    /// until the deadline.
+    pub fn shutdown_within(&mut self, timeout: std::time::Duration) -> Result<(), Error> {
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        let Some(thread) = self.node_thread.as_ref() else {
+            return Ok(());
         };
         if !thread.is_finished() {
-            // The request can only fail on a closed channel, which means the
-            // node is stopping already: wait for its thread either way.
-            let _ = self.handle.shutdown();
+            if self.stop_request.is_none() {
+                // The request can only fail on a closed channel, which means
+                // the node is stopping already: its thread is waited for
+                // either way.
+                let handle = self.handle.clone();
+                self.stop_request = Some(
+                    std::thread::Builder::new()
+                        .name("radicle-node-stop".to_string())
+                        .spawn(move || {
+                            let _ = handle.shutdown();
+                        })?,
+                );
+            }
             loop {
                 let now = std::time::Instant::now();
-                if now >= deadline {
-                    return Err(Error::ShutdownTimeout(timeout));
-                }
+                let left = match deadline {
+                    Some(deadline) if now >= deadline => {
+                        return Err(Error::ShutdownTimeout(timeout));
+                    }
+                    Some(deadline) => deadline - now,
+                    None => std::time::Duration::MAX,
+                };
                 if thread.is_finished() {
                     break;
                 }
-                std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(10)));
+                std::thread::sleep(left.min(std::time::Duration::from_millis(10)));
             }
         }
+        // A request still connecting, once the node has ended, is left to
+        // finish: the node's own result doesn't wait on it.
+        if self
+            .stop_request
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            if let Some(request) = self.stop_request.take() {
+                let _ = request.join();
+            }
+        }
+        let Some(thread) = self.node_thread.take() else {
+            return Ok(());
+        };
         thread
             .join()
             .map_err(|_| Error::NodeThread("node thread panicked".into()))?

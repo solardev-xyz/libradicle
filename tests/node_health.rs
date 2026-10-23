@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use libradicle::{Embedded, Error, HostKey, Options};
+use libradicle::{Embedded, HostKey, Options};
 use radicle::node::Handle as _;
 
 fn key() -> HostKey {
@@ -44,51 +44,32 @@ fn start(home: &str) -> Embedded {
 #[test]
 fn a_running_node_is_alive_and_stops_within_its_timeout() {
     let home = home("radhealth");
-    let node = start(&home);
+    let mut node = start(&home);
     assert!(node.node_alive());
     let started = Instant::now();
     node.shutdown_within(Duration::from_secs(10))
         .expect("stops in time");
     assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(!node.node_alive());
+    // Joined: another call has nothing to wait for.
+    node.shutdown_within(Duration::ZERO)
+        .expect("already joined");
     let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]
-fn a_shutdown_that_cannot_wait_is_a_timeout() {
-    let home = home("radtimeout");
-    let node = start(&home);
-    // No time at all: the node is asked to stop, and the call returns at
-    // once rather than wait for its thread to end.
-    match node.shutdown_within(Duration::ZERO) {
-        Err(Error::ShutdownTimeout(timeout)) => assert_eq!(timeout, Duration::ZERO),
-        other => panic!("expected a timeout, got {other:?}"),
-    }
-    // The thread was asked to stop, and finishes on its own: the home can
-    // be started again once it has.
-    let until = Instant::now() + Duration::from_secs(10);
-    let again = loop {
-        match Embedded::start_with_key(
-            Options {
-                home: home.clone().into(),
-                alias: "health".into(),
-                listen: vec![],
-            },
-            key(),
-        ) {
-            Ok(node) => break node,
-            Err(_) if Instant::now() < until => std::thread::sleep(Duration::from_millis(50)),
-            Err(e) => panic!("the timed-out node never let go of its home: {e}"),
-        }
-    };
-    assert!(again.node_alive());
-    again.shutdown().expect("clean shutdown");
+fn a_timeout_too_large_for_a_deadline_waits_for_the_node() {
+    let home = home("radforever");
+    let mut node = start(&home);
+    node.shutdown_within(Duration::MAX).expect("stops");
+    assert!(!node.node_alive());
     let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]
 fn a_node_stopped_from_outside_is_not_alive_and_shuts_down_cleanly() {
     let home = home("radoutside");
-    let node = start(&home);
+    let mut node = start(&home);
     assert!(node.node_alive());
     // Stopped through its control socket, as `rad node stop` would: the
     // embedder never asked, and learns of it from `node_alive`.
