@@ -1,0 +1,431 @@
+//! The JSON every host gets back from an [`Embedded`](crate::Embedded) call,
+//! in one place: the Node add-on (`napi`), the UniFFI binding (`uniffi`) and
+//! any other host write exactly these bytes.
+//!
+//! Each function writes one result into any [`io::Write`], so a host can
+//! stream it, or bound what it writes; [`to_string`] collects one into a
+//! `String`, as the bindings return them. The shapes are the add-on's, byte
+//! for byte: the radicle-httpd-compatible ones for COBs, and flat objects for
+//! the rest. An error is `{"error": "<message>"}` ([`error`]).
+
+use std::fmt::Display;
+use std::io;
+
+use radicle::cob;
+use radicle::identity::RepoId;
+use serde::Serialize;
+use serde_json::{json, Value};
+
+use crate::{
+    Blob, CommitDetail, CommitInfo, Identity, Progress, RemoteInfo, RepoInfo, RepoStats,
+    SeedConnectReport, SeededRepoInfo, TreeEntry,
+};
+
+/// What every writer here returns.
+pub type Written = serde_json::Result<()>;
+
+fn put(w: &mut impl io::Write, value: &Value) -> Written {
+    serde_json::to_writer(w, value)
+}
+
+/// One result, collected into a `String`. A write that fails is written as
+/// an [`error`] instead.
+pub fn to_string(write: impl FnOnce(&mut Vec<u8>) -> Written) -> String {
+    let mut out = Vec::new();
+    let failed = match write(&mut out) {
+        Ok(()) => match String::from_utf8(out) {
+            Ok(text) => return text,
+            Err(e) => e.to_string(),
+        },
+        Err(e) => e.to_string(),
+    };
+    let mut out = Vec::new();
+    match error(&mut out, failed) {
+        Ok(()) => String::from_utf8(out).unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
+/// `{"error": "<message>"}`.
+pub fn error(w: &mut impl io::Write, e: impl Display) -> Written {
+    put(w, &json!({ "error": e.to_string() }))
+}
+
+/// `{"ok": true}`.
+pub fn ok(w: &mut impl io::Write) -> Written {
+    w.write_all(br#"{"ok":true}"#)
+        .map_err(serde_json::Error::io)
+}
+
+/// `{"cancelled": bool}`.
+pub fn cancelled(w: &mut impl io::Write, cancelled: bool) -> Written {
+    put(w, &json!({ "cancelled": cancelled }))
+}
+
+/// `{"did": "<did>"}`.
+pub fn did(w: &mut impl io::Write, did: &str) -> Written {
+    put(w, &json!({ "did": did }))
+}
+
+/// A seed bootstrap's report.
+pub fn seed_report(w: &mut impl io::Write, report: &SeedConnectReport) -> Written {
+    put(
+        w,
+        &json!({
+            "attempted": report.attempted,
+            "connected": report.connected,
+            "target": report.target,
+            "targetReached": report.target_reached,
+            "elapsedMs": report.elapsed.as_millis(),
+            "failures": report.failures.iter().map(|failure| json!({
+                "nid": failure.nid,
+                "addr": failure.addr,
+                "reason": failure.reason,
+            })).collect::<Vec<_>>(),
+        }),
+    )
+}
+
+/// A [`Progress`] event as a flat `{ "phase": ..., ... }` object.
+pub fn progress(w: &mut impl io::Write, p: &Progress) -> Written {
+    let mut v = match p {
+        Progress::Resolving { candidates } => json!({ "candidates": candidates }),
+        Progress::Connecting {
+            nid,
+            addr,
+            index,
+            total,
+        } => {
+            json!({ "nid": nid, "addr": addr, "index": index, "total": total })
+        }
+        Progress::Fetching { nid, index, total } => {
+            json!({ "nid": nid, "index": index, "total": total })
+        }
+        Progress::PeerFailed {
+            nid,
+            index,
+            total,
+            reason,
+        } => {
+            json!({ "nid": nid, "index": index, "total": total, "reason": reason })
+        }
+        Progress::Failed { reason } => json!({ "reason": reason }),
+        Progress::Done | Progress::Cancelled => json!({}),
+    };
+    v["phase"] = Value::from(p.phase());
+    put(w, &v)
+}
+
+/// `{"unseeded": bool}`.
+pub fn unseeded(w: &mut impl io::Write, unseeded: bool) -> Written {
+    put(w, &json!({ "unseeded": unseeded }))
+}
+
+/// The public profile identity.
+pub fn identity(w: &mut impl io::Write, identity: &Identity) -> Written {
+    put(
+        w,
+        &json!({
+            "did": identity.did,
+            "nid": identity.nid,
+            "alias": identity.alias,
+        }),
+    )
+}
+
+/// The repositories in local storage.
+pub fn repos(w: &mut impl io::Write, repos: &[RepoInfo]) -> Written {
+    put(
+        w,
+        &json!(repos
+            .iter()
+            .map(|repo| json!({
+                "rid": repo.rid.to_string(),
+                "name": repo.name,
+                "description": repo.description,
+            }))
+            .collect::<Vec<_>>()),
+    )
+}
+
+/// The repositories with an explicit allow-seeding policy.
+pub fn seeded_repos(w: &mut impl io::Write, repos: &[SeededRepoInfo]) -> Written {
+    put(
+        w,
+        &json!(repos
+            .iter()
+            .map(|repo| json!({
+                "rid": repo.rid.to_string(),
+                "name": repo.name,
+                "description": repo.description,
+            }))
+            .collect::<Vec<_>>()),
+    )
+}
+
+fn comment<L>(id: &cob::EntryId, comment: &cob::thread::Comment<L>) -> Value {
+    json!({
+        "id": id.to_string(),
+        "author": cob::common::Author::new(comment.author()),
+        "body": comment.body(),
+        "timestamp": comment.timestamp(),
+        "replyTo": comment.reply_to().map(|id| id.to_string()),
+    })
+}
+
+fn issue_value(id: &cob::ObjectId, issue: &cob::issue::Issue) -> Value {
+    json!({
+        "id": id.to_string(),
+        "author": issue.author(),
+        "title": issue.title(),
+        "state": issue.state(),
+        "labels": issue.labels().map(ToString::to_string).collect::<Vec<_>>(),
+        "assignees": issue.assignees().map(ToString::to_string).collect::<Vec<_>>(),
+        "discussion": issue.comments().map(|(id, c)| comment(id, c)).collect::<Vec<_>>(),
+    })
+}
+
+fn patch_value(id: &cob::ObjectId, patch: &cob::patch::Patch) -> Value {
+    let revisions = patch
+        .revisions()
+        .map(|(id, revision)| {
+            json!({
+                "id": id.to_string(),
+                "author": revision.author(),
+                "description": revision.description(),
+                "base": revision.base().to_string(),
+                "oid": revision.head().to_string(),
+                "timestamp": revision.timestamp(),
+                "discussions": revision.discussion().comments()
+                    .map(|(id, c)| comment(id, c))
+                    .collect::<Vec<_>>(),
+                "reviews": revision.reviews().map(|(_, review)| json!({
+                    "id": review.id().to_string(),
+                    "author": review.author(),
+                    "verdict": review.verdict().map(|verdict| verdict.to_string()),
+                    "summary": review.summary(),
+                    "timestamp": review.timestamp(),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let merges = patch
+        .merges()
+        .map(|(author, merge)| {
+            json!({
+                "author": cob::common::Author::new(author),
+                "revision": merge.revision.to_string(),
+                "commit": merge.commit.to_string(),
+                "timestamp": merge.timestamp,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "id": id.to_string(),
+        "author": patch.author(),
+        "title": patch.title(),
+        "state": patch.state(),
+        "target": patch.target(),
+        "labels": patch.labels().map(ToString::to_string).collect::<Vec<_>>(),
+        "assignees": patch.assignees().map(|did| did.to_string()).collect::<Vec<_>>(),
+        "revisions": revisions,
+        "merges": merges,
+    })
+}
+
+/// All issues of a repository, radicle-httpd-shaped.
+pub fn issues(w: &mut impl io::Write, issues: &[(cob::ObjectId, cob::issue::Issue)]) -> Written {
+    put(
+        w,
+        &json!(issues
+            .iter()
+            .map(|(id, issue)| issue_value(id, issue))
+            .collect::<Vec<_>>()),
+    )
+}
+
+/// One issue, radicle-httpd-shaped.
+pub fn issue(w: &mut impl io::Write, id: &cob::ObjectId, issue: &cob::issue::Issue) -> Written {
+    put(w, &issue_value(id, issue))
+}
+
+/// All patches of a repository, radicle-httpd-shaped.
+pub fn patches(w: &mut impl io::Write, patches: &[(cob::ObjectId, cob::patch::Patch)]) -> Written {
+    put(
+        w,
+        &json!(patches
+            .iter()
+            .map(|(id, patch)| patch_value(id, patch))
+            .collect::<Vec<_>>()),
+    )
+}
+
+/// One patch, radicle-httpd-shaped.
+pub fn patch(w: &mut impl io::Write, id: &cob::ObjectId, patch: &cob::patch::Patch) -> Written {
+    put(w, &patch_value(id, patch))
+}
+
+/// `{"id": <id>}`: what a COB write made.
+pub fn id(w: &mut impl io::Write, id: impl Serialize) -> Written {
+    put(w, &json!({ "id": id }))
+}
+
+/// `{"id": <id>, "state": "<state>"}`: an issue's new state.
+pub fn id_state(w: &mut impl io::Write, id: impl Serialize, state: &str) -> Written {
+    put(w, &json!({ "id": id, "state": state }))
+}
+
+/// `{"rid": "<rid>"}`: an imported repository.
+pub fn rid(w: &mut impl io::Write, rid: &RepoId) -> Written {
+    put(w, &json!({ "rid": rid.to_string() }))
+}
+
+/// A repository's identity payload, head and COB counts.
+pub fn repo_info(w: &mut impl io::Write, info: &RepoInfo) -> Written {
+    put(
+        w,
+        &json!({
+            "rid": info.rid.to_string(),
+            "name": info.name,
+            "description": info.description,
+            "defaultBranch": info.default_branch,
+            "head": info.head,
+            "delegates": info.delegates,
+            "threshold": info.threshold,
+            "visibility": info.visibility,
+            "issuesOpen": info.issues_open,
+            "patchesOpen": info.patches_open,
+        }),
+    )
+}
+
+/// A page of commit history, each commit as radicle-surf serializes it.
+pub fn commits(w: &mut impl io::Write, commits: &[radicle_surf::Commit]) -> Written {
+    serde_json::to_writer(w, commits)
+}
+
+/// A commit's metadata and its diff against its first parent.
+pub fn commit(w: &mut impl io::Write, detail: &CommitDetail) -> Written {
+    put(
+        w,
+        &json!({
+            "commit": detail.commit,
+            "diff": detail.diff,
+        }),
+    )
+}
+
+/// File paths, as an array.
+pub fn files(w: &mut impl io::Write, files: &[String]) -> Written {
+    put(w, &json!(files))
+}
+
+fn entries(entries: &[TreeEntry]) -> Vec<Value> {
+    entries
+        .iter()
+        .map(|e| {
+            json!({
+                "name": e.name,
+                "path": e.path,
+                "kind": e.kind,
+            })
+        })
+        .collect()
+}
+
+/// A tree's entries, httpd-shaped: `{"entries":[{"name","path","kind"}]}`.
+pub fn tree(w: &mut impl io::Write, tree: &[TreeEntry]) -> Written {
+    put(w, &json!({ "entries": entries(tree) }))
+}
+
+/// A tree's entries at a revision, with that revision's commit metadata.
+pub fn tree_at(w: &mut impl io::Write, tree: &[TreeEntry], commit: &CommitInfo) -> Written {
+    put(
+        w,
+        &json!({
+            "entries": entries(tree),
+            "lastCommit": {
+                "id": commit.id,
+                "summary": commit.summary,
+                "description": commit.description,
+                "author": {
+                    "name": commit.author.name,
+                    "email": commit.author.email,
+                    "time": commit.author.time,
+                },
+                "committer": {
+                    "name": commit.committer.name,
+                    "email": commit.committer.email,
+                    "time": commit.committer.time,
+                },
+            },
+        }),
+    )
+}
+
+/// A blob read at `path`, httpd-shaped: `{"binary":bool,"content":"...",
+/// "name":"..."}`, named for the path's last component. A binary blob has no
+/// content (the viewer renders a placeholder for it).
+pub fn blob(w: &mut impl io::Write, path: &str, blob: &Blob) -> Written {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if blob.binary {
+        put(
+            w,
+            &json!({
+                "binary": true,
+                "name": name,
+            }),
+        )
+    } else {
+        put(
+            w,
+            &json!({
+                "binary": false,
+                "name": name,
+                "content": String::from_utf8_lossy(&blob.content),
+            }),
+        )
+    }
+}
+
+/// Signed remotes and their branch heads.
+pub fn remotes(w: &mut impl io::Write, remotes: &[RemoteInfo]) -> Written {
+    put(
+        w,
+        &json!(remotes
+            .iter()
+            .map(|remote| json!({
+                "id": remote.id,
+                "did": remote.did,
+                "delegate": remote.delegate,
+                "heads": remote.heads,
+            }))
+            .collect::<Vec<_>>()),
+    )
+}
+
+/// A repository's history statistics.
+pub fn repo_stats(w: &mut impl io::Write, stats: &RepoStats) -> Written {
+    put(
+        w,
+        &json!({
+            "commits": stats.commits,
+            "branches": stats.branches,
+            "contributors": stats.contributors,
+        }),
+    )
+}
+
+/// `{"connectedPeers": n}`.
+pub fn connected_peers(w: &mut impl io::Write, peers: usize) -> Written {
+    put(w, &json!({ "connectedPeers": peers }))
+}
+
+/// `{"seeding": n}`: a repository's known seeders.
+pub fn seeding(w: &mut impl io::Write, seeders: usize) -> Written {
+    put(w, &json!({ "seeding": seeders }))
+}
+
+#[cfg(test)]
+mod tests;
