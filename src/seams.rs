@@ -87,6 +87,7 @@ mod tests {
                 alias: "seams".into(),
                 listen: vec![],
                 control_socket: false,
+                routing: None,
             },
             key,
         )

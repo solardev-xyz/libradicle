@@ -36,6 +36,7 @@ fn start(home: &str) -> Embedded {
             alias: "health".into(),
             listen: vec![],
             control_socket: true,
+            routing: None,
         },
         key(),
     )

@@ -91,6 +91,7 @@ fn fixture(name: &str) -> Fixture {
             alias: "blobs".into(),
             listen: vec![],
             control_socket: true,
+            routing: None,
         },
         key(),
     )
