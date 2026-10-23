@@ -91,6 +91,7 @@ fn fixture(name: &str) -> Fixture {
             alias: "walks".into(),
             listen: vec![],
             control_socket: true,
+            routing: None,
         },
         key(),
     )
@@ -410,7 +411,7 @@ fn storage(f: &Fixture) -> radicle::storage::git::Storage {
 // Review of libradicle #8, round 2: the listing reads each repository's local
 // signed refs as heartwood's `Storage::repositories` does. Absent, or needing
 // migration, they are listed; unreadable, they fail the listing with the
-// same error.
+// same error. Round 3: downgraded, they are listed too.
 #[test]
 fn a_listing_reads_signed_refs_as_heartwood_does() {
     use radicle::storage::{ReadStorage, SignedRefsInfo};
@@ -451,6 +452,36 @@ fn a_listing_reads_signed_refs_as_heartwood_does() {
         .unwrap();
     assert!(matches!(
         compare("at their root"),
+        Ok(SignedRefsInfo::NeedsMigration)
+    ));
+
+    // Downgraded: a new commit on their tip, with their root's signed refs,
+    // still validly signed, but of an older feature level than the history
+    // under them. heartwood refuses to load them, and takes them as needing
+    // migration. No re-signing: the root's signature still holds.
+    let signature = radicle::git::raw::Signature::now("Test", "test@example.com").unwrap();
+    let downgraded = stored
+        .backend
+        .commit(
+            None,
+            &signature,
+            &signature,
+            "Downgrade",
+            &root.tree().unwrap(),
+            &[&stored.backend.find_commit(tip).unwrap()],
+        )
+        .unwrap();
+    stored
+        .backend
+        .reference(&sigrefs, downgraded, true, "downgrade")
+        .unwrap();
+    let nid = f.node.identity().nid.parse().unwrap();
+    assert!(matches!(
+        radicle::storage::refs::SignedRefs::load(nid, &stored),
+        Err(radicle::storage::refs::sigrefs::read::error::Read::Downgrade { .. })
+    ));
+    assert!(matches!(
+        compare("downgraded"),
         Ok(SignedRefsInfo::NeedsMigration)
     ));
 
