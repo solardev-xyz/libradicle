@@ -8,7 +8,14 @@ publish = false
 
 [dependencies]
 radicle = { git = "https://github.com/solardev-xyz/heartwood", rev = "c208df3ac7626402db60752f1f38d31465731f01" }
-radicle-node = { git = "https://github.com/solardev-xyz/heartwood", rev = "c208df3ac7626402db60752f1f38d31465731f01" }
+## No default features: `systemd` (socket activation reads and removes
+## `LISTEN_*` at bind), `backtrace` and `structured-logger` (the binary's
+## panic and log output) are the `radicle-node` binary's, not an embedder's.
+## `i2p` stays on: without it, an I2P address in a gossip message fails to
+## decode, and the peer that relayed it is disconnected. With it, an I2P
+## address is decoded, and dialled only if `node.i2p` routes it (by default
+## it is dropped).
+radicle-node = { git = "https://github.com/solardev-xyz/heartwood", rev = "c208df3ac7626402db60752f1f38d31465731f01", default-features = false, features = ["i2p", "socket2", "tor"] }
 radicle-surf = { git = "https://github.com/solardev-xyz/heartwood", rev = "c208df3ac7626402db60752f1f38d31465731f01", features = ["serde"] }
 getrandom = "0.4"
 git2 = { version = "0.21", default-features = false }
