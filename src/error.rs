@@ -35,7 +35,8 @@ pub enum Error {
     FetchFailed(RepoId, String),
     #[error("fetching {0} timed out")]
     Timeout(RepoId),
-    #[error("clone cancelled")]
+    /// A clone, or a bounded walk, cancelled through its `CancelToken`.
+    #[error("cancelled")]
     Cancelled,
     #[error("announce refs failed: {0}")]
     Announce(String),
@@ -49,6 +50,8 @@ pub enum Error {
     NotABlob(String),
     #[error("{size} bytes is over the limit of {limit}")]
     TooLarge { size: u64, limit: u64 },
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
     #[error("invalid commit revision {0:?}")]
     InvalidRevision(String),
     #[error(transparent)]
