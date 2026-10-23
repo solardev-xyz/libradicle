@@ -241,6 +241,25 @@ fn a_diff_that_cannot_fit_is_refused_before_it_is_built() {
     }
 }
 
+// Review of libradicle #8, round 2: a diff's hunks are counted before it is
+// built. The first commit's two files, three lines and two hunks don't fit
+// 500 bytes, and are refused for their count, short of the whole detail's
+// JSON; without the hunks, the count would fit, and only the whole refused.
+#[test]
+fn a_diff_counts_its_hunks_before_it_is_built() {
+    let f = fixture("radwalkhunks");
+    let first = f.commits[0].as_str();
+    let whole = len(|w| json::commit(w, &f.node.commit(f.rid, first).unwrap()));
+    assert!(whole > 1000, "{whole}");
+    match f.node.commit_bounded(f.rid, first, &budget(500)) {
+        Err(Error::TooLarge { size, limit }) => {
+            assert_eq!(limit, 500);
+            assert!(size > limit && size < whole, "{size} of {whole}");
+        }
+        other => panic!("expected TooLarge from the hunk count, got {other:?}"),
+    }
+}
+
 /// Imports into `f`'s node a repository whose commits each add or move many
 /// small files: 200 text files; 512 empty files; 300 small binary files;
 /// then the 200 text files moved. Its RID, and its commits oldest first.
@@ -290,6 +309,14 @@ fn a_diff_of_many_files_is_refused_before_it_is_built() {
     let mut f = fixture("radwalkmany");
     let (rid, commits) = many_files(&mut f);
     let node = &f.node;
+    // Review of libradicle #8, round 2: before moves are found, a diff is
+    // counted at its floor, half its deltas at the shortest file record (119
+    // bytes) each, as moves may pair them. The 512 empty files are refused
+    // there, at 256 records, before their records are walked.
+    match node.commit_bounded(rid, &commits[1], &budget(1024)) {
+        Err(Error::TooLarge { size, limit }) => assert_eq!((size, limit), (256 * 119, 1024)),
+        other => panic!("expected TooLarge from the floor, got {other:?}"),
+    }
     for (what, commit) in [
         ("512 empty files", &commits[1]),
         ("300 small binary files", &commits[2]),
@@ -364,5 +391,89 @@ fn listing_many_repositories_stops_at_the_first_that_doesnt_fit() {
     assert!(matches!(
         f.node.list_repos_bounded(&cancelled()),
         Err(Error::Cancelled)
+    ));
+}
+
+/// heartwood's storage of `f`'s node, as the node's own key opens it.
+fn storage(f: &Fixture) -> radicle::storage::git::Storage {
+    let identity = f.node.identity();
+    radicle::storage::git::Storage::open(
+        f.dir.join("home/storage"),
+        radicle::git::UserInfo {
+            alias: identity.alias.parse().unwrap(),
+            key: identity.nid.parse().unwrap(),
+        },
+    )
+    .unwrap()
+}
+
+// Review of libradicle #8, round 2: the listing reads each repository's local
+// signed refs as heartwood's `Storage::repositories` does. Absent, or needing
+// migration, they are listed; unreadable, they fail the listing with the
+// same error.
+#[test]
+fn a_listing_reads_signed_refs_as_heartwood_does() {
+    use radicle::storage::{ReadStorage, SignedRefsInfo};
+
+    let f = fixture("radwalksigrefs");
+    let compare = |state: &str| -> Result<SignedRefsInfo, String> {
+        let upstream = storage(&f).repositories().map_err(|e| e.to_string());
+        let bounded = f
+            .node
+            .list_repos_bounded(&budget(1 << 20))
+            .map_err(|e| e.to_string());
+        assert_eq!(
+            upstream
+                .as_ref()
+                .map(|repos| repos.iter().map(|repo| repo.rid).collect::<Vec<_>>()),
+            bounded
+                .as_ref()
+                .map(|repos| repos.iter().map(|repo| repo.rid).collect::<Vec<_>>()),
+            "{state}"
+        );
+        upstream.map(|mut repos| repos.remove(0).refs)
+    };
+
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let sigrefs = format!("refs/namespaces/{}/refs/rad/sigrefs", f.node.identity().nid);
+    let tip = stored.backend.refname_to_id(&sigrefs).unwrap();
+    assert!(matches!(compare("as signed"), Ok(SignedRefsInfo::Some(_))));
+
+    // At the root of their history, they need migrating.
+    let mut root = stored.backend.find_commit(tip).unwrap();
+    while let Ok(parent) = root.parent(0) {
+        root = parent;
+    }
+    assert_ne!(root.id(), tip);
+    stored
+        .backend
+        .reference(&sigrefs, root.id(), true, "root")
+        .unwrap();
+    assert!(matches!(
+        compare("at their root"),
+        Ok(SignedRefsInfo::NeedsMigration)
+    ));
+
+    // Absent, the repository is seeded but not forked.
+    stored
+        .backend
+        .find_reference(&sigrefs)
+        .unwrap()
+        .delete()
+        .unwrap();
+    assert!(matches!(compare("absent"), Ok(SignedRefsInfo::None)));
+
+    // Not a commit, they are unreadable.
+    let blob = stored.backend.blob(b"not signed refs").unwrap();
+    stored
+        .backend
+        .reference(&sigrefs, blob, true, "blob")
+        .unwrap();
+    assert!(compare("a blob").is_err());
+    // With no room left, the listing refuses before it opens the repository,
+    // and so before it reads them.
+    assert!(matches!(
+        f.node.list_repos_bounded(&budget(2)),
+        Err(Error::TooLarge { .. })
     ));
 }

@@ -36,6 +36,8 @@ pub mod error;
 pub use error::Error;
 pub mod json;
 mod meter;
+#[cfg(test)]
+mod seams;
 mod seeds;
 
 use meter::Meter;
@@ -333,6 +335,12 @@ const HUNK_JSON: u64 = 76;
 /// What an entry `repo_stats_bounded` holds while it counts costs beyond its
 /// bytes: its strings' headers and its slot in the set.
 const ENTRY_COST: u64 = 64;
+
+/// The shortest JSON a listed repository can take: an empty name and
+/// description, and the shortest RID, whose 20 bytes take at least 20
+/// base58 digits, `{"rid":"rad:z11111111111111111111","name":"",
+/// "description":""}`.
+const REPO_JSON: u64 = 62;
 
 impl Network {
     fn connected_seed_ids(&mut self) -> Result<HashSet<NodeId>, Error> {
@@ -930,18 +938,28 @@ impl Embedded {
     /// as [`json::repos`] writes it.
     ///
     /// Storage is walked one entry at a time, and nothing of a repository is
-    /// loaded before the token and the budget are checked for it: a
-    /// repository that isn't seeded is skipped before it is opened.
+    /// loaded before the token is checked for it, and the budget has room
+    /// for it at its shortest, [`REPO_JSON`] and a comma. A repository that
+    /// isn't seeded is skipped before it is opened; a seeded one is refused
+    /// unopened once there is no room for it, even one that would then have
+    /// been skipped as invalid.
     pub fn list_repos_bounded(&self, bounds: &Bounds) -> Result<Vec<RepoInfo>, Error> {
         let mut meter = Meter::array(bounds)?;
         let policies = self.profile.policies()?;
         let mut repos = Vec::new();
-        for entry in std::fs::read_dir(self.profile.storage.path())? {
+        let entries = std::fs::read_dir(self.profile.storage.path())?;
+        #[cfg(test)]
+        let entries = entries.inspect(|_| seams::bump(&seams::ENTRIES));
+        for entry in entries {
             meter.check()?;
             let Some(rid) = stored_repository(&entry?)? else {
                 continue;
             };
-            if !policies.is_seeding(&rid)? || !self.is_valid_repository(rid) {
+            if !policies.is_seeding(&rid)? {
+                continue;
+            }
+            meter.admits(REPO_JSON)?;
+            if !self.is_listed(rid)? {
                 continue;
             }
             let info = self.repo_info(rid)?;
@@ -951,14 +969,48 @@ impl Embedded {
         Ok(repos)
     }
 
-    /// Whether `rid` opens with an identity document and a head, as heartwood's
-    /// `Storage::repositories` requires of the repositories it lists.
-    fn is_valid_repository(&self, rid: RepoId) -> bool {
-        let Ok(repo) = self.profile.storage.repository(rid) else {
-            log::warn!(target: "libradicle", "Repository {rid} is invalid");
-            return false;
+    /// Whether heartwood's `Storage::repositories` lists `rid`, checked as it
+    /// checks each repository: one that doesn't open with an identity
+    /// document and a head is skipped; one whose local signed refs don't
+    /// read is an error, the error it returns. Signed refs that are absent,
+    /// or that need migrating, are accepted, as it accepts them.
+    fn is_listed(&self, rid: RepoId) -> Result<bool, Error> {
+        use radicle::storage::refs::{sigrefs::read::error::Read, FeatureLevel, SignedRefs};
+
+        #[cfg(test)]
+        seams::bump(&seams::OPENED);
+        let repo = match self.profile.storage.repository(rid) {
+            Ok(repo) => repo,
+            Err(e) => {
+                log::warn!(target: "libradicle", "Repository {rid} is invalid: {e}");
+                return Ok(false);
+            }
         };
-        repo.identity_doc().is_ok() && repo.head().is_ok()
+        if let Err(e) = repo.identity_doc() {
+            log::warn!(target: "libradicle", "Repository {rid} is invalid: looking up doc: {e}");
+            return Ok(false);
+        }
+        if let Err(e) = repo.head() {
+            log::warn!(target: "libradicle", "Repository {rid} is invalid: looking up head: {e}");
+            return Ok(false);
+        }
+        // heartwood's `SignedRefsInfo::new`, private to it, and the sync time
+        // it then reads for signed refs that need no migration.
+        let local = self.profile.storage.info().key;
+        match SignedRefs::load(local, &repo) {
+            Ok(Some(refs))
+                if refs.feature_level() >= FeatureLevel::LATEST && refs.parent().is_some() =>
+            {
+                radicle::node::SyncedAt::new(refs.at, &repo)
+                    .map_err(radicle::storage::Error::from)?;
+            }
+            Ok(_) | Err(Read::Downgrade { .. }) => {}
+            Err(err) => {
+                let err = radicle::storage::refs::Error::Read(err);
+                return Err(radicle::storage::Error::from(err).into());
+            }
+        }
+        Ok(true)
     }
 
     /// List explicit allow-seeding policies, including repositories whose
@@ -1701,7 +1753,11 @@ impl Embedded {
         let mut commits = 0;
         let mut contributors = HashSet::new();
         for oid in walk {
+            #[cfg(test)]
+            seams::at(seams::Step::Commit, &bounds.cancel);
             meter.check()?;
+            #[cfg(test)]
+            seams::bump(&seams::COMMITS);
             let commit = repo.backend.find_commit(oid?)?;
             let author = commit.author();
             let name = author.name().unwrap_or_default().to_string();
@@ -1717,7 +1773,11 @@ impl Embedded {
         repo.identity_doc()?;
         let mut branches = HashSet::new();
         for remote in repo.remotes()? {
+            #[cfg(test)]
+            seams::at(seams::Step::Remote, &bounds.cancel);
             meter.check()?;
+            #[cfg(test)]
+            seams::bump(&seams::REMOTES);
             let (_, remote) = remote?;
             for (name, _) in remote.iter() {
                 if let Some(branch) = name.as_str().strip_prefix("refs/heads/") {
@@ -1983,6 +2043,34 @@ mod tests {
             new: 0..0,
         };
         assert_eq!(len(serde_json::to_string(&hunk).unwrap()), HUNK_JSON);
+    }
+
+    /// No listed repository takes less JSON than `REPO_JSON`: one with an
+    /// empty name and description, and the RID of 20 zero bytes, the
+    /// shortest, takes exactly that.
+    #[test]
+    fn no_repository_takes_less_json_than_repo_json() {
+        use super::{json, RepoId, RepoInfo, REPO_JSON};
+        let shortest = "rad:z11111111111111111111";
+        let info = |rid: RepoId| RepoInfo {
+            rid,
+            name: String::new(),
+            description: String::new(),
+            default_branch: String::new(),
+            head: String::new(),
+            delegates: vec![],
+            threshold: 0,
+            visibility: Default::default(),
+            issues_open: 0,
+            patches_open: 0,
+        };
+        let len = |info: &RepoInfo| json::to_string(|w| json::repo(w, info)).len() as u64;
+        let floor = info(shortest.parse().expect("a RID"));
+        assert_eq!(floor.rid.to_string(), shortest);
+        assert_eq!(len(&floor), REPO_JSON);
+        let ones =
+            radicle::git::Oid::from(radicle::git::raw::Oid::from_bytes(&[0xff; 20]).unwrap());
+        assert!(len(&info(RepoId::from(ones))) > REPO_JSON);
     }
 
     #[test]

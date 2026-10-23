@@ -89,6 +89,22 @@ impl<'a> Meter<'a> {
         Ok(())
     }
 
+    /// `Error::TooLarge` unless one more array item of `floor` bytes, and the
+    /// comma before it unless it is the first, still fits: the check before
+    /// an item is loaded, `floor` the least JSON any item takes. Nothing is
+    /// charged; [`Meter::item`] charges the item once it is built.
+    pub(crate) fn admits(&self, floor: u64) -> Result<(), Error> {
+        self.check()?;
+        let need = floor.saturating_add(u64::from(self.items > 0));
+        if need > self.left() {
+            return Err(Error::TooLarge {
+                size: self.used.saturating_add(need),
+                limit: self.bounds.budget,
+            });
+        }
+        Ok(())
+    }
+
     /// Charges a whole result: its JSON as `write` writes it.
     pub(crate) fn whole(
         &mut self,
@@ -106,5 +122,60 @@ impl<'a> Meter<'a> {
     /// What is left of the budget.
     pub(crate) fn left(&self) -> u64 {
         self.bounds.budget - self.used
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use super::Meter;
+    use crate::{Bounds, CancelToken, Error};
+
+    /// An array item of `bytes` bytes.
+    fn item(meter: &mut Meter, bytes: usize) -> Result<(), Error> {
+        meter.item(|w| {
+            w.write_all(&vec![b'x'; bytes])
+                .map_err(serde_json::Error::io)
+        })
+    }
+
+    // Review of libradicle #8, round 2: an item is admitted while it, at its
+    // floor, and the comma before it, fit; the first has no comma.
+    #[test]
+    fn an_item_is_admitted_while_its_floor_and_comma_fit() {
+        let bounds = Bounds::new(CancelToken::new(), 2 + 62 + 1 + 62);
+        let mut meter = Meter::array(&bounds).unwrap();
+        meter.admits(62).unwrap();
+        item(&mut meter, 62).unwrap();
+        meter.admits(62).unwrap();
+        item(&mut meter, 62).unwrap();
+        assert!(matches!(
+            meter.admits(0),
+            Err(Error::TooLarge {
+                size: 128,
+                limit: 127
+            })
+        ));
+
+        let bounds = Bounds::new(CancelToken::new(), 2 + 62 + 62);
+        let mut meter = Meter::array(&bounds).unwrap();
+        item(&mut meter, 62).unwrap();
+        assert!(matches!(
+            meter.admits(62),
+            Err(Error::TooLarge {
+                size: 127,
+                limit: 126
+            })
+        ));
+        assert!(matches!(
+            Meter::array(&Bounds::new(CancelToken::new(), 2 + 61))
+                .unwrap()
+                .admits(62),
+            Err(Error::TooLarge {
+                size: 64,
+                limit: 63
+            })
+        ));
     }
 }
