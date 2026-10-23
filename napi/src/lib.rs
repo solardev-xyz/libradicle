@@ -101,6 +101,7 @@ pub fn start(home: String, alias: String) -> AsyncTask<BlockingJson> {
             alias,
             listen: vec![],
             control_socket: true,
+            routing: None,
         }) {
             Ok(node) => {
                 let did = node.did();

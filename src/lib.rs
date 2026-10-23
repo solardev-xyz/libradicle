@@ -50,6 +50,39 @@ pub struct Options {
     /// or `RAD_SOCKET`) for `rad` and other local clients. Without one, the
     /// host controls the node through this handle alone.
     pub control_socket: bool,
+    /// How the node reaches peers, set in memory over `config.json`. `None`
+    /// leaves `config.json`'s routing as it is.
+    pub routing: Option<Routing>,
+}
+
+/// How the node reaches peers. Given in [`Options::routing`], it replaces
+/// every routing field of the profile's node configuration, in memory only:
+/// `config.json` is never written, and whatever it says about routing has
+/// no effect.
+#[derive(Debug, Clone)]
+pub struct Routing {
+    /// The SOCKS5 proxy every peer dial goes through, or `None` to dial
+    /// directly (`node.proxy`).
+    pub proxy: Option<std::net::SocketAddr>,
+    /// How onion addresses are reached (`node.onion`). I2P addresses are
+    /// always dropped (`node.i2p`).
+    pub onion: radicle::node::config::AddressConfig,
+    /// Which addresses the node may dial, and how it resolves names.
+    pub gate: Arc<dyn radicle::node::dial::Gate>,
+}
+
+impl Routing {
+    /// The profile's node configuration with this routing in place: `proxy`
+    /// and `onion` as given, I2P dropped, and no external addresses, so the
+    /// node advertises no address of its own.
+    fn apply(&self, config: &radicle::node::Config) -> radicle::node::Config {
+        let mut config = config.clone();
+        config.proxy = self.proxy;
+        config.onion = self.onion;
+        config.i2p = radicle::node::config::AddressConfig::Drop;
+        config.external_addresses = vec![];
+        config
+    }
 }
 
 /// Summary of a repository's identity payload plus head.
@@ -787,13 +820,21 @@ impl Embedded {
         };
 
         let (sig_tx, sig_rx) = mpsc::channel();
+        let (config, gate) = match &opts.routing {
+            Some(routing) => (routing.apply(&profile.config.node), routing.gate.clone()),
+            None => (
+                profile.config.node.clone(),
+                Arc::new(radicle::node::dial::Open) as Arc<dyn radicle::node::dial::Gate>,
+            ),
+        };
         let runtime = Runtime::init(
             profile.home.clone(),
-            profile.config.node.clone(),
+            config,
             socket,
             opts.listen.clone(),
             sig_rx,
             signer,
+            gate,
         )?;
         if !seed_book.is_empty() {
             seeds::install(&profile)?;
