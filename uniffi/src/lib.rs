@@ -16,9 +16,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use libradicle::{
-    CancelToken, Embedded, FetchPolicy, Network, Options, Progress, SeedConnectReport,
-};
+use libradicle::{json, CancelToken, Embedded, FetchPolicy, Network, Options, Progress};
 
 uniffi::setup_scaffolding!();
 
@@ -36,23 +34,7 @@ pub trait ProgressListener: Send + Sync {
 }
 
 fn err_json(e: impl std::fmt::Display) -> String {
-    serde_json::json!({ "error": e.to_string() }).to_string()
-}
-
-fn seed_report_json(report: SeedConnectReport) -> String {
-    serde_json::json!({
-        "attempted": report.attempted,
-        "connected": report.connected,
-        "target": report.target,
-        "targetReached": report.target_reached,
-        "elapsedMs": report.elapsed.as_millis(),
-        "failures": report.failures.into_iter().map(|failure| serde_json::json!({
-            "nid": failure.nid,
-            "addr": failure.addr,
-            "reason": failure.reason,
-        })).collect::<Vec<_>>(),
-    })
-    .to_string()
+    json::to_string(|w| json::error(w, e))
 }
 
 fn with_node(f: impl FnOnce(&mut Embedded) -> String) -> String {
@@ -79,113 +61,6 @@ fn parse_rid(rid: &str) -> std::result::Result<radicle::identity::RepoId, String
     rid.parse().map_err(|e| format!("invalid RID {rid:?}: {e}"))
 }
 
-/// Render a [`Progress`] event as a flat `{ "phase": ..., ... }` JSON string.
-fn progress_json(p: &Progress) -> String {
-    use serde_json::json;
-    let mut v = match p {
-        Progress::Resolving { candidates } => json!({ "candidates": candidates }),
-        Progress::Connecting {
-            nid,
-            addr,
-            index,
-            total,
-        } => json!({ "nid": nid, "addr": addr, "index": index, "total": total }),
-        Progress::Fetching { nid, index, total } => {
-            json!({ "nid": nid, "index": index, "total": total })
-        }
-        Progress::PeerFailed {
-            nid,
-            index,
-            total,
-            reason,
-        } => json!({ "nid": nid, "index": index, "total": total, "reason": reason }),
-        Progress::Failed { reason } => json!({ "reason": reason }),
-        Progress::Done | Progress::Cancelled => json!({}),
-    };
-    v["phase"] = serde_json::Value::from(p.phase());
-    v.to_string()
-}
-
-fn comment_json<L>(
-    id: &radicle::cob::EntryId,
-    comment: &radicle::cob::thread::Comment<L>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "id": id.to_string(),
-        "author": radicle::cob::common::Author::new(comment.author()),
-        "body": comment.body(),
-        "timestamp": comment.timestamp(),
-        "replyTo": comment.reply_to().map(|id| id.to_string()),
-    })
-}
-
-fn issue_json(
-    id: &radicle::cob::ObjectId,
-    issue: &radicle::cob::issue::Issue,
-) -> serde_json::Value {
-    serde_json::json!({
-        "id": id.to_string(),
-        "author": issue.author(),
-        "title": issue.title(),
-        "state": issue.state(),
-        "labels": issue.labels().map(ToString::to_string).collect::<Vec<_>>(),
-        "assignees": issue.assignees().map(ToString::to_string).collect::<Vec<_>>(),
-        "discussion": issue.comments().map(|(id, comment)| comment_json(id, comment)).collect::<Vec<_>>(),
-    })
-}
-
-fn patch_json(
-    id: &radicle::cob::ObjectId,
-    patch: &radicle::cob::patch::Patch,
-) -> serde_json::Value {
-    let revisions = patch
-        .revisions()
-        .map(|(id, revision)| {
-            serde_json::json!({
-                "id": id.to_string(),
-                "author": revision.author(),
-                "description": revision.description(),
-                "base": revision.base().to_string(),
-                "oid": revision.head().to_string(),
-                "timestamp": revision.timestamp(),
-                "discussions": revision.discussion().comments()
-                    .map(|(id, comment)| comment_json(id, comment))
-                    .collect::<Vec<_>>(),
-                "reviews": revision.reviews().map(|(_, review)| serde_json::json!({
-                    "id": review.id().to_string(),
-                    "author": review.author(),
-                    "verdict": review.verdict().map(|verdict| verdict.to_string()),
-                    "summary": review.summary(),
-                    "timestamp": review.timestamp(),
-                })).collect::<Vec<_>>(),
-            })
-        })
-        .collect::<Vec<_>>();
-    let merges = patch
-        .merges()
-        .map(|(author, merge)| {
-            serde_json::json!({
-                "author": radicle::cob::common::Author::new(author),
-                "revision": merge.revision.to_string(),
-                "commit": merge.commit.to_string(),
-                "timestamp": merge.timestamp,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    serde_json::json!({
-        "id": id.to_string(),
-        "author": patch.author(),
-        "title": patch.title(),
-        "state": patch.state(),
-        "target": patch.target(),
-        "labels": patch.labels().map(ToString::to_string).collect::<Vec<_>>(),
-        "assignees": patch.assignees().map(|did| did.to_string()).collect::<Vec<_>>(),
-        "revisions": revisions,
-        "merges": merges,
-    })
-}
-
 /// Start the embedded node with a profile at `home`. `{"did": "..."}` on success.
 #[uniffi::export]
 pub fn start(home: String, alias: String) -> String {
@@ -204,7 +79,7 @@ pub fn start(home: String, alias: String) -> String {
         Ok(node) => {
             let did = node.did();
             *guard = Some(node);
-            serde_json::json!({ "did": did }).to_string()
+            json::to_string(|w| json::did(w, &did))
         }
         Err(e) => err_json(e),
     }
@@ -244,7 +119,7 @@ pub fn start_with_key(home: String, alias: String, secret_key: Vec<u8>) -> Strin
         Ok(node) => {
             let did = node.did();
             *guard = Some(node);
-            serde_json::json!({ "did": did }).to_string()
+            json::to_string(|w| json::did(w, &did))
         }
         Err(e) => err_json(e),
     }
@@ -259,7 +134,7 @@ pub fn connect_seeds(timeout_ms: u32) -> String {
         Err(e) => return err_json(e),
     };
     match network.connect_seed_book(Duration::from_millis(timeout_ms.into())) {
-        Ok(report) => seed_report_json(report),
+        Ok(report) => json::to_string(|w| json::seed_report(w, &report)),
         Err(e) => err_json(e),
     }
 }
@@ -276,7 +151,7 @@ pub fn clone_repo(rid: String, timeout_ms: u32) -> String {
         Err(e) => return err_json(e),
     };
     match network.clone_repo(rid, Duration::from_millis(timeout_ms.into())) {
-        Ok(()) => r#"{"ok":true}"#.to_string(),
+        Ok(()) => json::to_string(json::ok),
         Err(e) => err_json(e),
     }
 }
@@ -305,15 +180,16 @@ pub fn clone_repo_with_progress(
     }
 
     let policy = FetchPolicy::from_timeout(Duration::from_millis(timeout_ms.into()));
-    let mut emit = |p: Progress| on_progress.on_progress(progress_json(&p));
+    let mut emit =
+        |p: Progress| on_progress.on_progress(json::to_string(|w| json::progress(w, &p)));
     let result = network.clone_repo_with(parsed, &policy, &cancel, &mut emit);
 
     if let Ok(mut map) = CANCELS.lock() {
         map.remove(&rid);
     }
     match result {
-        Ok(()) => r#"{"ok":true}"#.to_string(),
-        Err(libradicle::Error::Cancelled) => r#"{"cancelled":true}"#.to_string(),
+        Ok(()) => json::to_string(json::ok),
+        Err(libradicle::Error::Cancelled) => json::to_string(|w| json::cancelled(w, true)),
         Err(e) => err_json(e),
     }
 }
@@ -326,7 +202,7 @@ pub fn cancel_clone(rid: String) -> String {
         .ok()
         .and_then(|map| map.get(&rid).map(|t| t.cancel()))
         .is_some();
-    serde_json::json!({ "cancelled": found }).to_string()
+    json::to_string(|w| json::cancelled(w, found))
 }
 
 /// Stop seeding a repository. `{"unseeded": bool}`.
@@ -337,7 +213,7 @@ pub fn unseed_repo(rid: String) -> String {
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.unseed_repo(rid) {
-        Ok(unseeded) => serde_json::json!({ "unseeded": unseeded }).to_string(),
+        Ok(unseeded) => json::to_string(|w| json::unseeded(w, unseeded)),
         Err(e) => err_json(e),
     })
 }
@@ -347,12 +223,7 @@ pub fn unseed_repo(rid: String) -> String {
 pub fn identity() -> String {
     with_node(|node| {
         let identity = node.identity();
-        serde_json::json!({
-            "did": identity.did,
-            "nid": identity.nid,
-            "alias": identity.alias,
-        })
-        .to_string()
+        json::to_string(|w| json::identity(w, &identity))
     })
 }
 
@@ -360,15 +231,7 @@ pub fn identity() -> String {
 #[uniffi::export]
 pub fn list_repos() -> String {
     with_node(|node| match node.list_repos() {
-        Ok(repos) => serde_json::json!(repos
-            .into_iter()
-            .map(|repo| serde_json::json!({
-                "rid": repo.rid.to_string(),
-                "name": repo.name,
-                "description": repo.description,
-            }))
-            .collect::<Vec<_>>())
-        .to_string(),
+        Ok(repos) => json::to_string(|w| json::repos(w, &repos)),
         Err(e) => err_json(e),
     })
 }
@@ -378,15 +241,7 @@ pub fn list_repos() -> String {
 #[uniffi::export]
 pub fn list_seeded_repos() -> String {
     with_node(|node| match node.list_seeded_repos() {
-        Ok(repos) => serde_json::json!(repos
-            .into_iter()
-            .map(|repo| serde_json::json!({
-                "rid": repo.rid.to_string(),
-                "name": repo.name,
-                "description": repo.description,
-            }))
-            .collect::<Vec<_>>())
-        .to_string(),
+        Ok(repos) => json::to_string(|w| json::seeded_repos(w, &repos)),
         Err(e) => err_json(e),
     })
 }
@@ -399,11 +254,7 @@ pub fn issues(rid: String) -> String {
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.issues(rid) {
-        Ok(issues) => serde_json::json!(issues
-            .iter()
-            .map(|(id, issue)| issue_json(id, issue))
-            .collect::<Vec<_>>())
-        .to_string(),
+        Ok(issues) => json::to_string(|w| json::issues(w, &issues)),
         Err(e) => err_json(e),
     })
 }
@@ -416,7 +267,7 @@ pub fn issue(rid: String, issue_id: String) -> String {
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.issue(rid, &issue_id) {
-        Ok((id, issue)) => issue_json(&id, &issue).to_string(),
+        Ok((id, issue)) => json::to_string(|w| json::issue(w, &id, &issue)),
         Err(e) => err_json(e),
     })
 }
@@ -429,11 +280,7 @@ pub fn patches(rid: String) -> String {
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.patches(rid) {
-        Ok(patches) => serde_json::json!(patches
-            .iter()
-            .map(|(id, patch)| patch_json(id, patch))
-            .collect::<Vec<_>>())
-        .to_string(),
+        Ok(patches) => json::to_string(|w| json::patches(w, &patches)),
         Err(e) => err_json(e),
     })
 }
@@ -446,7 +293,7 @@ pub fn patch(rid: String, patch_id: String) -> String {
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.patch(rid, &patch_id) {
-        Ok((id, patch)) => patch_json(&id, &patch).to_string(),
+        Ok((id, patch)) => json::to_string(|w| json::patch(w, &id, &patch)),
         Err(e) => err_json(e),
     })
 }
@@ -469,7 +316,7 @@ pub fn create_issue(
     };
     with_node(
         |node| match node.create_issue(rid, &title, &description, labels) {
-            Ok(id) => serde_json::json!({ "id": id }).to_string(),
+            Ok(id) => json::to_string(|w| json::id(w, id)),
             Err(e) => err_json(e),
         },
     )
@@ -489,7 +336,7 @@ pub fn comment_issue(
     };
     with_node(
         |node| match node.comment_issue(rid, &issue_id, &body, reply_to.as_deref()) {
-            Ok(id) => serde_json::json!({ "id": id }).to_string(),
+            Ok(id) => json::to_string(|w| json::id(w, id)),
             Err(e) => err_json(e),
         },
     )
@@ -503,7 +350,7 @@ pub fn edit_issue_state(rid: String, issue_id: String, state: String) -> String 
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.edit_issue_state(rid, &issue_id, &state) {
-        Ok(id) => serde_json::json!({ "id": id, "state": state }).to_string(),
+        Ok(id) => json::to_string(|w| json::id_state(w, id, &state)),
         Err(e) => err_json(e),
     })
 }
@@ -516,7 +363,7 @@ pub fn comment_patch(rid: String, revision_id: String, body: String) -> String {
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.comment_patch(rid, &revision_id, &body) {
-        Ok(id) => serde_json::json!({ "id": id }).to_string(),
+        Ok(id) => json::to_string(|w| json::id(w, id)),
         Err(e) => err_json(e),
     })
 }
@@ -538,7 +385,7 @@ pub fn import_repo(
             &description,
             &default_branch,
         ) {
-            Ok(rid) => serde_json::json!({ "rid": rid.to_string() }).to_string(),
+            Ok(rid) => json::to_string(|w| json::rid(w, &rid)),
             Err(e) => err_json(e),
         }
     })
@@ -552,19 +399,7 @@ pub fn repo_info(rid: String) -> String {
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.repo_info(rid) {
-        Ok(info) => serde_json::json!({
-            "rid": info.rid.to_string(),
-            "name": info.name,
-            "description": info.description,
-            "defaultBranch": info.default_branch,
-            "head": info.head,
-            "delegates": info.delegates,
-            "threshold": info.threshold,
-            "visibility": info.visibility,
-            "issuesOpen": info.issues_open,
-            "patchesOpen": info.patches_open,
-        })
-        .to_string(),
+        Ok(info) => json::to_string(|w| json::repo_info(w, &info)),
         Err(e) => err_json(e),
     })
 }
@@ -578,10 +413,7 @@ pub fn commits(rid: String, parent: String, page: u32, per_page: u32) -> String 
     };
     with_node(
         |node| match node.commits(rid, &parent, page as usize, per_page as usize) {
-            Ok(commits) => match serde_json::to_string(&commits) {
-                Ok(json) => json,
-                Err(e) => err_json(e),
-            },
+            Ok(commits) => json::to_string(|w| json::commits(w, &commits)),
             Err(e) => err_json(e),
         },
     )
@@ -595,11 +427,7 @@ pub fn commit(rid: String, revision: String) -> String {
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.commit(rid, &revision) {
-        Ok(detail) => serde_json::json!({
-            "commit": detail.commit,
-            "diff": detail.diff,
-        })
-        .to_string(),
+        Ok(detail) => json::to_string(|w| json::commit(w, &detail)),
         Err(e) => err_json(e),
     })
 }
@@ -612,7 +440,7 @@ pub fn list_files(rid: String) -> String {
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.list_files(rid) {
-        Ok(files) => serde_json::json!(files).to_string(),
+        Ok(files) => json::to_string(|w| json::files(w, &files)),
         Err(e) => err_json(e),
     })
 }
@@ -625,14 +453,7 @@ pub fn tree(rid: String, path: String) -> String {
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.tree(rid, &path) {
-        Ok(entries) => serde_json::json!({
-            "entries": entries.iter().map(|e| serde_json::json!({
-                "name": e.name,
-                "path": e.path,
-                "kind": e.kind,
-            })).collect::<Vec<_>>(),
-        })
-        .to_string(),
+        Ok(entries) => json::to_string(|w| json::tree(w, &entries)),
         Err(e) => err_json(e),
     })
 }
@@ -645,29 +466,7 @@ pub fn tree_at(rid: String, revision: String, path: String) -> String {
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.tree_at(rid, &revision, &path) {
-        Ok((entries, commit)) => serde_json::json!({
-            "entries": entries.iter().map(|e| serde_json::json!({
-                "name": e.name,
-                "path": e.path,
-                "kind": e.kind,
-            })).collect::<Vec<_>>(),
-            "lastCommit": {
-                "id": commit.id,
-                "summary": commit.summary,
-                "description": commit.description,
-                "author": {
-                    "name": commit.author.name,
-                    "email": commit.author.email,
-                    "time": commit.author.time,
-                },
-                "committer": {
-                    "name": commit.committer.name,
-                    "email": commit.committer.email,
-                    "time": commit.committer.time,
-                },
-            },
-        })
-        .to_string(),
+        Ok((entries, commit)) => json::to_string(|w| json::tree_at(w, &entries, &commit)),
         Err(e) => err_json(e),
     })
 }
@@ -679,15 +478,8 @@ pub fn blob(rid: String, path: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    let name = path.rsplit('/').next().unwrap_or(&path).to_string();
     with_node(|node| match node.read_blob(rid, &path) {
-        Ok(b) if b.binary => serde_json::json!({ "binary": true, "name": name }).to_string(),
-        Ok(b) => serde_json::json!({
-            "binary": false,
-            "name": name,
-            "content": String::from_utf8_lossy(&b.content),
-        })
-        .to_string(),
+        Ok(b) => json::to_string(|w| json::blob(w, &path, &b)),
         Err(e) => err_json(e),
     })
 }
@@ -699,15 +491,8 @@ pub fn blob_at(rid: String, revision: String, path: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    let name = path.rsplit('/').next().unwrap_or(&path).to_string();
     with_node(|node| match node.read_blob_at(rid, &revision, &path) {
-        Ok(b) if b.binary => serde_json::json!({ "binary": true, "name": name }).to_string(),
-        Ok(b) => serde_json::json!({
-            "binary": false,
-            "name": name,
-            "content": String::from_utf8_lossy(&b.content),
-        })
-        .to_string(),
+        Ok(b) => json::to_string(|w| json::blob(w, &path, &b)),
         Err(e) => err_json(e),
     })
 }
@@ -720,16 +505,7 @@ pub fn remotes(rid: String) -> String {
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.remotes(rid) {
-        Ok(remotes) => serde_json::json!(remotes
-            .iter()
-            .map(|remote| serde_json::json!({
-                "id": remote.id,
-                "did": remote.did,
-                "delegate": remote.delegate,
-                "heads": remote.heads,
-            }))
-            .collect::<Vec<_>>())
-        .to_string(),
+        Ok(remotes) => json::to_string(|w| json::remotes(w, &remotes)),
         Err(e) => err_json(e),
     })
 }
@@ -742,12 +518,7 @@ pub fn repo_stats(rid: String, revision: String) -> String {
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.repo_stats(rid, &revision) {
-        Ok(stats) => serde_json::json!({
-            "commits": stats.commits,
-            "branches": stats.branches,
-            "contributors": stats.contributors,
-        })
-        .to_string(),
+        Ok(stats) => json::to_string(|w| json::repo_stats(w, &stats)),
         Err(e) => err_json(e),
     })
 }
@@ -756,7 +527,7 @@ pub fn repo_stats(rid: String, revision: String) -> String {
 #[uniffi::export]
 pub fn status() -> String {
     with_node(|node| match node.connected_peers() {
-        Ok(n) => serde_json::json!({ "connectedPeers": n }).to_string(),
+        Ok(n) => json::to_string(|w| json::connected_peers(w, n)),
         Err(e) => err_json(e),
     })
 }
@@ -769,7 +540,7 @@ pub fn seeders(rid: String) -> String {
         Err(e) => return err_json(e),
     };
     with_node(|node| match node.seeders(rid) {
-        Ok(n) => serde_json::json!({ "seeding": n }).to_string(),
+        Ok(n) => json::to_string(|w| json::seeding(w, n)),
         Err(e) => err_json(e),
     })
 }
@@ -783,7 +554,7 @@ pub fn shutdown() -> String {
     };
     match node {
         Some(node) => match node.shutdown() {
-            Ok(()) => r#"{"ok":true}"#.to_string(),
+            Ok(()) => json::to_string(json::ok),
             Err(e) => err_json(e),
         },
         None => err_json("node not started"),
@@ -816,7 +587,8 @@ mod tests {
             index: 1,
             total: 3,
         };
-        let v: serde_json::Value = serde_json::from_str(&progress_json(&p)).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&json::to_string(|w| json::progress(w, &p))).unwrap();
         assert_eq!(v["phase"], "connecting");
         assert_eq!(v["nid"], "z6Mk");
         assert_eq!(v["total"], 3);

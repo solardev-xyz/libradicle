@@ -34,6 +34,7 @@ use radicle_node::runtime::Runtime;
 
 pub mod error;
 pub use error::Error;
+pub mod json;
 mod seeds;
 
 /// Options for starting an embedded Radicle stack.
