@@ -1,0 +1,46 @@
+name: test
+
+# `cargo test` for the crate, built as Freedom ships it (`no-spawn`: vendored
+# libgit2, in-process upload-pack, no git gc), on Linux, macOS and Windows.
+# The bindings (`napi`, `uniffi`) have no tests of their own; release.yml and
+# windows-check.yml build them.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/test.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "src/**"
+      - "tests/**"
+  push:
+    branches: [main, integration/rust-core]
+    paths:
+      - ".github/workflows/test.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "src/**"
+      - "tests/**"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        shell: bash
+        run: cargo test --locked -p libradicle --features no-spawn
