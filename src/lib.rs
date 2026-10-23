@@ -317,6 +317,19 @@ impl Bounds {
 /// `{"line":"","lineNo":1,"type":"addition"}`. A context line takes more.
 const LINE_JSON: u64 = 40;
 
+/// The shortest JSON a diff's file record can take, its paths aside: a move
+/// whose blob is unchanged, `{"status":"moved","oldPath":"","newPath":"",
+/// "current":{"oid":"<40 hex>","mode":"blob"}}`.
+const FILE_JSON: u64 = 119;
+
+/// The shortest JSON a diff hunk can take, its header aside: an empty one,
+/// `{"header":"","lines":[],"old":{"start":0,"end":0},"new":{"start":0,"end":0}}`.
+const HUNK_JSON: u64 = 76;
+
+/// What an entry `repo_stats_bounded` holds while it counts costs beyond its
+/// bytes: its strings' headers and its slot in the set.
+const ENTRY_COST: u64 = 64;
+
 impl Network {
     fn connected_seed_ids(&mut self) -> Result<HashSet<NodeId>, Error> {
         let seed_ids = self
@@ -896,19 +909,37 @@ impl Embedded {
 
     /// [`Embedded::list_repos`], within `bounds`: each repository is charged
     /// as [`json::repos`] writes it.
+    ///
+    /// Storage is walked one entry at a time, and nothing of a repository is
+    /// loaded before the token and the budget are checked for it: a
+    /// repository that isn't seeded is skipped before it is opened.
     pub fn list_repos_bounded(&self, bounds: &Bounds) -> Result<Vec<RepoInfo>, Error> {
         let mut meter = Meter::array(bounds)?;
         let policies = self.profile.policies()?;
         let mut repos = Vec::new();
-        for repo in self.profile.storage.repositories()? {
+        for entry in std::fs::read_dir(self.profile.storage.path())? {
             meter.check()?;
-            if policies.is_seeding(&repo.rid)? {
-                let info = self.repo_info(repo.rid)?;
-                meter.item(|w| json::repo(w, &info))?;
-                repos.push(info);
+            let Some(rid) = stored_repository(&entry?)? else {
+                continue;
+            };
+            if !policies.is_seeding(&rid)? || !self.is_valid_repository(rid) {
+                continue;
             }
+            let info = self.repo_info(rid)?;
+            meter.item(|w| json::repo(w, &info))?;
+            repos.push(info);
         }
         Ok(repos)
+    }
+
+    /// Whether `rid` opens with an identity document and a head, as heartwood's
+    /// `Storage::repositories` requires of the repositories it lists.
+    fn is_valid_repository(&self, rid: RepoId) -> bool {
+        let Ok(repo) = self.profile.storage.repository(rid) else {
+            log::warn!(target: "libradicle", "Repository {rid} is invalid");
+            return false;
+        };
+        repo.identity_doc().is_ok() && repo.head().is_ok()
     }
 
     /// List explicit allow-seeding policies, including repositories whose
@@ -1320,11 +1351,19 @@ impl Embedded {
     /// [`Embedded::commit`], within `bounds`: the detail is charged as
     /// [`json::commit`] writes it.
     ///
-    /// The diff is checked before it is built:
-    /// - every file it would load is sized from its header, and one larger
-    ///   than the budget is `TooLarge`, a binary file's too;
-    /// - its lines are counted at the least JSON each takes, and a diff whose
-    ///   lines can't fit is `TooLarge`.
+    /// The diff is checked before it is built, and is `TooLarge` before
+    /// anything of it is built when:
+    /// - its file records, a rename or copy counted as one, can't fit at the
+    ///   least JSON each takes, with its paths: checked before renames and
+    ///   copies are looked for, and again after;
+    /// - the blobs it would load, sized from their headers, add up to more
+    ///   than the budget, binary files' included;
+    /// - its records, hunks and lines can't fit, each at the least JSON it
+    ///   takes.
+    ///
+    /// The token is checked between those steps, and at every file record,
+    /// hunk and line; finding renames and copies is one step libgit2 doesn't
+    /// interrupt, bounded by the record count checked before it.
     pub fn commit_bounded(
         &self,
         rid: RepoId,
@@ -1347,10 +1386,13 @@ impl Embedded {
     }
 
     /// Whether `oid`'s diff against its first parent, as radicle-surf builds
-    /// it, can fit what is left of `meter`'s budget: its files sized from
-    /// their headers before any is loaded, then its lines counted.
+    /// it, can fit what is left of `meter`'s budget, found without building
+    /// it: see [`Embedded::commit_bounded`].
     fn diff_fits(repo: &git2::Repository, oid: git2::Oid, meter: &Meter) -> Result<(), Error> {
+        use std::cell::{Cell, RefCell};
+
         let left = meter.left();
+        let over = |size: u64| Error::TooLarge { size, limit: left };
         let commit = repo.find_commit(oid)?;
         let new_tree = commit.tree()?;
         let old_tree = match commit.parents().next() {
@@ -1358,7 +1400,17 @@ impl Embedded {
             None => None,
         };
         let mut diff = repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)?;
+
+        // Before renames and copies are found, the records can't be fewer than
+        // half the deltas: a rename or copy joins two at most.
+        let floor = (diff.deltas().len() as u64 / 2).saturating_mul(FILE_JSON);
+        if floor > left {
+            return Err(over(floor));
+        }
+        // Every blob the diff will load, sized from its header, all of them
+        // together.
         let odb = repo.odb()?;
+        let mut loaded = 0u64;
         for delta in diff.deltas() {
             meter.check()?;
             for file in [delta.old_file(), delta.new_file()] {
@@ -1366,49 +1418,63 @@ impl Embedded {
                     continue;
                 }
                 let (size, _) = odb.read_header(file.id())?;
-                if size as u64 > left {
-                    return Err(Error::TooLarge {
-                        size: size as u64,
-                        limit: left,
-                    });
+                loaded = loaded.saturating_add(size as u64);
+                if loaded > left {
+                    return Err(over(loaded));
                 }
             }
         }
         // As radicle-surf finds them: a rename or copy shows only its changes.
+        meter.check()?;
         let mut similar = git2::DiffFindOptions::new();
         similar.renames(true);
         similar.copies(true);
         diff.find_similar(Some(&mut similar))?;
-        let mut needed = 0u64;
-        let mut stopped = None;
+        meter.check()?;
+
+        // The records as radicle-surf builds them, each with its paths; then
+        // their hunks and lines.
+        let needed = Cell::new(0u64);
+        let stopped = RefCell::new(None);
+        let charge = |bytes: u64| -> bool {
+            needed.set(needed.get().saturating_add(bytes));
+            let fits = meter.check().and_then(|()| {
+                if needed.get() > left {
+                    return Err(over(needed.get()));
+                }
+                Ok(())
+            });
+            match fits {
+                Ok(()) => true,
+                Err(e) => {
+                    *stopped.borrow_mut() = Some(e);
+                    false
+                }
+            }
+        };
+        let path_len =
+            |file: git2::DiffFile<'_>| file.path().map_or(0, |path| path.as_os_str().len() as u64);
         let walked = diff.foreach(
-            &mut |_, _| true,
+            &mut |delta, _| {
+                let paths = match delta.status() {
+                    git2::Delta::Renamed | git2::Delta::Copied => {
+                        path_len(delta.old_file()) + path_len(delta.new_file())
+                    }
+                    git2::Delta::Deleted => path_len(delta.old_file()),
+                    _ => path_len(delta.new_file()),
+                };
+                charge(FILE_JSON + paths)
+            },
             None,
-            None,
+            Some(&mut |_, hunk| charge(HUNK_JSON + hunk.header().len() as u64)),
             Some(&mut |_, _, line| {
                 if !matches!(line.origin(), '+' | '-' | ' ') {
                     return true;
                 }
-                needed = needed.saturating_add(LINE_JSON + line.content().len() as u64);
-                let fits = meter.check().and_then(|()| {
-                    if needed > left {
-                        return Err(Error::TooLarge {
-                            size: needed,
-                            limit: left,
-                        });
-                    }
-                    Ok(())
-                });
-                match fits {
-                    Ok(()) => true,
-                    Err(e) => {
-                        stopped = Some(e);
-                        false
-                    }
-                }
+                charge(LINE_JSON + line.content().len() as u64)
             }),
         );
-        if let Some(e) = stopped {
+        if let Some(e) = stopped.into_inner() {
             return Err(e);
         }
         walked?;
@@ -1597,8 +1663,10 @@ impl Embedded {
     }
 
     /// [`Embedded::repo_stats`], within `bounds`. Its result is three
-    /// numbers; the budget bounds the contributors it holds while it counts,
-    /// each charged the bytes of its name and email.
+    /// numbers, but it holds a set of contributors and one of branches while
+    /// it counts: each new entry is charged its bytes and [`ENTRY_COST`], and
+    /// the result its JSON, as [`json::repo_stats`] writes it. The token is
+    /// checked at every commit walked, and at every remote.
     pub fn repo_stats_bounded(
         &self,
         rid: RepoId,
@@ -1621,23 +1689,33 @@ impl Embedded {
             let email = author.email().unwrap_or_default().to_string();
             let bytes = (name.len() + email.len()) as u64;
             if contributors.insert((name, email)) {
-                meter.charge(bytes)?;
+                meter.charge(bytes + ENTRY_COST)?;
             }
             commits += 1;
         }
-        meter.check()?;
 
-        let branches = self
-            .remotes(rid)?
-            .into_iter()
-            .flat_map(|remote| remote.heads.into_keys())
-            .collect::<HashSet<_>>()
-            .len();
-        Ok(RepoStats {
+        // The branches every signed remote publishes, as `remotes` reads them.
+        repo.identity_doc()?;
+        let mut branches = HashSet::new();
+        for remote in repo.remotes()? {
+            meter.check()?;
+            let (_, remote) = remote?;
+            for (name, _) in remote.iter() {
+                if let Some(branch) = name.as_str().strip_prefix("refs/heads/") {
+                    if !branches.contains(branch) {
+                        meter.charge(branch.len() as u64 + ENTRY_COST)?;
+                        branches.insert(branch.to_owned());
+                    }
+                }
+            }
+        }
+        let stats = RepoStats {
             commits,
-            branches,
+            branches: branches.len(),
             contributors: contributors.len(),
-        })
+        };
+        meter.whole(|w| json::repo_stats(w, &stats))?;
+        Ok(stats)
     }
 
     /// Gracefully shut the node down and join its thread.
@@ -1649,6 +1727,30 @@ impl Embedded {
                 .map_err(|e| Error::NodeThread(e.to_string()))?;
         }
         Ok(())
+    }
+}
+
+/// The repository stored at storage entry `entry`, as heartwood's
+/// `Storage::repositories` finds them: a directory named by its RID, neither
+/// hidden nor a temporary clone (`.tmp`, or the older `.lock`). Anything else
+/// there is `None`; a directory whose name isn't a RID is an error, as there.
+fn stored_repository(entry: &std::fs::DirEntry) -> Result<Option<RepoId>, Error> {
+    if !entry.file_type()?.is_dir() {
+        return Ok(None);
+    }
+    let name = entry.file_name();
+    if name.to_string_lossy().starts_with('.') {
+        return Ok(None);
+    }
+    let path = entry.path();
+    if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
+        if ext == "tmp" || ext == "lock" {
+            return Ok(None);
+        }
+    }
+    match RepoId::try_from(name.clone()) {
+        Ok(rid) => Ok(Some(rid)),
+        Err(_) => Err(radicle::storage::Error::InvalidId(name).into()),
     }
 }
 
@@ -1718,7 +1820,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{parse_revision, prepare_control_socket, validate_cob_id};
-    use super::{CancelToken, FetchPolicy, Progress, LINE_JSON};
+    use super::{CancelToken, FetchPolicy, Progress, FILE_JSON, HUNK_JSON, LINE_JSON};
     use std::time::{Duration, Instant};
 
     /// The bounded diff's line count is a floor of radicle-surf's JSON: no
@@ -1730,6 +1832,64 @@ mod tests {
         assert_eq!(len(Modification::addition(String::new(), 1)), LINE_JSON);
         assert_eq!(len(Modification::deletion(String::new(), 1)), LINE_JSON);
         assert!(len(Modification::context(String::new(), 1, 1)) > LINE_JSON);
+    }
+
+    /// The bounded diff's file and hunk counts are a floor of radicle-surf's
+    /// JSON too: no file record is shorter than `FILE_JSON`, a rename's with
+    /// empty paths, and no hunk than `HUNK_JSON`, an empty one's.
+    #[test]
+    fn no_diff_record_takes_less_json_than_its_floor() {
+        use radicle_surf::diff::*;
+        use std::path::PathBuf;
+        let file = DiffFile {
+            oid: radicle_surf::Oid::from(git2::Oid::ZERO_SHA1),
+            mode: FileMode::Blob,
+        };
+        let records = [
+            FileDiff::Added(Added {
+                path: PathBuf::new(),
+                diff: DiffContent::Empty,
+                new: file.clone(),
+            }),
+            FileDiff::Deleted(Deleted {
+                path: PathBuf::new(),
+                diff: DiffContent::Empty,
+                old: file.clone(),
+            }),
+            FileDiff::Modified(Modified {
+                path: PathBuf::new(),
+                diff: DiffContent::Empty,
+                old: file.clone(),
+                new: file.clone(),
+            }),
+            FileDiff::Moved(Moved {
+                old_path: PathBuf::new(),
+                old: file.clone(),
+                new_path: PathBuf::new(),
+                new: file.clone(),
+                diff: DiffContent::Empty,
+            }),
+            FileDiff::Copied(Copied {
+                old_path: PathBuf::new(),
+                old: file.clone(),
+                new_path: PathBuf::new(),
+                new: file.clone(),
+                diff: DiffContent::Binary,
+            }),
+        ];
+        let len = |json: String| json.len() as u64;
+        let shortest = records
+            .iter()
+            .map(|record| len(serde_json::to_string(record).unwrap()))
+            .min();
+        assert_eq!(shortest, Some(FILE_JSON));
+        let hunk: Hunk<Modification> = Hunk {
+            header: Line::from(String::new()),
+            lines: vec![],
+            old: 0..0,
+            new: 0..0,
+        };
+        assert_eq!(len(serde_json::to_string(&hunk).unwrap()), HUNK_JSON);
     }
 
     #[test]
