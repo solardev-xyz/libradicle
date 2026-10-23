@@ -75,6 +75,7 @@ pub fn start(home: String, alias: String) -> String {
         home: home.into(),
         alias,
         listen: vec![],
+        control_socket: true,
     }) {
         Ok(node) => {
             let did = node.did();
@@ -113,6 +114,7 @@ pub fn start_with_key(home: String, alias: String, secret_key: Vec<u8>) -> Strin
             home: home.into(),
             alias,
             listen: vec![],
+            control_socket: true,
         },
         key,
     ) {

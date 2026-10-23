@@ -46,6 +46,10 @@ pub struct Options {
     pub alias: String,
     /// Addresses to listen on for inbound connections. Empty = outbound-only.
     pub listen: Vec<std::net::SocketAddr>,
+    /// Whether the node listens on a control socket (`<home>/node/control.sock`,
+    /// or `RAD_SOCKET`) for `rad` and other local clients. Without one, the
+    /// host controls the node through this handle alone.
+    pub control_socket: bool,
 }
 
 /// Summary of a repository's identity payload plus head.
@@ -693,6 +697,10 @@ pub struct Embedded {
     handle: NodeHandle,
     seed_book: Arc<Vec<seeds::Candidate>>,
     node_thread: Option<JoinHandle<Result<(), radicle_node::runtime::Error>>>,
+    /// Asks the node's reactor to stop, through its controller: no socket, so
+    /// nothing to wait on. [`Embedded::shutdown_within`] and `Drop` stop the
+    /// node with it.
+    stop: Box<dyn Fn() + Send + Sync>,
     /// Keeps the node's signal channel open for the runtime's lifetime.
     _signals: mpsc::Sender<radicle_signals::Signal>,
 }
@@ -770,8 +778,13 @@ impl Embedded {
     ) -> Result<Self, Error> {
         let seed_book = Arc::new(seeds::effective(&profile)?);
 
-        let socket = profile.home.socket_from_env();
-        prepare_control_socket(&socket)?;
+        let socket = if opts.control_socket {
+            let socket = profile.home.socket_from_env();
+            prepare_control_socket(&socket)?;
+            Some(socket)
+        } else {
+            None
+        };
 
         let (sig_tx, sig_rx) = mpsc::channel();
         let runtime = Runtime::init(
@@ -786,6 +799,11 @@ impl Embedded {
             seeds::install(&profile)?;
         }
         let handle = runtime.handle.clone();
+        let controller = runtime.reactor.controller();
+        let stop = Box::new(move || {
+            // An error means the reactor has stopped already.
+            controller.clone().shutdown().ok();
+        });
         let node_thread = std::thread::Builder::new()
             .name("radicle-node".to_string())
             .spawn(move || runtime.run())?;
@@ -796,6 +814,7 @@ impl Embedded {
             handle,
             seed_book,
             node_thread: Some(node_thread),
+            stop,
             _signals: sig_tx,
         })
     }
@@ -1402,13 +1421,87 @@ impl Embedded {
 
     /// Gracefully shut the node down and join its thread.
     pub fn shutdown(mut self) -> Result<(), Error> {
-        self.handle.shutdown()?;
+        self.handle.clone().shutdown()?;
         if let Some(t) = self.node_thread.take() {
             t.join()
                 .map_err(|_| Error::NodeThread("node thread panicked".into()))?
                 .map_err(|e| Error::NodeThread(e.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Whether the node's thread is still running. `false` once the node has
+    /// stopped, whether it was asked to or ended by itself (an error in its
+    /// runtime): a host can then restart it, or report why.
+    pub fn node_alive(&self) -> bool {
+        self.node_thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+    }
+
+    /// Asks the node to stop, and waits at most `timeout` for its thread to
+    /// end. A `timeout` too large to add to the current time waits for as
+    /// long as the node takes.
+    ///
+    /// - **Stopped in time:** the node's thread is joined for its result,
+    ///   its runtime's error if it ended with one. A node that had already
+    ///   stopped by itself is joined at once, even with no time to wait.
+    /// - **Past the deadline:** [`Error::ShutdownTimeout`]. The node stays in
+    ///   `self`, asked to stop: [`Embedded::node_alive`] tells when it has,
+    ///   and another call waits again and joins it.
+    /// - **Once joined,** a further call returns `Ok` at once.
+    ///
+    /// The stop goes to the node's reactor directly, never through its
+    /// control socket, so asking can't wait on anything.
+    pub fn shutdown_within(&mut self, timeout: std::time::Duration) -> Result<(), Error> {
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        let Some(thread) = self.node_thread.as_ref() else {
+            return Ok(());
+        };
+        if !thread.is_finished() {
+            (self.stop)();
+            loop {
+                let now = std::time::Instant::now();
+                let left = match deadline {
+                    Some(deadline) if now >= deadline => {
+                        return Err(Error::ShutdownTimeout(timeout));
+                    }
+                    Some(deadline) => deadline - now,
+                    None => std::time::Duration::MAX,
+                };
+                if thread.is_finished() {
+                    break;
+                }
+                std::thread::sleep(left.min(std::time::Duration::from_millis(10)));
+            }
+        }
+        let Some(thread) = self.node_thread.take() else {
+            return Ok(());
+        };
+        thread
+            .join()
+            .map_err(|_| Error::NodeThread("node thread panicked".into()))?
+            .map_err(|e| Error::NodeThread(e.to_string()))
+    }
+}
+
+/// How long dropping an [`Embedded`] waits for a node that still runs.
+pub const DROP_SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Dropping an [`Embedded`] whose node still runs stops it, as
+/// [`Embedded::shutdown_within`] does, and waits up to
+/// [`DROP_SHUTDOWN_LIMIT`] for its thread, joining it. A node that hasn't
+/// stopped by then is logged, and its thread is left to finish by itself: it
+/// has been asked to stop, and holds the home until it does. A node that
+/// stopped with an error is logged too.
+impl Drop for Embedded {
+    fn drop(&mut self) {
+        if self.node_thread.is_none() {
+            return;
+        }
+        if let Err(e) = self.shutdown_within(DROP_SHUTDOWN_LIMIT) {
+            log::warn!(target: "libradicle", "Dropped a node that didn't stop cleanly: {e}");
+        }
     }
 }
 
