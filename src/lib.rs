@@ -1349,6 +1349,47 @@ impl Embedded {
         }
         Ok(())
     }
+
+    /// Whether the node's thread is still running. `false` once the node has
+    /// stopped, whether it was asked to or ended by itself (an error in its
+    /// runtime): a host can then restart it, or report why.
+    pub fn node_alive(&self) -> bool {
+        self.node_thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+    }
+
+    /// [`Embedded::shutdown`], waiting at most `timeout` for the node's
+    /// thread to end. Past it, [`Error::ShutdownTimeout`]: the thread is left
+    /// to finish on its own, and the host decides what to do (exit, say).
+    ///
+    /// A node that had already stopped by itself is joined for its own
+    /// result, its runtime's error if it ended with one, without waiting.
+    pub fn shutdown_within(mut self, timeout: std::time::Duration) -> Result<(), Error> {
+        let deadline = std::time::Instant::now() + timeout;
+        let Some(thread) = self.node_thread.take() else {
+            return Ok(self.handle.shutdown()?);
+        };
+        if !thread.is_finished() {
+            // The request can only fail on a closed channel, which means the
+            // node is stopping already: wait for its thread either way.
+            let _ = self.handle.shutdown();
+            loop {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(Error::ShutdownTimeout(timeout));
+                }
+                if thread.is_finished() {
+                    break;
+                }
+                std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(10)));
+            }
+        }
+        thread
+            .join()
+            .map_err(|_| Error::NodeThread("node thread panicked".into()))?
+            .map_err(|e| Error::NodeThread(e.to_string()))
+    }
 }
 
 /// Remove a Unix control socket left behind by an unclean process exit.
