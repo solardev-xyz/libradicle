@@ -49,6 +49,8 @@ pub enum Error {
     NotATree(String),
     #[error("not a file: {0}")]
     NotABlob(String),
+    #[error("{size} bytes is over the limit of {limit}")]
+    TooLarge { size: u64, limit: u64 },
     #[error("invalid commit revision {0:?}")]
     InvalidRevision(String),
     #[error(transparent)]
