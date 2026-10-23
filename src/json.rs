@@ -133,19 +133,22 @@ pub fn identity(w: &mut impl io::Write, identity: &Identity) -> Written {
     )
 }
 
+fn repo_value(repo: &RepoInfo) -> Value {
+    json!({
+        "rid": repo.rid.to_string(),
+        "name": repo.name,
+        "description": repo.description,
+    })
+}
+
 /// The repositories in local storage.
 pub fn repos(w: &mut impl io::Write, repos: &[RepoInfo]) -> Written {
-    put(
-        w,
-        &json!(repos
-            .iter()
-            .map(|repo| json!({
-                "rid": repo.rid.to_string(),
-                "name": repo.name,
-                "description": repo.description,
-            }))
-            .collect::<Vec<_>>()),
-    )
+    put(w, &json!(repos.iter().map(repo_value).collect::<Vec<_>>()))
+}
+
+/// One repository, as an item of [`repos`].
+pub fn repo(w: &mut impl io::Write, repo: &RepoInfo) -> Written {
+    put(w, &repo_value(repo))
 }
 
 /// The repositories with an explicit allow-seeding policy.

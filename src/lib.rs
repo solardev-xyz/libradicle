@@ -35,7 +35,12 @@ use radicle_node::runtime::Runtime;
 pub mod error;
 pub use error::Error;
 pub mod json;
+mod meter;
+#[cfg(test)]
+mod seams;
 mod seeds;
+
+use meter::Meter;
 
 /// Options for starting an embedded Radicle stack.
 #[derive(Debug, Clone)]
@@ -271,7 +276,8 @@ impl FetchPolicy {
     }
 }
 
-/// A cheap, cloneable cancellation flag shared with a running clone.
+/// A cheap, cloneable cancellation flag shared with a running clone, or with
+/// a bounded walk ([`Bounds`]).
 #[derive(Debug, Clone, Default)]
 pub struct CancelToken(Arc<AtomicBool>);
 
@@ -279,7 +285,7 @@ impl CancelToken {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Request cancellation of the associated clone.
+    /// Request cancellation of the associated clone or walk.
     pub fn cancel(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
@@ -287,6 +293,54 @@ impl CancelToken {
         self.0.load(Ordering::SeqCst)
     }
 }
+
+/// The limits on a read that walks storage, the `_bounded` reads: a
+/// cancellation token, and a budget in bytes of the result's JSON, as the
+/// [`json`] module writes it.
+///
+/// A walk checks the token at each step, and stops with
+/// [`Error::Cancelled`] once it is cancelled. It charges each item as it is
+/// built, and stops with [`Error::TooLarge`] when the next one doesn't fit:
+/// a result it returns never writes more JSON than its budget.
+#[derive(Debug, Clone)]
+pub struct Bounds {
+    pub cancel: CancelToken,
+    pub budget: u64,
+}
+
+impl Bounds {
+    pub fn new(cancel: CancelToken, budget: u64) -> Self {
+        Self { cancel, budget }
+    }
+
+    /// No limit, and a token nobody holds: what the unbounded reads use.
+    pub fn unbounded() -> Self {
+        Self::new(CancelToken::new(), u64::MAX)
+    }
+}
+
+/// The shortest JSON a diff line can take: an empty addition or deletion,
+/// `{"line":"","lineNo":1,"type":"addition"}`. A context line takes more.
+const LINE_JSON: u64 = 40;
+
+/// The shortest JSON a diff's file record can take, its paths aside: a move
+/// whose blob is unchanged, `{"status":"moved","oldPath":"","newPath":"",
+/// "current":{"oid":"<40 hex>","mode":"blob"}}`.
+const FILE_JSON: u64 = 119;
+
+/// The shortest JSON a diff hunk can take, its header aside: an empty one,
+/// `{"header":"","lines":[],"old":{"start":0,"end":0},"new":{"start":0,"end":0}}`.
+const HUNK_JSON: u64 = 76;
+
+/// What an entry `repo_stats_bounded` holds while it counts costs beyond its
+/// bytes: its strings' headers and its slot in the set.
+const ENTRY_COST: u64 = 64;
+
+/// The shortest JSON a listed repository can take: an empty name and
+/// description, and the shortest RID, whose 20 bytes take at least 20
+/// base58 digits, `{"rid":"rad:z11111111111111111111","name":"",
+/// "description":""}`.
+const REPO_JSON: u64 = 62;
 
 impl Network {
     fn connected_seed_ids(&mut self) -> Result<HashSet<NodeId>, Error> {
@@ -877,14 +931,86 @@ impl Embedded {
 
     /// List all locally stored repositories.
     pub fn list_repos(&self) -> Result<Vec<RepoInfo>, Error> {
+        self.list_repos_bounded(&Bounds::unbounded())
+    }
+
+    /// [`Embedded::list_repos`], within `bounds`: each repository is charged
+    /// as [`json::repos`] writes it.
+    ///
+    /// Storage is walked one entry at a time, and nothing of a repository is
+    /// loaded before the token is checked for it, and the budget has room
+    /// for it at its shortest, [`REPO_JSON`] and a comma. A repository that
+    /// isn't seeded is skipped before it is opened; a seeded one is refused
+    /// unopened once there is no room for it, even one that would then have
+    /// been skipped as invalid.
+    pub fn list_repos_bounded(&self, bounds: &Bounds) -> Result<Vec<RepoInfo>, Error> {
+        let mut meter = Meter::array(bounds)?;
         let policies = self.profile.policies()?;
         let mut repos = Vec::new();
-        for repo in self.profile.storage.repositories()? {
-            if policies.is_seeding(&repo.rid)? {
-                repos.push(self.repo_info(repo.rid)?);
+        let entries = std::fs::read_dir(self.profile.storage.path())?;
+        #[cfg(test)]
+        let entries = entries.inspect(|_| seams::bump(&seams::ENTRIES));
+        for entry in entries {
+            meter.check()?;
+            let Some(rid) = stored_repository(&entry?)? else {
+                continue;
+            };
+            if !policies.is_seeding(&rid)? {
+                continue;
             }
+            meter.admits(REPO_JSON)?;
+            if !self.is_listed(rid)? {
+                continue;
+            }
+            let info = self.repo_info(rid)?;
+            meter.item(|w| json::repo(w, &info))?;
+            repos.push(info);
         }
         Ok(repos)
+    }
+
+    /// Whether heartwood's `Storage::repositories` lists `rid`, checked as it
+    /// checks each repository: one that doesn't open with an identity
+    /// document and a head is skipped; one whose local signed refs don't
+    /// read is an error, the error it returns. Signed refs that are absent,
+    /// or that need migrating, are accepted, as it accepts them.
+    fn is_listed(&self, rid: RepoId) -> Result<bool, Error> {
+        use radicle::storage::refs::{sigrefs::read::error::Read, FeatureLevel, SignedRefs};
+
+        #[cfg(test)]
+        seams::bump(&seams::OPENED);
+        let repo = match self.profile.storage.repository(rid) {
+            Ok(repo) => repo,
+            Err(e) => {
+                log::warn!(target: "libradicle", "Repository {rid} is invalid: {e}");
+                return Ok(false);
+            }
+        };
+        if let Err(e) = repo.identity_doc() {
+            log::warn!(target: "libradicle", "Repository {rid} is invalid: looking up doc: {e}");
+            return Ok(false);
+        }
+        if let Err(e) = repo.head() {
+            log::warn!(target: "libradicle", "Repository {rid} is invalid: looking up head: {e}");
+            return Ok(false);
+        }
+        // heartwood's `SignedRefsInfo::new`, private to it, and the sync time
+        // it then reads for signed refs that need no migration.
+        let local = self.profile.storage.info().key;
+        match SignedRefs::load(local, &repo) {
+            Ok(Some(refs))
+                if refs.feature_level() >= FeatureLevel::LATEST && refs.parent().is_some() =>
+            {
+                radicle::node::SyncedAt::new(refs.at, &repo)
+                    .map_err(radicle::storage::Error::from)?;
+            }
+            Ok(_) | Err(Read::Downgrade { .. }) => {}
+            Err(err) => {
+                let err = radicle::storage::refs::Error::Read(err);
+                return Err(radicle::storage::Error::from(err).into());
+            }
+        }
+        Ok(true)
     }
 
     /// List explicit allow-seeding policies, including repositories whose
@@ -1065,9 +1191,26 @@ impl Embedded {
 
     /// Read all issues in repository storage.
     pub fn issues(&self, rid: RepoId) -> Result<Vec<(cob::ObjectId, cob::issue::Issue)>, Error> {
+        self.issues_bounded(rid, &Bounds::unbounded())
+    }
+
+    /// [`Embedded::issues`], within `bounds`: each issue is charged as
+    /// [`json::issues`] writes it.
+    pub fn issues_bounded(
+        &self,
+        rid: RepoId,
+        bounds: &Bounds,
+    ) -> Result<Vec<(cob::ObjectId, cob::issue::Issue)>, Error> {
+        let mut meter = Meter::array(bounds)?;
         let repo = self.profile.storage.repository(rid)?;
         let issues = self.profile.issues(&repo)?;
-        let result = issues.list()?.collect::<Result<Vec<_>, _>>()?;
+        let mut result = Vec::new();
+        for issue in issues.list()? {
+            meter.check()?;
+            let (id, issue) = issue?;
+            meter.item(|w| json::issue(w, &id, &issue))?;
+            result.push((id, issue));
+        }
         Ok(result)
     }
 
@@ -1089,9 +1232,26 @@ impl Embedded {
 
     /// Read all patches in repository storage.
     pub fn patches(&self, rid: RepoId) -> Result<Vec<(cob::ObjectId, cob::patch::Patch)>, Error> {
+        self.patches_bounded(rid, &Bounds::unbounded())
+    }
+
+    /// [`Embedded::patches`], within `bounds`: each patch is charged as
+    /// [`json::patches`] writes it.
+    pub fn patches_bounded(
+        &self,
+        rid: RepoId,
+        bounds: &Bounds,
+    ) -> Result<Vec<(cob::ObjectId, cob::patch::Patch)>, Error> {
+        let mut meter = Meter::array(bounds)?;
         let repo = self.profile.storage.repository(rid)?;
         let patches = self.profile.patches(&repo)?;
-        let result = patches.list()?.collect::<Result<Vec<_>, _>>()?;
+        let mut result = Vec::new();
+        for patch in patches.list()? {
+            meter.check()?;
+            let (id, patch) = patch?;
+            meter.item(|w| json::patch(w, &id, &patch))?;
+            result.push((id, patch));
+        }
         Ok(result)
     }
 
@@ -1143,17 +1303,40 @@ impl Embedded {
     /// List file paths at the head of the default branch, straight from
     /// the bare repo in storage.
     pub fn list_files(&self, rid: RepoId) -> Result<Vec<String>, Error> {
+        self.list_files_bounded(rid, &Bounds::unbounded())
+    }
+
+    /// [`Embedded::list_files`], within `bounds`: each path is charged as
+    /// [`json::files`] writes it.
+    pub fn list_files_bounded(&self, rid: RepoId, bounds: &Bounds) -> Result<Vec<String>, Error> {
+        let mut meter = Meter::array(bounds)?;
         let repo = self.profile.storage.repository(rid)?;
         let (_, head) = repo.head()?;
         let commit = repo.backend.find_commit(head.into())?;
         let tree = commit.tree()?;
         let mut files = Vec::new();
-        tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
-            if entry.kind() == Some(git2::ObjectType::Blob) {
-                files.push(format!("{dir}{}", entry.name().unwrap_or("?")));
+        let mut stopped = None;
+        let walked = tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+            let charged = meter.check().and_then(|()| {
+                if entry.kind() == Some(git2::ObjectType::Blob) {
+                    let path = format!("{dir}{}", entry.name().unwrap_or("?"));
+                    meter.item(|w| serde_json::to_writer(w, &path))?;
+                    files.push(path);
+                }
+                Ok(())
+            });
+            match charged {
+                Ok(()) => git2::TreeWalkResult::Ok,
+                Err(e) => {
+                    stopped = Some(e);
+                    git2::TreeWalkResult::Abort
+                }
             }
-            git2::TreeWalkResult::Ok
-        })?;
+        });
+        if let Some(e) = stopped {
+            return Err(e);
+        }
+        walked?;
         Ok(files)
     }
 
@@ -1192,23 +1375,181 @@ impl Embedded {
         page: usize,
         per_page: usize,
     ) -> Result<Vec<radicle_surf::Commit>, Error> {
+        self.commits_bounded(rid, parent, page, per_page, &Bounds::unbounded())
+    }
+
+    /// [`Embedded::commits`], within `bounds`: each commit is charged as
+    /// [`json::commits`] writes it, and the token is checked at every commit
+    /// walked, the skipped pages' included.
+    pub fn commits_bounded(
+        &self,
+        rid: RepoId,
+        parent: &str,
+        page: usize,
+        per_page: usize,
+        bounds: &Bounds,
+    ) -> Result<Vec<radicle_surf::Commit>, Error> {
+        let mut meter = Meter::array(bounds)?;
         let oid = parse_revision(parent)?;
         let repo = self.surf_repo(rid)?;
         let history = repo.history(radicle_surf::Oid::from(oid))?;
-        history
-            .skip(page.saturating_mul(per_page))
-            .take(per_page)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Error::from)
+        let skip = page.saturating_mul(per_page);
+        let mut commits = Vec::new();
+        if per_page == 0 {
+            return Ok(commits);
+        }
+        for (index, commit) in history.enumerate() {
+            meter.check()?;
+            // As `skip` would: a skipped commit is dropped, an error with it.
+            if index < skip {
+                continue;
+            }
+            let commit = commit?;
+            meter.item(|w| serde_json::to_writer(w, &commit))?;
+            commits.push(commit);
+            if commits.len() == per_page {
+                break;
+            }
+        }
+        Ok(commits)
     }
 
     /// Commit metadata plus a structured diff against its first parent.
     pub fn commit(&self, rid: RepoId, revision: &str) -> Result<CommitDetail, Error> {
+        self.commit_bounded(rid, revision, &Bounds::unbounded())
+    }
+
+    /// [`Embedded::commit`], within `bounds`: the detail is charged as
+    /// [`json::commit`] writes it.
+    ///
+    /// The diff is checked before it is built, and is `TooLarge` before
+    /// anything of it is built when:
+    /// - its file records, a rename or copy counted as one, can't fit at the
+    ///   least JSON each takes, with its paths: checked before renames and
+    ///   copies are looked for, and again after;
+    /// - the blobs it would load, sized from their headers, add up to more
+    ///   than the budget, binary files' included;
+    /// - its records, hunks and lines can't fit, each at the least JSON it
+    ///   takes.
+    ///
+    /// The token is checked between those steps, and at every file record,
+    /// hunk and line; finding renames and copies is one step libgit2 doesn't
+    /// interrupt, bounded by the record count checked before it.
+    pub fn commit_bounded(
+        &self,
+        rid: RepoId,
+        revision: &str,
+        bounds: &Bounds,
+    ) -> Result<CommitDetail, Error> {
+        let mut meter = Meter::new(bounds);
         let oid = parse_revision(revision)?;
+        if meter.counts() {
+            let storage = self.profile.storage.repository(rid)?;
+            Self::diff_fits(&storage.backend, oid, &meter)?;
+        }
         let repo = self.surf_repo(rid)?;
         let commit = repo.commit(radicle_surf::Oid::from(oid))?;
+        meter.check()?;
         let diff = repo.diff_commit(commit.id)?;
-        Ok(CommitDetail { commit, diff })
+        let detail = CommitDetail { commit, diff };
+        meter.whole(|w| json::commit(w, &detail))?;
+        Ok(detail)
+    }
+
+    /// Whether `oid`'s diff against its first parent, as radicle-surf builds
+    /// it, can fit what is left of `meter`'s budget, found without building
+    /// it: see [`Embedded::commit_bounded`].
+    fn diff_fits(repo: &git2::Repository, oid: git2::Oid, meter: &Meter) -> Result<(), Error> {
+        use std::cell::{Cell, RefCell};
+
+        let left = meter.left();
+        let over = |size: u64| Error::TooLarge { size, limit: left };
+        let commit = repo.find_commit(oid)?;
+        let new_tree = commit.tree()?;
+        let old_tree = match commit.parents().next() {
+            Some(parent) => Some(parent.tree()?),
+            None => None,
+        };
+        let mut diff = repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)?;
+
+        // Before renames and copies are found, the records can't be fewer than
+        // half the deltas: a rename or copy joins two at most.
+        let floor = (diff.deltas().len() as u64 / 2).saturating_mul(FILE_JSON);
+        if floor > left {
+            return Err(over(floor));
+        }
+        // Every blob the diff will load, sized from its header, all of them
+        // together.
+        let odb = repo.odb()?;
+        let mut loaded = 0u64;
+        for delta in diff.deltas() {
+            meter.check()?;
+            for file in [delta.old_file(), delta.new_file()] {
+                if file.id().is_zero() || file.mode() == git2::FileMode::Commit {
+                    continue;
+                }
+                let (size, _) = odb.read_header(file.id())?;
+                loaded = loaded.saturating_add(size as u64);
+                if loaded > left {
+                    return Err(over(loaded));
+                }
+            }
+        }
+        // As radicle-surf finds them: a rename or copy shows only its changes.
+        meter.check()?;
+        let mut similar = git2::DiffFindOptions::new();
+        similar.renames(true);
+        similar.copies(true);
+        diff.find_similar(Some(&mut similar))?;
+        meter.check()?;
+
+        // The records as radicle-surf builds them, each with its paths; then
+        // their hunks and lines.
+        let needed = Cell::new(0u64);
+        let stopped = RefCell::new(None);
+        let charge = |bytes: u64| -> bool {
+            needed.set(needed.get().saturating_add(bytes));
+            let fits = meter.check().and_then(|()| {
+                if needed.get() > left {
+                    return Err(over(needed.get()));
+                }
+                Ok(())
+            });
+            match fits {
+                Ok(()) => true,
+                Err(e) => {
+                    *stopped.borrow_mut() = Some(e);
+                    false
+                }
+            }
+        };
+        let path_len =
+            |file: git2::DiffFile<'_>| file.path().map_or(0, |path| path.as_os_str().len() as u64);
+        let walked = diff.foreach(
+            &mut |delta, _| {
+                let paths = match delta.status() {
+                    git2::Delta::Renamed | git2::Delta::Copied => {
+                        path_len(delta.old_file()) + path_len(delta.new_file())
+                    }
+                    git2::Delta::Deleted => path_len(delta.old_file()),
+                    _ => path_len(delta.new_file()),
+                };
+                charge(FILE_JSON + paths)
+            },
+            None,
+            Some(&mut |_, hunk| charge(HUNK_JSON + hunk.header().len() as u64)),
+            Some(&mut |_, _, line| {
+                if !matches!(line.origin(), '+' | '-' | ' ') {
+                    return true;
+                }
+                charge(LINE_JSON + line.content().len() as u64)
+            }),
+        );
+        if let Some(e) = stopped.into_inner() {
+            return Err(e);
+        }
+        walked?;
+        Ok(())
     }
 
     fn commit_info(commit: &git2::Commit<'_>) -> CommitInfo {
@@ -1389,6 +1730,21 @@ impl Embedded {
 
     /// Commit, branch, and contributor counts reachable from `revision`.
     pub fn repo_stats(&self, rid: RepoId, revision: &str) -> Result<RepoStats, Error> {
+        self.repo_stats_bounded(rid, revision, &Bounds::unbounded())
+    }
+
+    /// [`Embedded::repo_stats`], within `bounds`. Its result is three
+    /// numbers, but it holds a set of contributors and one of branches while
+    /// it counts: each new entry is charged its bytes and [`ENTRY_COST`], and
+    /// the result its JSON, as [`json::repo_stats`] writes it. The token is
+    /// checked at every commit walked, and at every remote.
+    pub fn repo_stats_bounded(
+        &self,
+        rid: RepoId,
+        revision: &str,
+        bounds: &Bounds,
+    ) -> Result<RepoStats, Error> {
+        let mut meter = Meter::new(bounds);
         let repo = self.profile.storage.repository(rid)?;
         let commit = Self::commit_at(&repo, revision)?;
         let mut walk = repo.backend.revwalk()?;
@@ -1397,26 +1753,48 @@ impl Embedded {
         let mut commits = 0;
         let mut contributors = HashSet::new();
         for oid in walk {
+            #[cfg(test)]
+            seams::at(seams::Step::Commit, &bounds.cancel);
+            meter.check()?;
+            #[cfg(test)]
+            seams::bump(&seams::COMMITS);
             let commit = repo.backend.find_commit(oid?)?;
             let author = commit.author();
-            contributors.insert((
-                author.name().unwrap_or_default().to_string(),
-                author.email().unwrap_or_default().to_string(),
-            ));
+            let name = author.name().unwrap_or_default().to_string();
+            let email = author.email().unwrap_or_default().to_string();
+            let bytes = (name.len() + email.len()) as u64;
+            if contributors.insert((name, email)) {
+                meter.charge(bytes + ENTRY_COST)?;
+            }
             commits += 1;
         }
 
-        let branches = self
-            .remotes(rid)?
-            .into_iter()
-            .flat_map(|remote| remote.heads.into_keys())
-            .collect::<HashSet<_>>()
-            .len();
-        Ok(RepoStats {
+        // The branches every signed remote publishes, as `remotes` reads them.
+        repo.identity_doc()?;
+        let mut branches = HashSet::new();
+        for remote in repo.remotes()? {
+            #[cfg(test)]
+            seams::at(seams::Step::Remote, &bounds.cancel);
+            meter.check()?;
+            #[cfg(test)]
+            seams::bump(&seams::REMOTES);
+            let (_, remote) = remote?;
+            for (name, _) in remote.iter() {
+                if let Some(branch) = name.as_str().strip_prefix("refs/heads/") {
+                    if !branches.contains(branch) {
+                        meter.charge(branch.len() as u64 + ENTRY_COST)?;
+                        branches.insert(branch.to_owned());
+                    }
+                }
+            }
+        }
+        let stats = RepoStats {
             commits,
-            branches,
+            branches: branches.len(),
             contributors: contributors.len(),
-        })
+        };
+        meter.whole(|w| json::repo_stats(w, &stats))?;
+        Ok(stats)
     }
 
     /// Gracefully shut the node down and join its thread.
@@ -1505,6 +1883,30 @@ impl Drop for Embedded {
     }
 }
 
+/// The repository stored at storage entry `entry`, as heartwood's
+/// `Storage::repositories` finds them: a directory named by its RID, neither
+/// hidden nor a temporary clone (`.tmp`, or the older `.lock`). Anything else
+/// there is `None`; a directory whose name isn't a RID is an error, as there.
+fn stored_repository(entry: &std::fs::DirEntry) -> Result<Option<RepoId>, Error> {
+    if !entry.file_type()?.is_dir() {
+        return Ok(None);
+    }
+    let name = entry.file_name();
+    if name.to_string_lossy().starts_with('.') {
+        return Ok(None);
+    }
+    let path = entry.path();
+    if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
+        if ext == "tmp" || ext == "lock" {
+            return Ok(None);
+        }
+    }
+    match RepoId::try_from(name.clone()) {
+        Ok(rid) => Ok(Some(rid)),
+        Err(_) => Err(radicle::storage::Error::InvalidId(name).into()),
+    }
+}
+
 /// Remove a Unix control socket left behind by an unclean process exit.
 ///
 /// A successful connection means another node really is listening, so the
@@ -1571,8 +1973,105 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{parse_revision, prepare_control_socket, validate_cob_id};
-    use super::{CancelToken, FetchPolicy, Progress};
+    use super::{CancelToken, FetchPolicy, Progress, FILE_JSON, HUNK_JSON, LINE_JSON};
     use std::time::{Duration, Instant};
+
+    /// The bounded diff's line count is a floor of radicle-surf's JSON: no
+    /// line's JSON is shorter than `LINE_JSON`, an empty addition's.
+    #[test]
+    fn no_diff_line_takes_less_json_than_line_json() {
+        use radicle_surf::diff::Modification;
+        let len = |line: Modification| serde_json::to_string(&line).unwrap().len() as u64;
+        assert_eq!(len(Modification::addition(String::new(), 1)), LINE_JSON);
+        assert_eq!(len(Modification::deletion(String::new(), 1)), LINE_JSON);
+        assert!(len(Modification::context(String::new(), 1, 1)) > LINE_JSON);
+    }
+
+    /// The bounded diff's file and hunk counts are a floor of radicle-surf's
+    /// JSON too: no file record is shorter than `FILE_JSON`, a rename's with
+    /// empty paths, and no hunk than `HUNK_JSON`, an empty one's.
+    #[test]
+    fn no_diff_record_takes_less_json_than_its_floor() {
+        use radicle_surf::diff::*;
+        use std::path::PathBuf;
+        let file = DiffFile {
+            oid: radicle_surf::Oid::from(git2::Oid::ZERO_SHA1),
+            mode: FileMode::Blob,
+        };
+        let records = [
+            FileDiff::Added(Added {
+                path: PathBuf::new(),
+                diff: DiffContent::Empty,
+                new: file.clone(),
+            }),
+            FileDiff::Deleted(Deleted {
+                path: PathBuf::new(),
+                diff: DiffContent::Empty,
+                old: file.clone(),
+            }),
+            FileDiff::Modified(Modified {
+                path: PathBuf::new(),
+                diff: DiffContent::Empty,
+                old: file.clone(),
+                new: file.clone(),
+            }),
+            FileDiff::Moved(Moved {
+                old_path: PathBuf::new(),
+                old: file.clone(),
+                new_path: PathBuf::new(),
+                new: file.clone(),
+                diff: DiffContent::Empty,
+            }),
+            FileDiff::Copied(Copied {
+                old_path: PathBuf::new(),
+                old: file.clone(),
+                new_path: PathBuf::new(),
+                new: file.clone(),
+                diff: DiffContent::Binary,
+            }),
+        ];
+        let len = |json: String| json.len() as u64;
+        let shortest = records
+            .iter()
+            .map(|record| len(serde_json::to_string(record).unwrap()))
+            .min();
+        assert_eq!(shortest, Some(FILE_JSON));
+        let hunk: Hunk<Modification> = Hunk {
+            header: Line::from(String::new()),
+            lines: vec![],
+            old: 0..0,
+            new: 0..0,
+        };
+        assert_eq!(len(serde_json::to_string(&hunk).unwrap()), HUNK_JSON);
+    }
+
+    /// No listed repository takes less JSON than `REPO_JSON`: one with an
+    /// empty name and description, and the RID of 20 zero bytes, the
+    /// shortest, takes exactly that.
+    #[test]
+    fn no_repository_takes_less_json_than_repo_json() {
+        use super::{json, RepoId, RepoInfo, REPO_JSON};
+        let shortest = "rad:z11111111111111111111";
+        let info = |rid: RepoId| RepoInfo {
+            rid,
+            name: String::new(),
+            description: String::new(),
+            default_branch: String::new(),
+            head: String::new(),
+            delegates: vec![],
+            threshold: 0,
+            visibility: Default::default(),
+            issues_open: 0,
+            patches_open: 0,
+        };
+        let len = |info: &RepoInfo| json::to_string(|w| json::repo(w, info)).len() as u64;
+        let floor = info(shortest.parse().expect("a RID"));
+        assert_eq!(floor.rid.to_string(), shortest);
+        assert_eq!(len(&floor), REPO_JSON);
+        let ones =
+            radicle::git::Oid::from(radicle::git::raw::Oid::from_bytes(&[0xff; 20]).unwrap());
+        assert!(len(&info(RepoId::from(ones))) > REPO_JSON);
+    }
 
     #[test]
     fn cancel_token_flips() {
