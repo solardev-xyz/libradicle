@@ -42,6 +42,8 @@ pub enum Error {
     Announce(String),
     #[error("node thread: {0}")]
     NodeThread(String),
+    #[error("the node didn't stop within {0:?}")]
+    ShutdownTimeout(std::time::Duration),
     #[error("invalid collaborative object id {0:?}")]
     InvalidCobId(String),
     #[error("not a directory: {0}")]

@@ -24,6 +24,7 @@ fn opts(home: &str) -> Options {
         home: home.into(),
         alias: "host-key-test".into(),
         listen: vec![],
+        control_socket: true,
     }
 }
 

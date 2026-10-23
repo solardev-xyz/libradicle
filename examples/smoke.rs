@@ -25,6 +25,7 @@ fn main() -> anyhow::Result<()> {
         home: home.into(),
         alias: "libradicle-smoke".into(),
         listen: vec![],
+        control_socket: true,
     })?;
     println!("node started, DID: {}", node.did());
 
