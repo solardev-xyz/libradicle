@@ -48,7 +48,6 @@ fn read(counter: &'static LocalKey<Cell<usize>>) -> usize {
 
 mod tests {
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::{Bounds, Embedded, Error, HostKey, Options, RepoId};
@@ -69,12 +68,10 @@ mod tests {
     /// A node that dials nobody, with `repos` imported repositories of one
     /// commit each.
     fn fixture(name: &str, repos: usize) -> Fixture {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is before Unix epoch")
-            .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("libradicle-{name}-{}-{nonce}", std::process::id()));
+        // Short: a COB ref's path in storage, under it, is long enough to
+        // pass Windows' 260 characters under a long name.
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(
@@ -131,7 +128,7 @@ mod tests {
     // the listing opens none.
     #[test]
     fn a_listing_with_no_room_left_opens_no_repository() {
-        let f = fixture("seamsopened", 1);
+        let f = fixture("rsopened", 1);
         read(&OPENED);
         assert!(matches!(
             f.node.list_repos_bounded(&budget(2)),
@@ -150,7 +147,7 @@ mod tests {
     // a time, and none past the repository that doesn't fit.
     #[test]
     fn a_listing_reads_no_entry_past_the_repository_that_doesnt_fit() {
-        let f = fixture("seamsentries", 2);
+        let f = fixture("rsentries", 2);
         let storage = f.node.profile.storage.path().to_owned();
         for i in 0..100 {
             std::fs::create_dir(storage.join(format!(".hidden-{i}"))).unwrap();
@@ -182,7 +179,7 @@ mod tests {
     // remote, `repo_stats` reads nothing of it.
     #[test]
     fn a_stats_walk_cancelled_at_a_step_reads_none_of_it() {
-        let f = fixture("seamsstats", 1);
+        let f = fixture("rsstats", 1);
         let (rid, commit) = &f.repos[0];
         for (step, counter) in [(Step::Commit, &COMMITS), (Step::Remote, &REMOTES)] {
             read(counter);
