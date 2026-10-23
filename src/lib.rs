@@ -88,6 +88,13 @@ pub struct Blob {
     pub content: Vec<u8>,
 }
 
+/// A blob's object id and size, read from its object header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobHeader {
+    pub oid: String,
+    pub size: u64,
+}
+
 /// Git signature information exposed with a commit.
 #[derive(Debug, Clone)]
 pub struct CommitSignature {
@@ -1260,18 +1267,71 @@ impl Embedded {
         Ok(self.tree_at(rid, &head.to_string(), path)?.0)
     }
 
+    /// The object id and size of the file at `path` in a specific commit,
+    /// from the object's header: none of its content is loaded.
+    pub fn blob_header(
+        &self,
+        rid: RepoId,
+        revision: &str,
+        path: &str,
+    ) -> Result<BlobHeader, Error> {
+        let repo = self.profile.storage.repository(rid)?;
+        let (oid, size) = Self::blob_header_in(&repo, revision, path)?;
+        Ok(BlobHeader {
+            oid: oid.to_string(),
+            size,
+        })
+    }
+
+    fn blob_header_in(
+        repo: &radicle::storage::git::Repository,
+        revision: &str,
+        path: &str,
+    ) -> Result<(git2::Oid, u64), Error> {
+        let commit = Self::commit_at(repo, revision)?;
+        let entry = commit.tree()?.get_path(std::path::Path::new(path))?;
+        let not_a_blob = || Error::NotABlob(path.to_string());
+        if entry.kind() != Some(git2::ObjectType::Blob) {
+            return Err(not_a_blob());
+        }
+        let (size, kind) = repo.backend.odb()?.read_header(entry.id())?;
+        if kind != git2::ObjectType::Blob {
+            return Err(not_a_blob());
+        }
+        Ok((entry.id(), size as u64))
+    }
+
     /// Blob content at a specific commit.
     pub fn read_blob_at(&self, rid: RepoId, revision: &str, path: &str) -> Result<Blob, Error> {
+        self.read_blob_at_capped(rid, revision, path, u64::MAX)
+    }
+
+    /// [`Embedded::read_blob_at`], for a file of at most `limit` bytes. Its
+    /// size is read from the object's header first, so a larger file is
+    /// refused with [`Error::TooLarge`] before any of it is loaded.
+    pub fn read_blob_at_capped(
+        &self,
+        rid: RepoId,
+        revision: &str,
+        path: &str,
+        limit: u64,
+    ) -> Result<Blob, Error> {
         let repo = self.profile.storage.repository(rid)?;
-        let commit = Self::commit_at(&repo, revision)?;
-        let entry = commit.tree()?.get_path(std::path::Path::new(path))?;
-        let blob = entry
-            .to_object(&repo.backend)?
-            .into_blob()
-            .map_err(|_| Error::NotABlob(path.to_string()))?;
+        let (oid, size) = Self::blob_header_in(&repo, revision, path)?;
+        if size > limit {
+            return Err(Error::TooLarge { size, limit });
+        }
+        let blob = repo.backend.find_blob(oid)?;
+        let content = blob.content();
+        if content.len() as u64 > limit {
+            return Err(Error::TooLarge {
+                size: content.len() as u64,
+                limit,
+            });
+        }
         Ok(Blob {
             binary: blob.is_binary(),
-            content: blob.content().to_vec(),
+            content: content.to_vec(),
         })
     }
 
