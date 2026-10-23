@@ -135,3 +135,49 @@ fn without_routing_config_json_routes_as_before() {
     node.shutdown().expect("clean shutdown");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// Review of libradicle #9, round 1: a routing through a proxy, with onion
+// names to a proxy of their own, replaces config.json's routing in memory
+// too, and the node still resolves names through the gate it was given.
+#[test]
+fn routing_through_a_proxy_replaces_config_jsons_proxy() {
+    let home = home("radroutingproxy");
+    let written = std::fs::read(home.join("config.json")).unwrap();
+    let gate = Arc::new(Recording::default());
+    let proxy: std::net::SocketAddr = ([127, 0, 0, 1], 19050).into();
+    let onion = AddressConfig::Proxy {
+        address: ([127, 0, 0, 1], 19051).into(),
+    };
+    let node = start(
+        &home,
+        Some(Routing {
+            proxy: Some(proxy),
+            onion: onion.clone(),
+            gate: gate.clone(),
+        }),
+    );
+
+    let config = running_config(&home);
+    assert_eq!(config.proxy, Some(proxy));
+    assert_eq!(config.onion, onion);
+    assert_eq!(config.i2p, AddressConfig::Drop);
+    assert!(config.external_addresses.is_empty());
+    assert_eq!(std::fs::read(home.join("config.json")).unwrap(), written);
+
+    // With a proxy, the gate, which doesn't let the proxy resolve names, is
+    // still asked for the `connect` peer's name.
+    let until = Instant::now() + Duration::from_secs(10);
+    while gate.0.lock().unwrap().is_empty() {
+        assert!(Instant::now() < until, "the gate was never asked");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(gate
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|name| name == "seed.test:8776"));
+
+    node.shutdown().expect("clean shutdown");
+    let _ = std::fs::remove_dir_all(&home);
+}
