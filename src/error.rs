@@ -52,6 +52,10 @@ pub enum Error {
     NotABlob(String),
     #[error("{size} bytes is over the limit of {limit}")]
     TooLarge { size: u64, limit: u64 },
+    /// A bounded tree walk that would descend past
+    /// [`crate::MAX_TREE_DEPTH`].
+    #[error("the tree is nested deeper than {limit} levels")]
+    TooDeep { limit: usize },
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("invalid commit revision {0:?}")]
@@ -72,4 +76,6 @@ pub enum Error {
     Init(#[from] radicle::rad::InitError),
     #[error(transparent)]
     Policy(#[from] radicle::node::policy::store::Error),
+    #[error(transparent)]
+    Sqlite(#[from] sqlite::Error),
 }

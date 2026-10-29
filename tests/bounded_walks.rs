@@ -508,3 +508,475 @@ fn a_listing_reads_signed_refs_as_heartwood_does() {
         Err(Error::TooLarge { .. })
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Review of libradicle #15: what each binding read loads before its budget
+// applies, and what the remaining reads return.
+
+use radicle::storage::ReadStorage as _;
+
+/// The test `name` run again in a child process of this binary, with
+/// `LIBRADICLE_CHILD=name`: its stdout. A child that dies (a stack overflow
+/// aborts the process, which no `catch_unwind` turns into an error) fails
+/// the test with how it died, instead of taking the test run down.
+fn in_child(name: &str) -> String {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env("LIBRADICLE_CHILD", name)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "the child running {name} died: {:?}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn is_child(name: &str) -> bool {
+    std::env::var("LIBRADICLE_CHILD").as_deref() == Ok(name)
+}
+
+/// The commit `tree` makes on top of `f`'s head in storage, `message` its
+/// message; `head` moves `refs/heads/main` (the head every read resolves)
+/// to it.
+fn store_commit(f: &Fixture, tree: Option<git2::Oid>, message: &str, head: bool) -> git2::Oid {
+    let stored = storage(f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let main = git.find_reference("refs/heads/main").unwrap();
+    let parent = main.peel_to_commit().unwrap();
+    let tree = match tree {
+        Some(tree) => git.find_tree(tree).unwrap(),
+        None => parent.tree().unwrap(),
+    };
+    let signature =
+        git2::Signature::new("Test", "test@example.com", &git2::Time::new(1, 0)).unwrap();
+    let oid = git
+        .commit(None, &signature, &signature, message, &tree, &[&parent])
+        .unwrap();
+    if head {
+        git.reference("refs/heads/main", oid, true, "test").unwrap();
+    }
+    oid
+}
+
+/// The bytes this process's peak resident set grew while `run` ran (Linux:
+/// `/proc/self/clear_refs` resets the peak), or `None` elsewhere.
+fn peak_growth(run: impl FnOnce()) -> Option<u64> {
+    fn status(field: &str) -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status.lines().find(|l| l.starts_with(field)).unwrap();
+        line.split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            * 1024
+    }
+    if !cfg!(target_os = "linux") {
+        run();
+        return None;
+    }
+    std::fs::write("/proc/self/clear_refs", "5").unwrap();
+    let before = status("VmRSS:");
+    run();
+    Some(status("VmHWM:").saturating_sub(before))
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// LR15-M1: a chain of 30,000 nested trees, as the reviewer built it. The
+/// bounded walk refuses it cleanly; the unbounded one lists its one file.
+/// Neither may overflow the stack, so both run in a child.
+#[test]
+fn a_deep_tree_is_refused_never_overflowed() {
+    const NAME: &str = "a_deep_tree_is_refused_never_overflowed";
+    if !is_child(NAME) {
+        let out = in_child(NAME);
+        assert!(out.contains("bounded: TooDeep { limit: 4096 }"), "{out}");
+        assert!(out.contains("unbounded: 1 file, 60001 bytes"), "{out}");
+        return;
+    }
+    let f = fixture("raddeep");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let blob = git.blob(b"x").unwrap();
+    let mut builder = git.treebuilder(None).unwrap();
+    builder.insert("f", blob, 0o100644).unwrap();
+    let mut tree = builder.write().unwrap();
+    for _ in 0..30_000 {
+        let mut builder = git.treebuilder(None).unwrap();
+        builder.insert("d", tree, 0o040000).unwrap();
+        tree = builder.write().unwrap();
+    }
+    store_commit(&f, Some(tree), "deep", true);
+
+    match f.node.list_files_bounded(f.rid, &Bounds::for_binding()) {
+        Err(e @ Error::TooDeep { .. }) => println!("bounded: {e:?}"),
+        other => println!("bounded: unexpected {other:?}"),
+    }
+    let files = f.node.list_files(f.rid).expect("an unbounded walk");
+    println!(
+        "unbounded: {} file, {} bytes",
+        files.len(),
+        files.iter().map(String::len).sum::<usize>()
+    );
+}
+
+/// The trees a bounded walk loads count against its loads budget: the
+/// listing fits at exactly what it loads, and not one byte less.
+#[test]
+fn a_tree_walk_counts_what_it_loads() {
+    let f = fixture("radloads");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let odb = git.odb().unwrap();
+    let head = git
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let mut loads = odb.read_header(head.id()).unwrap().0 as u64;
+    let root = head.tree().unwrap();
+    loads += odb.read_header(root.id()).unwrap().0 as u64;
+    for entry in root.iter() {
+        if entry.kind() == Some(git2::ObjectType::Tree) {
+            loads += odb.read_header(entry.id()).unwrap().0 as u64;
+        }
+    }
+    let at = |loads: u64| budget(1 << 20).with_loads(loads);
+    assert_eq!(
+        f.node.list_files_bounded(f.rid, &at(loads)).unwrap().len(),
+        4
+    );
+    assert!(matches!(
+        f.node.list_files_bounded(f.rid, &at(loads - 1)),
+        Err(Error::TooLarge { .. })
+    ));
+}
+
+/// LR15-M2: the reads that were unbounded now stop at their budget, and a
+/// result exactly at its budget fits.
+#[test]
+fn every_binding_read_has_a_budget() {
+    let f = fixture("radreads");
+    let (node, rid) = (&f.node, f.rid);
+
+    let tree = node.tree(rid, "").expect("tree");
+    assert_eq!(tree.len(), 4);
+    exact(len(|w| json::tree(w, &tree)), |b| {
+        node.tree_bounded(rid, "", b)
+    });
+    let dir = node.tree(rid, "dir").expect("a subtree");
+    exact(len(|w| json::tree(w, &dir)), |b| {
+        node.tree_bounded(rid, "dir", b)
+    });
+
+    let head = f.commits[2].as_str();
+    let (entries, commit) = node.tree_at(rid, head, "").expect("tree_at");
+    exact(len(|w| json::tree_at(w, &entries, &commit)), |b| {
+        node.tree_at_bounded(rid, head, "", b)
+    });
+    assert!(matches!(
+        node.tree_at_bounded(rid, head, "a.txt", &budget(1 << 20)),
+        Err(Error::NotATree(_))
+    ));
+    let missing = node
+        .tree_at_bounded(rid, head, "nope/deeper", &budget(1 << 20))
+        .unwrap_err();
+    assert!(missing.to_string().contains("does not exist"), "{missing}");
+
+    let issues = node.issues(rid).expect("issues");
+    let (id, issue) = &issues[0];
+    exact(len(|w| json::issue(w, id, issue)), |b| {
+        node.issue_bounded(rid, &id.to_string(), b)
+    });
+    // A prefix names it too; one that names nothing is not found, as before.
+    let prefix = &id.to_string()[..12];
+    assert_eq!(node.issue(rid, prefix).unwrap().0, *id);
+    let unknown = node.issue(rid, "0000000000").unwrap_err().to_string();
+    assert!(unknown.contains("not found"), "{unknown}");
+
+    let remotes = node.remotes(rid).expect("remotes");
+    assert_eq!(remotes.len(), 1);
+    exact(len(|w| json::remotes(w, &remotes)), |b| {
+        node.remotes_bounded(rid, b)
+    });
+
+    let seeded = node.list_seeded_repos().expect("seeded");
+    assert_eq!(seeded.len(), 1);
+    exact(len(|w| json::seeded_repos(w, &seeded)), |b| {
+        node.list_seeded_repos_bounded(b)
+    });
+
+    let info = node.repo_info(rid).expect("repo info");
+    exact(len(|w| json::repo_info(w, &info)), |b| {
+        node.repo_info_bounded(rid, b)
+    });
+}
+
+/// LR15-M2: a tree with 70,000 long names, as the reviewer built it, is
+/// refused at the binding budget, never returned.
+#[test]
+fn a_wide_tree_is_refused_at_the_binding_budget() {
+    let f = fixture("radwide");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let blob = git.blob(b"x").unwrap();
+    let mut builder = git.treebuilder(None).unwrap();
+    for i in 0..70_000 {
+        builder
+            .insert(format!("{i:0>200}"), blob, 0o100644)
+            .unwrap();
+    }
+    let tree = builder.write().unwrap();
+    let oid = store_commit(&f, Some(tree), "wide", true).to_string();
+
+    for result in [
+        f.node
+            .tree_bounded(f.rid, "", &Bounds::for_binding())
+            .map(|_| ()),
+        f.node
+            .tree_at_bounded(f.rid, &oid, "", &Bounds::for_binding())
+            .map(|_| ()),
+    ] {
+        assert!(matches!(result, Err(Error::TooLarge { .. })), "{result:?}");
+    }
+}
+
+/// LR15-M3: a commit with a 64 MiB message, away from the head, read by
+/// its id: every read refuses it from its header, without loading it. In a
+/// child, so the peak memory is this read's alone.
+#[test]
+fn a_huge_commit_is_refused_before_it_is_loaded() {
+    const NAME: &str = "a_huge_commit_is_refused_before_it_is_loaded";
+    if !is_child(NAME) {
+        let out = in_child(NAME);
+        assert!(out.contains("refused: 6 of 6"), "{out}");
+        if cfg!(target_os = "linux") {
+            let grew: u64 = out
+                .lines()
+                .find_map(|l| l.strip_prefix("peak growth: "))
+                .expect("a peak")
+                .parse()
+                .unwrap();
+            assert!(grew < 24 * MIB, "the reads grew the peak by {grew} bytes");
+            let control: u64 = out
+                .lines()
+                .find_map(|l| l.strip_prefix("control growth: "))
+                .expect("a control")
+                .parse()
+                .unwrap();
+            assert!(
+                control >= 24 * MIB,
+                "the measure missed a load: {control} bytes"
+            );
+        }
+        return;
+    }
+    let f = fixture("radhuge");
+    let oid = {
+        let message = "x".repeat(64 * MIB as usize);
+        store_commit(&f, None, &message, false).to_string()
+    };
+    let (node, rid) = (&f.node, f.rid);
+    let mut refused = 0;
+    let grew = peak_growth(|| {
+        let b = Bounds::for_binding();
+        for result in [
+            node.commit_bounded(rid, &oid, &b).map(|_| ()),
+            node.commits_bounded(rid, &oid, 0, 1, &b).map(|_| ()),
+            node.commits_bounded(rid, &oid, u32::MAX as usize, 1, &b)
+                .map(|_| ()),
+            node.tree_at_bounded(rid, &oid, "", &b).map(|_| ()),
+            node.repo_stats_bounded(rid, &oid, &b).map(|_| ()),
+            node.read_blob_at_capped(rid, &oid, "a.txt", libradicle::BINDING_READ_BUDGET)
+                .map(|_| ()),
+        ] {
+            if matches!(result, Err(Error::TooLarge { .. })) {
+                refused += 1;
+            } else {
+                println!("not refused: {result:?}");
+            }
+        }
+    });
+    println!("refused: {refused} of 6");
+    if let Some(grew) = grew {
+        println!("peak growth: {grew}");
+    }
+    // The control: loading the commit, as the reads did before, shows on
+    // the same measure.
+    let stored = storage(&f).repository(rid).unwrap();
+    let loaded = peak_growth(|| {
+        let commit = stored
+            .backend
+            .find_commit(git2::Oid::from_str(&oid).unwrap())
+            .unwrap();
+        assert!(commit.message_bytes().len() as u64 >= 64 * MIB);
+    });
+    if let Some(loaded) = loaded {
+        println!("control growth: {loaded}");
+    }
+}
+
+/// LR15-M3: skipped commits count against the loads budget too: a page
+/// past the end walks every commit, and fits only in what they take.
+#[test]
+fn skipped_commits_count_against_the_loads_budget() {
+    let f = fixture("radskip");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let odb = stored.backend.odb().unwrap();
+    let loads: u64 = f
+        .commits
+        .iter()
+        .map(|c| odb.read_header(git2::Oid::from_str(c).unwrap()).unwrap().0 as u64)
+        .sum();
+    let head = f.commits[2].as_str();
+    let at = |loads: u64| budget(1 << 20).with_loads(loads);
+    let past_the_end = u32::MAX as usize;
+    assert!(f
+        .node
+        .commits_bounded(f.rid, head, past_the_end, 1, &at(loads))
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        f.node
+            .commits_bounded(f.rid, head, past_the_end, 1, &at(loads - 1)),
+        Err(Error::TooLarge { .. })
+    ));
+}
+
+/// LR15-M3: an issue of 32 MiB is refused from its cached size, before it
+/// is deserialized, listed or read alone. In a child, for its peak memory.
+#[test]
+fn a_huge_issue_is_refused_before_it_is_loaded() {
+    const NAME: &str = "a_huge_issue_is_refused_before_it_is_loaded";
+    if !is_child(NAME) {
+        let out = in_child(NAME);
+        assert!(out.contains("refused: 2 of 2"), "{out}");
+        if cfg!(target_os = "linux") {
+            let grew: u64 = out
+                .lines()
+                .find_map(|l| l.strip_prefix("peak growth: "))
+                .expect("a peak")
+                .parse()
+                .unwrap();
+            assert!(grew < 24 * MIB, "the reads grew the peak by {grew} bytes");
+            let control: u64 = out
+                .lines()
+                .find_map(|l| l.strip_prefix("control growth: "))
+                .expect("a control")
+                .parse()
+                .unwrap();
+            assert!(
+                control >= 24 * MIB,
+                "the measure missed a load: {control} bytes"
+            );
+        }
+        return;
+    }
+    let mut f = fixture("radhugeissue");
+    let id = {
+        let description = "y".repeat(32 * MIB as usize);
+        f.node
+            .create_issue(f.rid, "Huge", &description, vec![])
+            .expect("a huge issue")
+            .to_string()
+    };
+    let (node, rid) = (&f.node, f.rid);
+    let mut refused = 0;
+    let grew = peak_growth(|| {
+        let b = Bounds::for_binding();
+        for result in [
+            node.issues_bounded(rid, &b).map(|_| ()),
+            node.issue_bounded(rid, &id, &b).map(|_| ()),
+        ] {
+            if matches!(result, Err(Error::TooLarge { .. })) {
+                refused += 1;
+            } else {
+                println!("not refused: {result:?}");
+            }
+        }
+    });
+    println!("refused: {refused} of 2");
+    if let Some(grew) = grew {
+        println!("peak growth: {grew}");
+    }
+    // The control: the unbounded read, which loads it, shows on the same
+    // measure.
+    let loaded = peak_growth(|| {
+        node.issue(rid, &id).expect("the unbounded read");
+    });
+    if let Some(loaded) = loaded {
+        println!("control growth: {loaded}");
+    }
+    let _ = &mut f;
+}
+
+/// The bounded history is in radicle-surf's order, libgit2's revwalk
+/// without sorting flags: through merges, and across commits whose times
+/// tie.
+#[test]
+fn history_is_walked_in_radicle_surfs_order() {
+    let mut f = fixture("radorder");
+    let work = f.dir.join("order");
+    let repo = git2::Repository::init(&work).unwrap();
+    let blob = repo.blob(b"x").unwrap();
+    let tree = {
+        let mut builder = repo.treebuilder(None).unwrap();
+        builder.insert("f", blob, 0o100644).unwrap();
+        builder.write().unwrap()
+    };
+    let tree = repo.find_tree(tree).unwrap();
+    let at = |seconds: i64| {
+        git2::Signature::new("T", "t@example.com", &git2::Time::new(seconds, 0)).unwrap()
+    };
+    let make = |message: &str, seconds: i64, parents: &[git2::Oid]| -> git2::Oid {
+        let parents = parents
+            .iter()
+            .map(|p| repo.find_commit(*p).unwrap())
+            .collect::<Vec<_>>();
+        repo.commit(
+            None,
+            &at(seconds),
+            &at(seconds),
+            message,
+            &tree,
+            &parents.iter().collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    let root = make("root", 100, &[]);
+    let a = make("a", 300, &[root]);
+    let b = make("b", 200, &[root]);
+    let c = make("c", 300, &[b]);
+    let d = make("d", 200, &[a]);
+    let merge = make("merge", 250, &[d, c]);
+    let e = make("e", 250, &[merge]);
+    let tip = make("tip", 400, &[e, a]);
+    repo.reference("refs/heads/main", tip, true, "test")
+        .unwrap();
+    repo.set_head("refs/heads/main").unwrap();
+    let rid = f
+        .node
+        .import_repo(&work, "order", "walk order", "main")
+        .expect("import");
+
+    let stored = storage(&f).repository(rid).unwrap();
+    let surf = radicle_surf::Repository::open(stored.backend.path()).unwrap();
+    let expected = surf
+        .history(radicle_surf::Oid::from(tip))
+        .unwrap()
+        .map(|c| c.unwrap().id.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(expected.len(), 8);
+    let walked = f
+        .node
+        .commits(rid, &tip.to_string(), 0, 100)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.id.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(walked, expected);
+}

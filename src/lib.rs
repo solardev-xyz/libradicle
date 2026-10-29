@@ -36,11 +36,13 @@ pub mod error;
 pub use error::Error;
 pub mod json;
 mod meter;
+mod objects;
 #[cfg(test)]
 mod seams;
 mod seeds;
 
 use meter::Meter;
+use objects::{Objects, Walk};
 
 /// Options for starting an embedded Radicle stack.
 #[derive(Debug, Clone)]
@@ -328,22 +330,38 @@ impl CancelToken {
 }
 
 /// The limits on a read that walks storage, the `_bounded` reads: a
-/// cancellation token, and a budget in bytes of the result's JSON, as the
-/// [`json`] module writes it.
+/// cancellation token, a budget in bytes of the result's JSON, as the
+/// [`json`] module writes it, and a budget in bytes of the repository
+/// objects (commits, trees) it may load.
 ///
 /// A walk checks the token at each step, and stops with
 /// [`Error::Cancelled`] once it is cancelled. It charges each item as it is
 /// built, and stops with [`Error::TooLarge`] when the next one doesn't fit:
-/// a result it returns never writes more JSON than its budget.
+/// a result it returns never writes more JSON than its budget. It reads each
+/// object's size from its header before loading it, and stops with
+/// [`Error::TooLarge`] before loading one that `loads` has no room left for,
+/// counting every object it has loaded so far, skipped ones included.
 #[derive(Debug, Clone)]
 pub struct Bounds {
     pub cancel: CancelToken,
     pub budget: u64,
+    pub loads: u64,
 }
 
 impl Bounds {
+    /// A JSON budget, and no limit on loads.
     pub fn new(cancel: CancelToken, budget: u64) -> Self {
-        Self { cancel, budget }
+        Self {
+            cancel,
+            budget,
+            loads: u64::MAX,
+        }
+    }
+
+    /// These bounds, loading at most `loads` bytes of objects.
+    pub fn with_loads(mut self, loads: u64) -> Self {
+        self.loads = loads;
+        self
     }
 
     /// No limit, and a token nobody holds: what the unbounded reads use.
@@ -351,10 +369,16 @@ impl Bounds {
         Self::new(CancelToken::new(), u64::MAX)
     }
 
-    /// The bounds of one read a binding serves: [`BINDING_READ_BUDGET`],
-    /// and a token nobody cancels.
+    /// The bounds of one read a binding serves: [`BINDING_READ_BUDGET`] of
+    /// JSON, and as much of loaded objects, and a token nobody cancels.
     pub fn for_binding() -> Self {
-        Self::new(CancelToken::new(), BINDING_READ_BUDGET)
+        Self::new(CancelToken::new(), BINDING_READ_BUDGET).with_loads(BINDING_READ_BUDGET)
+    }
+
+    /// The loads budget, as a JSON budget: what a meter of loaded bytes
+    /// counts against.
+    fn loading(&self) -> Self {
+        Self::new(self.cancel.clone(), self.loads)
     }
 }
 
@@ -392,6 +416,43 @@ const ENTRY_COST: u64 = 64;
 /// base58 digits, `{"rid":"rad:z11111111111111111111","name":"",
 /// "description":""}`.
 const REPO_JSON: u64 = 62;
+
+/// The COB cache's tables, and their queries for sizes: the same rows, in
+/// the same order, as heartwood's `list` and `get` read.
+#[derive(Clone, Copy)]
+enum CobTable {
+    Issues,
+    Patches,
+}
+
+impl CobTable {
+    fn sizes(self) -> &'static str {
+        match self {
+            Self::Issues => "SELECT id, octet_length(issue) AS size FROM issues WHERE repo = ?1",
+            Self::Patches => {
+                "SELECT id, octet_length(patch) AS size FROM patches WHERE repo = ?1 ORDER BY id"
+            }
+        }
+    }
+
+    fn size(self) -> &'static str {
+        match self {
+            Self::Issues => {
+                "SELECT octet_length(issue) AS size FROM issues WHERE id = ?1 AND repo = ?2"
+            }
+            Self::Patches => {
+                "SELECT octet_length(patch) AS size FROM patches WHERE id = ?1 AND repo = ?2"
+            }
+        }
+    }
+}
+
+/// The deepest a bounded walk of a tree descends (`list_files_bounded`).
+/// libgit2's own walk recurses, and a chain of nested trees deep enough
+/// overflows the stack; the bounded walk is iterative, and refuses a deeper
+/// tree with [`Error::TooDeep`] before it descends. Git's own default for
+/// `core.maxTreeDepth` is 4096.
+pub const MAX_TREE_DEPTH: usize = 4096;
 
 impl Network {
     fn connected_seed_ids(&mut self) -> Result<HashSet<NodeId>, Error> {
@@ -1004,6 +1065,10 @@ impl Embedded {
     /// been skipped as invalid.
     pub fn list_repos_bounded(&self, bounds: &Bounds) -> Result<Vec<RepoInfo>, Error> {
         let mut meter = Meter::array(bounds)?;
+        self.list_repos_metered(&mut meter)
+    }
+
+    fn list_repos_metered(&self, meter: &mut Meter) -> Result<Vec<RepoInfo>, Error> {
         let policies = self.profile.policies()?;
         let mut repos = Vec::new();
         let entries = std::fs::read_dir(self.profile.storage.path())?;
@@ -1075,9 +1140,18 @@ impl Embedded {
     /// List explicit allow-seeding policies, including repositories whose
     /// first fetch has not succeeded yet.
     pub fn list_seeded_repos(&self) -> Result<Vec<SeededRepoInfo>, Error> {
+        self.list_seeded_repos_bounded(&Bounds::unbounded())
+    }
+
+    /// [`Embedded::list_seeded_repos`], within `bounds`: the stored
+    /// repositories are listed as [`Embedded::list_repos_bounded`] lists
+    /// them, and each policy without one is charged as
+    /// [`json::seeded_repos`] writes it.
+    pub fn list_seeded_repos_bounded(&self, bounds: &Bounds) -> Result<Vec<SeededRepoInfo>, Error> {
+        let mut meter = Meter::array(bounds)?;
         let policies = self.profile.policies()?;
         let mut repos = self
-            .list_repos()?
+            .list_repos_metered(&mut meter)?
             .into_iter()
             .map(|repo| {
                 (
@@ -1091,15 +1165,18 @@ impl Embedded {
             })
             .collect::<BTreeMap<_, _>>();
         for policy in policies.seed_policies()? {
+            meter.check()?;
             let policy = policy?;
-            if !policy.policy.is_allow() {
+            if !policy.policy.is_allow() || repos.contains_key(&policy.rid) {
                 continue;
             }
-            repos.entry(policy.rid).or_insert(SeededRepoInfo {
+            let info = SeededRepoInfo {
                 rid: policy.rid,
                 name: None,
                 description: None,
-            });
+            };
+            meter.item(|w| json::seeded_repo(w, &info))?;
+            repos.insert(policy.rid, info);
         }
         Ok(repos.into_values().collect())
     }
@@ -1255,21 +1332,31 @@ impl Embedded {
 
     /// [`Embedded::issues`], within `bounds`: each issue is charged as
     /// [`json::issues`] writes it.
+    ///
+    /// Each cached issue's size is read first, without loading it (review
+    /// of libradicle #15), and counted against the loads budget: one it
+    /// has no room left for is refused before it is deserialized.
     pub fn issues_bounded(
         &self,
         rid: RepoId,
         bounds: &Bounds,
     ) -> Result<Vec<(cob::ObjectId, cob::issue::Issue)>, Error> {
         let mut meter = Meter::array(bounds)?;
+        let loading = bounds.loading();
+        let mut read = Meter::new(&loading);
         let repo = self.profile.storage.repository(rid)?;
         let issues = self.profile.issues(&repo)?;
         let mut result = Vec::new();
-        for issue in issues.list()? {
+        self.each_cob(CobTable::Issues, rid, |id, size| {
             meter.check()?;
-            let (id, issue) = issue?;
-            meter.item(|w| json::issue(w, &id, &issue))?;
-            result.push((id, issue));
-        }
+            read.charge(size)?;
+            // Gone since it was sized: as if it had not been listed.
+            if let Some(issue) = issues.get(&id)? {
+                meter.item(|w| json::issue(w, &id, &issue))?;
+                result.push((id, issue));
+            }
+            Ok(())
+        })?;
         Ok(result)
     }
 
@@ -1279,14 +1366,33 @@ impl Embedded {
         rid: RepoId,
         issue_id: &str,
     ) -> Result<(cob::ObjectId, cob::issue::Issue), Error> {
-        validate_cob_id(issue_id)?;
+        self.issue_bounded(rid, issue_id, &Bounds::unbounded())
+    }
+
+    /// [`Embedded::issue`], within `bounds`: its cached size is checked
+    /// against the loads budget before it is loaded, and the result charged
+    /// as [`json::issue`] writes it.
+    pub fn issue_bounded(
+        &self,
+        rid: RepoId,
+        issue_id: &str,
+        bounds: &Bounds,
+    ) -> Result<(cob::ObjectId, cob::issue::Issue), Error> {
+        let not_found = || Error::NodeThread(format!("issue {issue_id} not found"));
+        let mut meter = Meter::new(bounds);
         let repo = self.profile.storage.repository(rid)?;
-        let id: cob::ObjectId = repo.backend.revparse_single(issue_id)?.id().into();
-        let issues = self.profile.issues(&repo)?;
-        issues
+        let id = Self::cob_id(&repo, issue_id)?.ok_or_else(not_found)?;
+        let size = self
+            .cob_size(CobTable::Issues, rid, &id)?
+            .ok_or_else(not_found)?;
+        Meter::new(&bounds.loading()).charge(size)?;
+        let issue = self
+            .profile
+            .issues(&repo)?
             .get(&id)?
-            .map(|issue| (id, issue))
-            .ok_or_else(|| Error::NodeThread(format!("issue {issue_id} not found")))
+            .ok_or_else(not_found)?;
+        meter.whole(|w| json::issue(w, &id, &issue))?;
+        Ok((id, issue))
     }
 
     /// Read all patches in repository storage.
@@ -1295,22 +1401,28 @@ impl Embedded {
     }
 
     /// [`Embedded::patches`], within `bounds`: each patch is charged as
-    /// [`json::patches`] writes it.
+    /// [`json::patches`] writes it, and sized first, as
+    /// [`Embedded::issues_bounded`] sizes issues.
     pub fn patches_bounded(
         &self,
         rid: RepoId,
         bounds: &Bounds,
     ) -> Result<Vec<(cob::ObjectId, cob::patch::Patch)>, Error> {
         let mut meter = Meter::array(bounds)?;
+        let loading = bounds.loading();
+        let mut read = Meter::new(&loading);
         let repo = self.profile.storage.repository(rid)?;
         let patches = self.profile.patches(&repo)?;
         let mut result = Vec::new();
-        for patch in patches.list()? {
+        self.each_cob(CobTable::Patches, rid, |id, size| {
             meter.check()?;
-            let (id, patch) = patch?;
-            meter.item(|w| json::patch(w, &id, &patch))?;
-            result.push((id, patch));
-        }
+            read.charge(size)?;
+            if let Some(patch) = patches.get(&id)? {
+                meter.item(|w| json::patch(w, &id, &patch))?;
+                result.push((id, patch));
+            }
+            Ok(())
+        })?;
         Ok(result)
     }
 
@@ -1320,14 +1432,105 @@ impl Embedded {
         rid: RepoId,
         patch_id: &str,
     ) -> Result<(cob::ObjectId, cob::patch::Patch), Error> {
-        validate_cob_id(patch_id)?;
+        self.patch_bounded(rid, patch_id, &Bounds::unbounded())
+    }
+
+    /// [`Embedded::patch`], within `bounds`, as [`Embedded::issue_bounded`].
+    pub fn patch_bounded(
+        &self,
+        rid: RepoId,
+        patch_id: &str,
+        bounds: &Bounds,
+    ) -> Result<(cob::ObjectId, cob::patch::Patch), Error> {
+        let not_found = || Error::NodeThread(format!("patch {patch_id} not found"));
+        let mut meter = Meter::new(bounds);
         let repo = self.profile.storage.repository(rid)?;
-        let id: cob::ObjectId = repo.backend.revparse_single(patch_id)?.id().into();
-        let patches = self.profile.patches(&repo)?;
-        patches
+        let id = Self::cob_id(&repo, patch_id)?.ok_or_else(not_found)?;
+        let size = self
+            .cob_size(CobTable::Patches, rid, &id)?
+            .ok_or_else(not_found)?;
+        Meter::new(&bounds.loading()).charge(size)?;
+        let patch = self
+            .profile
+            .patches(&repo)?
             .get(&id)?
-            .map(|patch| (id, patch))
-            .ok_or_else(|| Error::NodeThread(format!("patch {patch_id} not found")))
+            .ok_or_else(not_found)?;
+        meter.whole(|w| json::patch(w, &id, &patch))?;
+        Ok((id, patch))
+    }
+
+    /// The COB `id` names, a full id or a unique prefix, resolved without
+    /// loading the object; `None` when nothing matches.
+    fn cob_id(
+        repo: &radicle::storage::git::Repository,
+        id: &str,
+    ) -> Result<Option<cob::ObjectId>, Error> {
+        validate_cob_id(id)?;
+        let short = git2::Oid::from_str(id)?;
+        match repo.backend.odb()?.exists_prefix(short, id.len()) {
+            Ok(oid) => Ok(Some(oid.into())),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The COB cache, read-only, as heartwood opens it.
+    fn cob_db(&self) -> Result<sqlite::Connection, Error> {
+        let path = self.profile.cobs().join(cob::cache::COBS_DB_FILE);
+        let mut db =
+            sqlite::Connection::open_with_flags(path, sqlite::OpenFlags::new().with_read_only())?;
+        db.set_busy_timeout(3000)?;
+        Ok(db)
+    }
+
+    /// Calls `each` with every cached COB of `rid` in `table`, in the order
+    /// heartwood's cache lists them, and its size in bytes: SQLite's
+    /// `octet_length` reads a value's length from its record, so no COB is
+    /// loaded, and the rows are read one at a time.
+    fn each_cob(
+        &self,
+        table: CobTable,
+        rid: RepoId,
+        mut each: impl FnMut(cob::ObjectId, u64) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let db = self.cob_db()?;
+        let mut stmt = db.prepare(table.sizes())?;
+        stmt.bind((1, &rid))?;
+        for row in stmt.into_iter() {
+            let row = row?;
+            let id = row.try_read::<&str, _>("id")?;
+            let id = id
+                .parse::<cob::ObjectId>()
+                .map_err(|e| Error::NodeThread(format!("cached COB id {id:?}: {e}")))?;
+            each(id, row.try_read::<i64, _>("size")?.max(0) as u64)?;
+        }
+        Ok(())
+    }
+
+    /// The size in bytes of the cached COB `id` of `rid` in `table`.
+    fn cob_size(
+        &self,
+        table: CobTable,
+        rid: RepoId,
+        id: &cob::ObjectId,
+    ) -> Result<Option<u64>, Error> {
+        let db = self.cob_db()?;
+        let mut stmt = db.prepare(table.size())?;
+        stmt.bind((1, id.to_string().as_str()))?;
+        stmt.bind((2, &rid))?;
+        let size = match stmt.into_iter().next().transpose()? {
+            None => None,
+            Some(row) => Some(row.try_read::<i64, _>("size")?.max(0) as u64),
+        };
+        Ok(size)
+    }
+
+    /// [`Embedded::repo_info`], within `bounds`: the result is charged as
+    /// [`json::repo_info`] writes it.
+    pub fn repo_info_bounded(&self, rid: RepoId, bounds: &Bounds) -> Result<RepoInfo, Error> {
+        let info = self.repo_info(rid)?;
+        Meter::new(bounds).whole(|w| json::repo_info(w, &info))?;
+        Ok(info)
     }
 
     /// Read a repository's identity payload + head from local storage.
@@ -1367,35 +1570,79 @@ impl Embedded {
 
     /// [`Embedded::list_files`], within `bounds`: each path is charged as
     /// [`json::files`] writes it.
+    ///
+    /// The walk is depth-first and pre-order, as libgit2's `git_tree_walk`
+    /// is, but iterative (review of libradicle #15): a bounded walk refuses
+    /// to descend past [`MAX_TREE_DEPTH`] with [`Error::TooDeep`], and
+    /// loads each tree only after its header, which the budget must have
+    /// room for, counting every tree it has loaded so far: trees reached
+    /// more than once are counted each time. A name that isn't UTF-8 reads
+    /// `?`, a directory's too.
     pub fn list_files_bounded(&self, rid: RepoId, bounds: &Bounds) -> Result<Vec<String>, Error> {
         let mut meter = Meter::array(bounds)?;
+        let loading = bounds.loading();
+        let mut read = Meter::new(&loading);
+        let bounded = meter.counts() || read.counts();
         let repo = self.profile.storage.repository(rid)?;
         let (_, head) = repo.head()?;
-        let commit = repo.backend.find_commit(head.into())?;
-        let tree = commit.tree()?;
+        let objects = Objects::new(&repo.backend, bounds.loads)?;
+        let commit = objects.commit(head.into(), &mut read)?;
+        let root = objects.tree(commit.tree_id(), &mut read)?;
+        drop(commit);
+
         let mut files = Vec::new();
-        let mut stopped = None;
-        let walked = tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
-            let charged = meter.check().and_then(|()| {
-                if entry.kind() == Some(git2::ObjectType::Blob) {
-                    let path = format!("{dir}{}", entry.name().unwrap_or("?"));
-                    meter.item(|w| serde_json::to_writer(w, &path))?;
-                    files.push(path);
+        // Each tree being walked, the index of its next entry, and the length
+        // of `prefix` before its own name was added.
+        let mut stack = vec![(root, 0usize, 0usize)];
+        let mut prefix = String::new();
+        loop {
+            meter.check()?;
+            let depth = stack.len();
+            let Some((tree, index, mark)) = stack.last_mut() else {
+                break;
+            };
+            let descend = match tree.get(*index) {
+                None => {
+                    prefix.truncate(*mark);
+                    None
                 }
-                Ok(())
-            });
-            match charged {
-                Ok(()) => git2::TreeWalkResult::Ok,
-                Err(e) => {
-                    stopped = Some(e);
-                    git2::TreeWalkResult::Abort
+                Some(entry) => {
+                    *index += 1;
+                    let name = entry.name().unwrap_or("?");
+                    match entry.kind() {
+                        Some(git2::ObjectType::Blob) => {
+                            let path = format!("{prefix}{name}");
+                            meter.item(|w| serde_json::to_writer(w, &path))?;
+                            files.push(path);
+                            continue;
+                        }
+                        Some(git2::ObjectType::Tree) => {
+                            if bounded && depth > MAX_TREE_DEPTH {
+                                return Err(Error::TooDeep {
+                                    limit: MAX_TREE_DEPTH,
+                                });
+                            }
+                            let mark = prefix.len();
+                            prefix.push_str(name);
+                            prefix.push('/');
+                            Some((entry.id(), mark))
+                        }
+                        // A submodule: listed by nobody, as libgit2's walk
+                        // doesn't descend into it either.
+                        _ => continue,
+                    }
+                }
+            };
+            match descend {
+                Some((id, mark)) => {
+                    let subtree = objects.tree(id, &mut read)?;
+                    stack.push((subtree, 0, mark));
+                }
+                None => {
+                    stack.pop();
                 }
             }
-        });
-        if let Some(e) = stopped {
-            return Err(e);
         }
-        walked?;
         Ok(files)
     }
 
@@ -1411,14 +1658,6 @@ impl Embedded {
     /// Number of nodes known to seed the given repository.
     pub fn seeders(&mut self, rid: RepoId) -> Result<usize, Error> {
         Ok(self.handle.seeds_for(rid, [*self.profile.did()])?.len())
-    }
-
-    fn commit_at<'repo>(
-        repo: &'repo radicle::storage::git::Repository,
-        revision: &str,
-    ) -> Result<git2::Commit<'repo>, Error> {
-        let oid = parse_revision(revision)?;
-        Ok(repo.backend.find_commit(oid)?)
     }
 
     fn surf_repo(&self, rid: RepoId) -> Result<radicle_surf::Repository, Error> {
@@ -1440,6 +1679,14 @@ impl Embedded {
     /// [`Embedded::commits`], within `bounds`: each commit is charged as
     /// [`json::commits`] writes it, and the token is checked at every commit
     /// walked, the skipped pages' included.
+    ///
+    /// The history is walked as radicle-surf's is (libgit2's revwalk order,
+    /// see [`objects::Walk`]), but each commit's size is read from its
+    /// header before it is loaded (review of libradicle #15): one over the
+    /// budget is refused unloaded, and the commits walked, skipped ones
+    /// included, may not add up to more than the budget either. A skipped
+    /// commit is never converted, so one that radicle-surf would refuse
+    /// (say, a message that isn't UTF-8) doesn't fail a later page.
     pub fn commits_bounded(
         &self,
         rid: RepoId,
@@ -1449,21 +1696,26 @@ impl Embedded {
         bounds: &Bounds,
     ) -> Result<Vec<radicle_surf::Commit>, Error> {
         let mut meter = Meter::array(bounds)?;
+        let loading = bounds.loading();
+        let mut read = Meter::new(&loading);
         let oid = parse_revision(parent)?;
-        let repo = self.surf_repo(rid)?;
-        let history = repo.history(radicle_surf::Oid::from(oid))?;
+        let repo = self.profile.storage.repository(rid)?;
+        let objects = Objects::new(&repo.backend, bounds.loads)?;
+        let mut walk = Walk::new(&objects, oid, &mut read)?;
         let skip = page.saturating_mul(per_page);
         let mut commits = Vec::new();
         if per_page == 0 {
             return Ok(commits);
         }
-        for (index, commit) in history.enumerate() {
+        let mut index = 0usize;
+        while let Some(oid) = walk.next(&mut read)? {
             meter.check()?;
-            // As `skip` would: a skipped commit is dropped, an error with it.
-            if index < skip {
+            index += 1;
+            if index <= skip {
                 continue;
             }
-            let commit = commit?;
+            let commit = radicle_surf::Commit::try_from(walk.load(oid)?)
+                .map_err(radicle_surf::Error::from)?;
             meter.item(|w| serde_json::to_writer(w, &commit))?;
             commits.push(commit);
             if commits.len() == per_page {
@@ -1523,10 +1775,19 @@ impl Embedded {
 
         let left = meter.left();
         let over = |size: u64| Error::TooLarge { size, limit: left };
-        let commit = repo.find_commit(oid)?;
-        let new_tree = commit.tree()?;
-        let old_tree = match commit.parents().next() {
-            Some(parent) => Some(parent.tree()?),
+        // The commit, its first parent and both root trees, each sized from
+        // its header before it is loaded (review of libradicle #15): the
+        // commit's message is part of the result.
+        let objects = Objects::new(repo, left.min(meter.bounds().loads))?;
+        let loading = meter.bounds().loading();
+        let mut read_all = Meter::new(&loading);
+        let commit = objects.commit(oid, &mut read_all)?;
+        let new_tree = objects.tree(commit.tree_id(), &mut read_all)?;
+        let old_tree = match commit.parent_ids().next() {
+            Some(parent) => {
+                let parent = objects.commit(parent, &mut read_all)?;
+                Some(objects.tree(parent.tree_id(), &mut read_all)?)
+            }
             None => None,
         };
         let mut diff = repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)?;
@@ -1641,49 +1902,84 @@ impl Embedded {
         revision: &str,
         path: &str,
     ) -> Result<(Vec<TreeEntry>, CommitInfo), Error> {
+        self.tree_at_bounded(rid, revision, path, &Bounds::unbounded())
+    }
+
+    /// [`Embedded::tree_at`], within `bounds`: the entries are charged as
+    /// they are listed, and the whole result as [`json::tree_at`] writes
+    /// it. The commit and every tree on the way to `path` are sized from
+    /// their headers before they are loaded (review of libradicle #15).
+    pub fn tree_at_bounded(
+        &self,
+        rid: RepoId,
+        revision: &str,
+        path: &str,
+        bounds: &Bounds,
+    ) -> Result<(Vec<TreeEntry>, CommitInfo), Error> {
         let repo = self.profile.storage.repository(rid)?;
-        let commit = Self::commit_at(&repo, revision)?;
-        let commit_info = Self::commit_info(&commit);
-        let root = commit.tree()?;
-        let tree = if path.is_empty() {
-            root
-        } else {
-            let entry = root.get_path(std::path::Path::new(path))?;
-            entry
-                .to_object(&repo.backend)?
-                .into_tree()
-                .map_err(|_| Error::NotATree(path.to_string()))?
-        };
-        let prefix = if path.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", path.trim_end_matches('/'))
-        };
-        let entries = tree
-            .iter()
-            .map(|e| {
-                let name = e.name().unwrap_or("?").to_string();
-                let kind = match e.kind() {
-                    Some(git2::ObjectType::Tree) => "tree",
-                    Some(git2::ObjectType::Commit) => "submodule",
-                    _ => "blob",
-                };
-                TreeEntry {
-                    path: format!("{prefix}{name}"),
-                    name,
-                    kind: kind.to_string(),
-                }
-            })
-            .collect();
-        Ok((entries, commit_info))
+        let (entries, commit) = Self::entries_at(&repo, parse_revision(revision)?, path, bounds)?;
+        Meter::new(bounds).whole(|w| json::tree_at(w, &entries, &commit))?;
+        Ok((entries, commit))
     }
 
     /// Entries of the tree at the head of the default branch, under
     /// `path` (empty = repository root).
     pub fn tree(&self, rid: RepoId, path: &str) -> Result<Vec<TreeEntry>, Error> {
+        self.tree_bounded(rid, path, &Bounds::unbounded())
+    }
+
+    /// [`Embedded::tree`], within `bounds`, as [`Embedded::tree_at_bounded`];
+    /// the whole result as [`json::tree`] writes it.
+    pub fn tree_bounded(
+        &self,
+        rid: RepoId,
+        path: &str,
+        bounds: &Bounds,
+    ) -> Result<Vec<TreeEntry>, Error> {
         let repo = self.profile.storage.repository(rid)?;
         let (_, head) = repo.head()?;
-        Ok(self.tree_at(rid, &head.to_string(), path)?.0)
+        let (entries, _) = Self::entries_at(&repo, head.into(), path, bounds)?;
+        Meter::new(bounds).whole(|w| json::tree(w, &entries))?;
+        Ok(entries)
+    }
+
+    fn entries_at(
+        repo: &radicle::storage::git::Repository,
+        oid: git2::Oid,
+        path: &str,
+        bounds: &Bounds,
+    ) -> Result<(Vec<TreeEntry>, CommitInfo), Error> {
+        let mut meter = Meter::array(bounds)?;
+        let loading = bounds.loading();
+        let mut read = Meter::new(&loading);
+        let objects = Objects::new(&repo.backend, bounds.loads)?;
+        let commit = objects.commit(oid, &mut read)?;
+        let commit_info = Self::commit_info(&commit);
+        let root = objects.tree(commit.tree_id(), &mut read)?;
+        let tree = objects.tree_at_path(root, path, &mut read)?;
+        let prefix = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", path.trim_end_matches('/'))
+        };
+        let mut entries = Vec::new();
+        for e in tree.iter() {
+            meter.check()?;
+            let name = e.name().unwrap_or("?").to_string();
+            let kind = match e.kind() {
+                Some(git2::ObjectType::Tree) => "tree",
+                Some(git2::ObjectType::Commit) => "submodule",
+                _ => "blob",
+            };
+            let entry = TreeEntry {
+                path: format!("{prefix}{name}"),
+                name,
+                kind: kind.to_string(),
+            };
+            meter.item(|w| json::tree_entry(w, &entry))?;
+            entries.push(entry);
+        }
+        Ok((entries, commit_info))
     }
 
     /// The object id and size of the file at `path` in a specific commit,
@@ -1695,20 +1991,42 @@ impl Embedded {
         path: &str,
     ) -> Result<BlobHeader, Error> {
         let repo = self.profile.storage.repository(rid)?;
-        let (oid, size) = Self::blob_header_in(&repo, revision, path)?;
+        let (oid, size) = Self::blob_header_in(&repo, revision, path, u64::MAX)?;
         Ok(BlobHeader {
             oid: oid.to_string(),
             size,
         })
     }
 
+    /// The id and size of the blob at `path` in `revision`. The commit and
+    /// every tree on the way are sized from their headers first, each
+    /// within `loads` (review of libradicle #15), and the blob's own size
+    /// is read from its header.
     fn blob_header_in(
         repo: &radicle::storage::git::Repository,
         revision: &str,
         path: &str,
+        loads: u64,
     ) -> Result<(git2::Oid, u64), Error> {
-        let commit = Self::commit_at(repo, revision)?;
-        let entry = commit.tree()?.get_path(std::path::Path::new(path))?;
+        let objects = Objects::new(&repo.backend, loads)?;
+        let unbounded = Bounds::unbounded();
+        let mut read = Meter::new(&unbounded);
+        let commit = objects.commit(parse_revision(revision)?, &mut read)?;
+        let root = objects.tree(commit.tree_id(), &mut read)?;
+        let trimmed = path.trim_end_matches('/');
+        let (dir, file) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+        let missing = || {
+            Error::Git(git2::Error::new(
+                git2::ErrorCode::NotFound,
+                git2::ErrorClass::Tree,
+                format!("the path '{path}' does not exist in the given tree"),
+            ))
+        };
+        let tree = match objects.tree_at_path(root, dir, &mut read) {
+            Err(Error::NotATree(_)) => return Err(missing()),
+            other => other?,
+        };
+        let entry = tree.get_name(file).ok_or_else(missing)?;
         let not_a_blob = || Error::NotABlob(path.to_string());
         if entry.kind() != Some(git2::ObjectType::Blob) {
             return Err(not_a_blob());
@@ -1727,7 +2045,9 @@ impl Embedded {
 
     /// [`Embedded::read_blob_at`], for a file of at most `limit` bytes. Its
     /// size is read from the object's header first, so a larger file is
-    /// refused with [`Error::TooLarge`] before any of it is loaded.
+    /// refused with [`Error::TooLarge`] before any of it is loaded. The
+    /// commit and the trees on the way to it are sized from their headers
+    /// too, each at most the larger of `limit` and [`BINDING_READ_BUDGET`].
     pub fn read_blob_at_capped(
         &self,
         rid: RepoId,
@@ -1736,7 +2056,10 @@ impl Embedded {
         limit: u64,
     ) -> Result<Blob, Error> {
         let repo = self.profile.storage.repository(rid)?;
-        let (oid, size) = Self::blob_header_in(&repo, revision, path)?;
+        // The commit and the trees on the way: at most the larger of the
+        // blob's cap and a binding's loads budget, each.
+        let loads = limit.max(BINDING_READ_BUDGET);
+        let (oid, size) = Self::blob_header_in(&repo, revision, path, loads)?;
         if size > limit {
             return Err(Error::TooLarge { size, limit });
         }
@@ -1769,10 +2092,18 @@ impl Embedded {
 
     /// Signed repository remotes and their published branch heads.
     pub fn remotes(&self, rid: RepoId) -> Result<Vec<RemoteInfo>, Error> {
+        self.remotes_bounded(rid, &Bounds::unbounded())
+    }
+
+    /// [`Embedded::remotes`], within `bounds`: each remote is charged as
+    /// [`json::remotes`] writes it, before the next is read.
+    pub fn remotes_bounded(&self, rid: RepoId, bounds: &Bounds) -> Result<Vec<RemoteInfo>, Error> {
+        let mut meter = Meter::array(bounds)?;
         let repo = self.profile.storage.repository(rid)?;
         let doc = repo.identity_doc()?;
         let mut result = Vec::new();
         for remote in repo.remotes()? {
+            meter.check()?;
             let (id, remote) = remote?;
             let heads = remote
                 .iter()
@@ -1782,12 +2113,14 @@ impl Embedded {
                         .map(|branch| (branch.to_string(), oid.to_string()))
                 })
                 .collect();
-            result.push(RemoteInfo {
+            let info = RemoteInfo {
                 id: id.to_string(),
                 did: radicle::identity::Did::from(id).to_string(),
                 delegate: doc.is_delegate(&id.into()),
                 heads,
-            });
+            };
+            meter.item(|w| json::remote(w, &info))?;
+            result.push(info);
         }
         result.sort_by(|a, b| b.delegate.cmp(&a.delegate).then_with(|| a.id.cmp(&b.id)));
         Ok(result)
@@ -1803,6 +2136,10 @@ impl Embedded {
     /// it counts: each new entry is charged its bytes and [`ENTRY_COST`], and
     /// the result its JSON, as [`json::repo_stats`] writes it. The token is
     /// checked at every commit walked, and at every remote.
+    ///
+    /// Every commit is sized from its header before it is loaded (review of
+    /// libradicle #15): one over the budget is refused unloaded. The walk
+    /// itself, all of history from `revision`, is the count it returns.
     pub fn repo_stats_bounded(
         &self,
         rid: RepoId,
@@ -1811,19 +2148,23 @@ impl Embedded {
     ) -> Result<RepoStats, Error> {
         let mut meter = Meter::new(bounds);
         let repo = self.profile.storage.repository(rid)?;
-        let commit = Self::commit_at(&repo, revision)?;
-        let mut walk = repo.backend.revwalk()?;
-        walk.push(commit.id())?;
+        let head = parse_revision(revision)?;
+        // Each commit within the loads budget; the walk itself not counted:
+        // all of history is what it counts.
+        let objects = Objects::new(&repo.backend, bounds.loads)?;
+        let unlimited = Bounds::new(bounds.cancel.clone(), u64::MAX);
+        let mut read = Meter::new(&unlimited);
+        let mut walk = Walk::new(&objects, head, &mut read)?;
 
         let mut commits = 0;
         let mut contributors = HashSet::new();
-        for oid in walk {
+        while let Some(oid) = walk.next(&mut read)? {
             #[cfg(test)]
             seams::at(seams::Step::Commit, &bounds.cancel);
             meter.check()?;
             #[cfg(test)]
             seams::bump(&seams::COMMITS);
-            let commit = repo.backend.find_commit(oid?)?;
+            let commit = walk.load(oid)?;
             let author = commit.author();
             let name = author.name().unwrap_or_default().to_string();
             let email = author.email().unwrap_or_default().to_string();

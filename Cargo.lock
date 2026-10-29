@@ -2083,6 +2083,7 @@ dependencies = [
  "radicle-surf",
  "serde",
  "serde_json",
+ "sqlite",
  "thiserror 2.0.20",
  "zeroize",
 ]

@@ -256,10 +256,12 @@ pub fn list_repos() -> String {
 /// successful first fetch.
 #[uniffi::export]
 pub fn list_seeded_repos() -> String {
-    with_node(|node| match node.list_seeded_repos() {
-        Ok(repos) => json::to_string(|w| json::seeded_repos(w, &repos)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.list_seeded_repos_bounded(&Bounds::for_binding()) {
+            Ok(repos) => json::to_string(|w| json::seeded_repos(w, &repos)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// All issues in a repository, in radicle-httpd-compatible JSON shape.
@@ -284,10 +286,12 @@ pub fn issue(rid: String, issue_id: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.issue(rid, &issue_id) {
-        Ok((id, issue)) => json::to_string(|w| json::issue(w, &id, &issue)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.issue_bounded(rid, &issue_id, &Bounds::for_binding()) {
+            Ok((id, issue)) => json::to_string(|w| json::issue(w, &id, &issue)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// All patches in a repository, in radicle-httpd-compatible JSON shape.
@@ -312,10 +316,12 @@ pub fn patch(rid: String, patch_id: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.patch(rid, &patch_id) {
-        Ok((id, patch)) => json::to_string(|w| json::patch(w, &id, &patch)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.patch_bounded(rid, &patch_id, &Bounds::for_binding()) {
+            Ok((id, patch)) => json::to_string(|w| json::patch(w, &id, &patch)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// Create an issue directly in the COB store. `labels_json` is a JSON string array.
@@ -418,10 +424,12 @@ pub fn repo_info(rid: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.repo_info(rid) {
-        Ok(info) => json::to_string(|w| json::repo_info(w, &info)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.repo_info_bounded(rid, &Bounds::for_binding()) {
+            Ok(info) => json::to_string(|w| json::repo_info(w, &info)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// Paginated commit history reachable from a validated full commit id.
@@ -482,10 +490,12 @@ pub fn tree(rid: String, path: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.tree(rid, &path) {
-        Ok(entries) => json::to_string(|w| json::tree(w, &entries)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.tree_bounded(rid, &path, &Bounds::for_binding()) {
+            Ok(entries) => json::to_string(|w| json::tree(w, &entries)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// Tree entries at a validated full commit id, including commit metadata.
@@ -495,10 +505,12 @@ pub fn tree_at(rid: String, revision: String, path: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.tree_at(rid, &revision, &path) {
-        Ok((entries, commit)) => json::to_string(|w| json::tree_at(w, &entries, &commit)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.tree_at_bounded(rid, &revision, &path, &Bounds::for_binding()) {
+            Ok((entries, commit)) => json::to_string(|w| json::tree_at(w, &entries, &commit)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// Blob at the head of the default branch, httpd-shaped. Binary blobs omit content.
@@ -538,10 +550,12 @@ pub fn remotes(rid: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.remotes(rid) {
-        Ok(remotes) => json::to_string(|w| json::remotes(w, &remotes)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.remotes_bounded(rid, &Bounds::for_binding()) {
+            Ok(remotes) => json::to_string(|w| json::remotes(w, &remotes)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// Repository history statistics reachable from a validated full commit id.
@@ -724,6 +738,14 @@ mod tests {
         assert!(list_files(rid.clone()).contains("big.txt"));
         assert!(repo_stats(rid.clone(), head.clone()).contains("\"commits\""));
         assert!(error_of(&issues(rid.clone())).is_empty());
+        // So do the reads bounded since (review of libradicle #15).
+        assert!(tree(rid.clone(), String::new()).contains("big.txt"));
+        assert!(tree_at(rid.clone(), head.clone(), String::new()).contains("lastCommit"));
+        assert!(error_of(&remotes(rid.clone())).is_empty());
+        assert!(list_seeded_repos().contains(&rid));
+        assert!(repo_info(rid.clone()).contains("\"defaultBranch\""));
+        let missing = issue(rid.clone(), "0000000000".into());
+        assert!(error_of(&missing).contains("not found"), "{missing}");
 
         assert_eq!(shutdown(), r#"{"ok":true}"#);
         let _ = std::fs::remove_dir_all(&dir);

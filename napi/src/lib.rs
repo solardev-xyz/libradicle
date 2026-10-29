@@ -260,10 +260,12 @@ pub fn list_repos() -> AsyncTask<BlockingJson> {
 #[napi]
 pub fn list_seeded_repos() -> AsyncTask<BlockingJson> {
     blocking(|| {
-        with_node(|node| match node.list_seeded_repos() {
-            Ok(repos) => json::to_string(|w| json::seeded_repos(w, &repos)),
-            Err(e) => err_json(e),
-        })
+        with_node(
+            |node| match node.list_seeded_repos_bounded(&Bounds::for_binding()) {
+                Ok(repos) => json::to_string(|w| json::seeded_repos(w, &repos)),
+                Err(e) => err_json(e),
+            },
+        )
     })
 }
 
@@ -292,10 +294,12 @@ pub fn issue(rid: String, issue_id: String) -> AsyncTask<BlockingJson> {
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(|node| match node.issue(rid, &issue_id) {
-            Ok((id, issue)) => json::to_string(|w| json::issue(w, &id, &issue)),
-            Err(e) => err_json(e),
-        })
+        with_node(
+            |node| match node.issue_bounded(rid, &issue_id, &Bounds::for_binding()) {
+                Ok((id, issue)) => json::to_string(|w| json::issue(w, &id, &issue)),
+                Err(e) => err_json(e),
+            },
+        )
     })
 }
 
@@ -324,10 +328,12 @@ pub fn patch(rid: String, patch_id: String) -> AsyncTask<BlockingJson> {
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(|node| match node.patch(rid, &patch_id) {
-            Ok((id, patch)) => json::to_string(|w| json::patch(w, &id, &patch)),
-            Err(e) => err_json(e),
-        })
+        with_node(
+            |node| match node.patch_bounded(rid, &patch_id, &Bounds::for_binding()) {
+                Ok((id, patch)) => json::to_string(|w| json::patch(w, &id, &patch)),
+                Err(e) => err_json(e),
+            },
+        )
     })
 }
 
@@ -440,10 +446,12 @@ pub fn repo_info(rid: String) -> AsyncTask<BlockingJson> {
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(|node| match node.repo_info(rid) {
-            Ok(info) => json::to_string(|w| json::repo_info(w, &info)),
-            Err(e) => err_json(e),
-        })
+        with_node(
+            |node| match node.repo_info_bounded(rid, &Bounds::for_binding()) {
+                Ok(info) => json::to_string(|w| json::repo_info(w, &info)),
+                Err(e) => err_json(e),
+            },
+        )
     })
 }
 
@@ -513,10 +521,12 @@ pub fn tree(rid: String, path: String) -> AsyncTask<BlockingJson> {
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(|node| match node.tree(rid, &path) {
-            Ok(entries) => json::to_string(|w| json::tree(w, &entries)),
-            Err(e) => err_json(e),
-        })
+        with_node(
+            |node| match node.tree_bounded(rid, &path, &Bounds::for_binding()) {
+                Ok(entries) => json::to_string(|w| json::tree(w, &entries)),
+                Err(e) => err_json(e),
+            },
+        )
     })
 }
 
@@ -528,9 +538,11 @@ pub fn tree_at(rid: String, revision: String, path: String) -> AsyncTask<Blockin
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(|node| match node.tree_at(rid, &revision, &path) {
-            Ok((entries, commit)) => json::to_string(|w| json::tree_at(w, &entries, &commit)),
-            Err(e) => err_json(e),
+        with_node(|node| {
+            match node.tree_at_bounded(rid, &revision, &path, &Bounds::for_binding()) {
+                Ok((entries, commit)) => json::to_string(|w| json::tree_at(w, &entries, &commit)),
+                Err(e) => err_json(e),
+            }
         })
     })
 }
@@ -579,10 +591,12 @@ pub fn remotes(rid: String) -> AsyncTask<BlockingJson> {
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(|node| match node.remotes(rid) {
-            Ok(remotes) => json::to_string(|w| json::remotes(w, &remotes)),
-            Err(e) => err_json(e),
-        })
+        with_node(
+            |node| match node.remotes_bounded(rid, &Bounds::for_binding()) {
+                Ok(remotes) => json::to_string(|w| json::remotes(w, &remotes)),
+                Err(e) => err_json(e),
+            },
+        )
     })
 }
 
