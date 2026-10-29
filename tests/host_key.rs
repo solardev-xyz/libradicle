@@ -26,6 +26,7 @@ fn opts(home: &str) -> Options {
         listen: vec![],
         control_socket: true,
         routing: None,
+        isolated: false,
     }
 }
 
