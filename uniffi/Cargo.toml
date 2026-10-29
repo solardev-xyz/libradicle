@@ -26,3 +26,6 @@ uniffi = "0.32"
 ## Make the embedded node spawn-free (serve fetches in-process, skip git gc).
 ## iOS builds enable this; it is the whole reason the iOS node can publish.
 no-spawn = ["libradicle/no-spawn"]
+
+[dev-dependencies]
+git2 = { version = "0.21", default-features = false }

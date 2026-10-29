@@ -15,7 +15,10 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Result, Task};
 use napi_derive::napi;
 
-use libradicle::{json, CancelToken, Embedded, FetchPolicy, Network, Options, Progress};
+use libradicle::{
+    json, Bounds, CancelToken, Embedded, FetchPolicy, Network, Options, Progress,
+    BINDING_MAX_PER_PAGE, BINDING_READ_BUDGET,
+};
 
 static NODE: Mutex<Option<Embedded>> = Mutex::new(None);
 
@@ -78,6 +81,13 @@ fn network() -> std::result::Result<Network, String> {
             .ok_or_else(|| "node not started".to_string()),
         Err(_) => Err("node lock poisoned".to_string()),
     }
+}
+
+/// The page size a `commits` call gets: what it asked for, up to
+/// [`BINDING_MAX_PER_PAGE`]. Every read here is bounded too (R-18): walks by
+/// [`Bounds::for_binding`], blobs by [`BINDING_READ_BUDGET`].
+fn page_size(per_page: u32) -> usize {
+    (per_page as usize).min(BINDING_MAX_PER_PAGE)
 }
 
 fn parse_rid(rid: &str) -> std::result::Result<radicle::identity::RepoId, String> {
@@ -236,10 +246,12 @@ pub fn identity() -> AsyncTask<BlockingJson> {
 #[napi]
 pub fn list_repos() -> AsyncTask<BlockingJson> {
     blocking(|| {
-        with_node(|node| match node.list_repos() {
-            Ok(repos) => json::to_string(|w| json::repos(w, &repos)),
-            Err(e) => err_json(e),
-        })
+        with_node(
+            |node| match node.list_repos_bounded(&Bounds::for_binding()) {
+                Ok(repos) => json::to_string(|w| json::repos(w, &repos)),
+                Err(e) => err_json(e),
+            },
+        )
     })
 }
 
@@ -263,10 +275,12 @@ pub fn issues(rid: String) -> AsyncTask<BlockingJson> {
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(|node| match node.issues(rid) {
-            Ok(issues) => json::to_string(|w| json::issues(w, &issues)),
-            Err(e) => err_json(e),
-        })
+        with_node(
+            |node| match node.issues_bounded(rid, &Bounds::for_binding()) {
+                Ok(issues) => json::to_string(|w| json::issues(w, &issues)),
+                Err(e) => err_json(e),
+            },
+        )
     })
 }
 
@@ -293,10 +307,12 @@ pub fn patches(rid: String) -> AsyncTask<BlockingJson> {
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(|node| match node.patches(rid) {
-            Ok(patches) => json::to_string(|w| json::patches(w, &patches)),
-            Err(e) => err_json(e),
-        })
+        with_node(
+            |node| match node.patches_bounded(rid, &Bounds::for_binding()) {
+                Ok(patches) => json::to_string(|w| json::patches(w, &patches)),
+                Err(e) => err_json(e),
+            },
+        )
     })
 }
 
@@ -439,12 +455,18 @@ pub fn commits(rid: String, parent: String, page: u32, per_page: u32) -> AsyncTa
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(
-            |node| match node.commits(rid, &parent, page as usize, per_page as usize) {
+        with_node(|node| {
+            match node.commits_bounded(
+                rid,
+                &parent,
+                page as usize,
+                page_size(per_page),
+                &Bounds::for_binding(),
+            ) {
                 Ok(commits) => json::to_string(|w| json::commits(w, &commits)),
                 Err(e) => err_json(e),
-            },
-        )
+            }
+        })
     })
 }
 
@@ -456,10 +478,12 @@ pub fn commit(rid: String, revision: String) -> AsyncTask<BlockingJson> {
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(|node| match node.commit(rid, &revision) {
-            Ok(detail) => json::to_string(|w| json::commit(w, &detail)),
-            Err(e) => err_json(e),
-        })
+        with_node(
+            |node| match node.commit_bounded(rid, &revision, &Bounds::for_binding()) {
+                Ok(detail) => json::to_string(|w| json::commit(w, &detail)),
+                Err(e) => err_json(e),
+            },
+        )
     })
 }
 
@@ -471,10 +495,12 @@ pub fn list_files(rid: String) -> AsyncTask<BlockingJson> {
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(|node| match node.list_files(rid) {
-            Ok(files) => json::to_string(|w| json::files(w, &files)),
-            Err(e) => err_json(e),
-        })
+        with_node(
+            |node| match node.list_files_bounded(rid, &Bounds::for_binding()) {
+                Ok(files) => json::to_string(|w| json::files(w, &files)),
+                Err(e) => err_json(e),
+            },
+        )
     })
 }
 
@@ -519,10 +545,12 @@ pub fn blob(rid: String, path: String) -> AsyncTask<BlockingJson> {
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(|node| match node.read_blob(rid, &path) {
-            Ok(b) => json::to_string(|w| json::blob(w, &path, &b)),
-            Err(e) => err_json(e),
-        })
+        with_node(
+            |node| match node.read_blob_capped(rid, &path, BINDING_READ_BUDGET) {
+                Ok(b) => json::to_string(|w| json::blob(w, &path, &b)),
+                Err(e) => err_json(e),
+            },
+        )
     })
 }
 
@@ -534,9 +562,11 @@ pub fn blob_at(rid: String, revision: String, path: String) -> AsyncTask<Blockin
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(|node| match node.read_blob_at(rid, &revision, &path) {
-            Ok(b) => json::to_string(|w| json::blob(w, &path, &b)),
-            Err(e) => err_json(e),
+        with_node(|node| {
+            match node.read_blob_at_capped(rid, &revision, &path, BINDING_READ_BUDGET) {
+                Ok(b) => json::to_string(|w| json::blob(w, &path, &b)),
+                Err(e) => err_json(e),
+            }
         })
     })
 }
@@ -564,10 +594,12 @@ pub fn repo_stats(rid: String, revision: String) -> AsyncTask<BlockingJson> {
             Ok(r) => r,
             Err(e) => return err_json(e),
         };
-        with_node(|node| match node.repo_stats(rid, &revision) {
-            Ok(stats) => json::to_string(|w| json::repo_stats(w, &stats)),
-            Err(e) => err_json(e),
-        })
+        with_node(
+            |node| match node.repo_stats_bounded(rid, &revision, &Bounds::for_binding()) {
+                Ok(stats) => json::to_string(|w| json::repo_stats(w, &stats)),
+                Err(e) => err_json(e),
+            },
+        )
     })
 }
 
@@ -613,4 +645,18 @@ pub fn shutdown() -> AsyncTask<BlockingJson> {
             None => err_json("node not started"),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{page_size, BINDING_MAX_PER_PAGE};
+
+    /// R-18: `commits` never walks a page larger than the cap, whatever
+    /// page size the host asks for (a `u32`).
+    #[test]
+    fn page_size_is_capped() {
+        assert_eq!(page_size(0), 0);
+        assert_eq!(page_size(30), 30);
+        assert_eq!(page_size(u32::MAX), BINDING_MAX_PER_PAGE);
+    }
 }

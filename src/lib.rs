@@ -350,7 +350,25 @@ impl Bounds {
     pub fn unbounded() -> Self {
         Self::new(CancelToken::new(), u64::MAX)
     }
+
+    /// The bounds of one read a binding serves: [`BINDING_READ_BUDGET`],
+    /// and a token nobody cancels.
+    pub fn for_binding() -> Self {
+        Self::new(CancelToken::new(), BINDING_READ_BUDGET)
+    }
 }
+
+/// The most one read through the bindings (N-API, UniFFI) returns: the JSON
+/// a walk may write, and a blob's size in bytes. The bindings run every read
+/// under the node's global mutex on a host thread, so an unbounded one (a
+/// huge blob, diff, history page or file list) holds both, and its whole
+/// result in memory, for as long as it takes (R-18). Larger reads fail with
+/// [`Error::TooLarge`].
+pub const BINDING_READ_BUDGET: u64 = 16 * 1024 * 1024;
+
+/// The largest page of commits a binding's `commits` returns, whatever page
+/// size it is asked for.
+pub const BINDING_MAX_PER_PAGE: usize = 100;
 
 /// The shortest JSON a diff line can take: an empty addition or deletion,
 /// `{"line":"","lineNo":1,"type":"addition"}`. A context line takes more.
@@ -1738,9 +1756,15 @@ impl Embedded {
 
     /// Blob content at the head of the default branch.
     pub fn read_blob(&self, rid: RepoId, path: &str) -> Result<Blob, Error> {
+        self.read_blob_capped(rid, path, u64::MAX)
+    }
+
+    /// [`Embedded::read_blob`], for a file of at most `limit` bytes, as
+    /// [`Embedded::read_blob_at_capped`].
+    pub fn read_blob_capped(&self, rid: RepoId, path: &str, limit: u64) -> Result<Blob, Error> {
         let repo = self.profile.storage.repository(rid)?;
         let (_, head) = repo.head()?;
-        self.read_blob_at(rid, &head.to_string(), path)
+        self.read_blob_at_capped(rid, &head.to_string(), path, limit)
     }
 
     /// Signed repository remotes and their published branch heads.

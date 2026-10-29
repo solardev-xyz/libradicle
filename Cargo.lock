@@ -2103,6 +2103,7 @@ dependencies = [
 name = "libradicle-uniffi"
 version = "0.8.0"
 dependencies = [
+ "git2",
  "libradicle",
  "radicle",
  "serde_json",
