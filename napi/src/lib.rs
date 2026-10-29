@@ -51,6 +51,30 @@ fn seed_report_json(report: SeedConnectReport) -> String {
     .to_string()
 }
 
+/// The text of a caught panic, for the error payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
+}
+
+/// Run `f`, answering a panic with an `{"error": ...}` payload instead.
+///
+/// A panic must not reach napi: `compute` runs on a libuv worker inside an
+/// `extern "C"` callback, where an unwinding panic aborts the process, and
+/// the process is the host application (the whole browser, for Freedom).
+fn guarded(f: impl FnOnce() -> String) -> String {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(json) => json,
+        Err(payload) => err_json(format!(
+            "libradicle panicked: {}",
+            panic_message(payload.as_ref())
+        )),
+    }
+}
+
 /// One blocking call scheduled on the libuv thread pool (myotis pattern).
 pub struct BlockingJson {
     run: Option<Box<dyn FnOnce() -> String + Send>>,
@@ -62,7 +86,7 @@ impl Task for BlockingJson {
 
     fn compute(&mut self) -> Result<Self::Output> {
         match self.run.take() {
-            Some(f) => Ok(f()),
+            Some(f) => Ok(guarded(f)),
             None => Ok(r#"{"error":"task already ran"}"#.to_string()),
         }
     }
@@ -78,10 +102,12 @@ fn blocking(f: impl FnOnce() -> String + Send + 'static) -> AsyncTask<BlockingJs
     })
 }
 
+/// Run `f` on the started node. A panic in `f` is caught here, while the
+/// guard is still held, so it does not poison `NODE` for every later call.
 fn with_node(f: impl FnOnce(&mut Embedded) -> String) -> String {
     match NODE.lock() {
         Ok(mut guard) => match guard.as_mut() {
-            Some(node) => f(node),
+            Some(node) => guarded(|| f(node)),
             None => err_json("node not started"),
         },
         Err(_) => err_json("node lock poisoned"),
@@ -213,30 +239,41 @@ fn patch_json(
     })
 }
 
+/// Start a node into `NODE` with `start`, answering `{"did": ...}` or an
+/// error payload. A panic in `start` is caught while the guard is held, as
+/// in `with_node`, so a failed start never poisons `NODE` for the next one.
+fn start_node(start: impl FnOnce() -> std::result::Result<Embedded, libradicle::Error>) -> String {
+    let mut guard = match NODE.lock() {
+        Ok(g) => g,
+        Err(_) => return err_json("node lock poisoned"),
+    };
+    if guard.is_some() {
+        return err_json("node already started");
+    }
+    guarded(|| match start() {
+        Ok(node) => {
+            let did = node.did();
+            *guard = Some(node);
+            serde_json::json!({ "did": did }).to_string()
+        }
+        Err(e) => err_json(e),
+    })
+}
+
 /// Start the embedded node with a profile at `home`. Resolves to
 /// `{"did": "..."}` once the node thread is up.
 #[napi]
 pub fn start(home: String, alias: String) -> AsyncTask<BlockingJson> {
-    blocking(move || {
-        let mut guard = match NODE.lock() {
-            Ok(g) => g,
-            Err(_) => return err_json("node lock poisoned"),
-        };
-        if guard.is_some() {
-            return err_json("node already started");
-        }
-        match Embedded::start(Options {
+    blocking(move || start_json(home, alias))
+}
+
+fn start_json(home: String, alias: String) -> String {
+    start_node(|| {
+        Embedded::start(Options {
             home: home.into(),
             alias,
             listen: vec![],
-        }) {
-            Ok(node) => {
-                let did = node.did();
-                *guard = Some(node);
-                serde_json::json!({ "did": did }).to_string()
-            }
-            Err(e) => err_json(e),
-        }
+        })
     })
 }
 
@@ -616,6 +653,18 @@ pub fn commits(rid: String, parent: String, page: u32, per_page: u32) -> AsyncTa
     })
 }
 
+/// `{"commit": ..., "diff": ...}`, or an error payload if either fails to
+/// serialize. `json!` would unwrap that error, and a panic there takes the
+/// host process down.
+fn commit_json(detail: &libradicle::CommitDetail) -> String {
+    let fields = serde_json::to_value(&detail.commit)
+        .and_then(|commit| Ok((commit, serde_json::to_value(&detail.diff)?)));
+    match fields {
+        Ok((commit, diff)) => serde_json::json!({ "commit": commit, "diff": diff }).to_string(),
+        Err(e) => err_json(format!("commit does not serialize: {e}")),
+    }
+}
+
 /// Commit metadata plus its structured first-parent diff.
 #[napi]
 pub fn commit(rid: String, revision: String) -> AsyncTask<BlockingJson> {
@@ -625,11 +674,7 @@ pub fn commit(rid: String, revision: String) -> AsyncTask<BlockingJson> {
             Err(e) => return err_json(e),
         };
         with_node(|node| match node.commit(rid, &revision) {
-            Ok(detail) => serde_json::json!({
-                "commit": detail.commit,
-                "diff": detail.diff,
-            })
-            .to_string(),
+            Ok(detail) => commit_json(&detail),
             Err(e) => err_json(e),
         })
     })
@@ -850,4 +895,65 @@ pub fn shutdown() -> AsyncTask<BlockingJson> {
             None => err_json("node not started"),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{guarded, start_json, start_node, with_node, NODE};
+
+    #[test]
+    fn a_panic_becomes_an_error_payload() {
+        let json: serde_json::Value =
+            serde_json::from_str(&guarded(|| panic!("boom"))).expect("JSON");
+        assert_eq!(json["error"], "libradicle panicked: boom");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&guarded(|| panic!("{}", String::from("owned")))).unwrap();
+        assert_eq!(json["error"], "libradicle panicked: owned");
+
+        assert_eq!(guarded(|| "{}".to_string()), "{}");
+    }
+
+    fn error_of(json: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(json).expect("JSON");
+        value["error"].as_str().unwrap_or_default().to_string()
+    }
+
+    fn temp_home(name: &str) -> String {
+        let mut home = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        if home.join("node/control.sock").as_os_str().len() > 100 {
+            home = std::path::Path::new("/tmp").join(format!("{name}-{}", std::process::id()));
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        home.to_str().expect("utf-8 temp dir").to_owned()
+    }
+
+    /// One test drives `NODE` end to end, so no two tests race the global.
+    #[test]
+    fn a_failed_start_leaves_the_node_slot_usable() {
+        // A panic inside the startup lock is answered and does not poison it.
+        let failed = start_node(|| panic!("startup panic"));
+        assert_eq!(error_of(&failed), "libradicle panicked: startup panic");
+        assert!(NODE.lock().is_ok(), "NODE is not poisoned");
+
+        // An alias Radicle refuses is an error, not a panic.
+        let home = temp_home("lr-napi-start");
+        let invalid = start_json(home.clone(), "invalid alias".into());
+        assert!(error_of(&invalid).contains("alias"), "{invalid}");
+        assert!(NODE.lock().is_ok(), "NODE is not poisoned");
+
+        // The next, valid start works, and so do calls on the node.
+        let started: serde_json::Value =
+            serde_json::from_str(&start_json(home.clone(), "ValidAlias".into())).unwrap();
+        assert!(
+            started["did"].as_str().unwrap().starts_with("did:key:"),
+            "{started}"
+        );
+        let alias = with_node(|node| node.identity().alias);
+        assert_eq!(alias, "ValidAlias");
+
+        let node = NODE.lock().unwrap().take().expect("started");
+        node.shutdown().expect("clean shutdown");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

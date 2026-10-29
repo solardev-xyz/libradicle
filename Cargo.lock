@@ -2111,6 +2111,7 @@ dependencies = [
  "radicle-node",
  "radicle-signals",
  "radicle-surf",
+ "serde_json",
  "thiserror 2.0.20",
  "zeroize",
 ]
