@@ -889,6 +889,7 @@ impl Embedded {
             sig_rx,
             signer,
             gate,
+            repositories(),
         )?;
         if !seed_book.is_empty() {
             seeds::install(&profile)?;
@@ -1948,6 +1949,14 @@ fn stored_repository(entry: &std::fs::DirEntry) -> Result<Option<RepoId>, Error>
     }
 }
 
+/// The node's repository gate: one that admits every repository, for every
+/// purpose, as the node did before heartwood had one. libradicle gives the
+/// node a gate of its own once the service work needs one (freedom-core
+/// design 0008).
+fn repositories() -> radicle::node::gate::RepoGate {
+    radicle::node::gate::RepoGate::new()
+}
+
 /// Remove a Unix control socket left behind by an unclean process exit.
 ///
 /// A successful connection means another node really is listening, so the
@@ -2013,7 +2022,7 @@ mod tests {
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{parse_revision, prepare_control_socket, validate_cob_id};
+    use super::{parse_revision, prepare_control_socket, repositories, validate_cob_id};
     use super::{CancelToken, FetchPolicy, Progress, FILE_JSON, HUNK_JSON, LINE_JSON};
     use std::time::{Duration, Instant};
 
@@ -2231,6 +2240,37 @@ mod tests {
             "0123456789abcdef0123456789abcdef0123456g",
         ] {
             assert!(parse_revision(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn the_node_s_repository_gate_admits_everything() {
+        use radicle::node::gate::Purpose;
+
+        let gate = repositories();
+        let rids = [[1u8; 20], [2u8; 20]].map(|bytes| {
+            super::RepoId::from(radicle::git::Oid::from(
+                radicle::git::raw::Oid::from_bytes(&bytes).unwrap(),
+            ))
+        });
+        for rid in rids {
+            assert!(gate.state(&rid).is_open());
+            for purpose in [
+                Purpose::Mutate,
+                Purpose::Serve,
+                Purpose::Announce,
+                Purpose::Inventory,
+            ] {
+                assert!(gate.admit(rid, purpose).is_some(), "{rid} for {purpose:?}");
+            }
+        }
+        for purpose in [
+            Purpose::Mutate,
+            Purpose::Serve,
+            Purpose::Announce,
+            Purpose::Inventory,
+        ] {
+            assert_eq!(gate.admit_all(rids, purpose).rids(), rids);
         }
     }
 }
