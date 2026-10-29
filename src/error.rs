@@ -56,6 +56,11 @@ pub enum Error {
     /// [`crate::MAX_TREE_DEPTH`].
     #[error("the tree is nested deeper than {limit} levels")]
     TooDeep { limit: usize },
+    /// A bounded read of a repository with no canonical identity head
+    /// (`refs/rad/id`): heartwood would search every remote's identity
+    /// history for it, which can't be sized before it is read.
+    #[error("{0} has no canonical identity head to size its identity document from")]
+    NoIdentityHead(RepoId),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("invalid commit revision {0:?}")]

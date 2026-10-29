@@ -58,6 +58,13 @@ impl<'r> Objects<'r> {
         Ok(size)
     }
 
+    /// The size of the blob `oid`, from its header, checked and charged:
+    /// for a blob something else loads (heartwood's readers). Nothing of
+    /// it is loaded here.
+    pub(crate) fn blob(&self, oid: git2::Oid, read: &mut Meter) -> Result<u64, Error> {
+        self.admit(oid, git2::ObjectType::Blob, read)
+    }
+
     /// The commit `oid`, its size checked and charged before it is loaded.
     pub(crate) fn commit(
         &self,
@@ -72,6 +79,11 @@ impl<'r> Objects<'r> {
     pub(crate) fn tree(&self, oid: git2::Oid, read: &mut Meter) -> Result<git2::Tree<'r>, Error> {
         self.admit(oid, git2::ObjectType::Tree, read)?;
         Ok(self.repo.find_tree(oid)?)
+    }
+
+    /// The repository these objects are in.
+    pub(crate) fn repo(&self) -> &'r git2::Repository {
+        self.repo
     }
 
     /// The tree at `path` under `root`, each tree on the way loaded as

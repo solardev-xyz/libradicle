@@ -28,7 +28,7 @@ use radicle::node::{ConnectOptions, ConnectResult, FetchResult, Handle as _};
 use radicle::patch::{cache::Patches as _, ByRevision};
 use radicle::prelude::*;
 use radicle::profile::{Home, Profile, Signer};
-use radicle::storage::{ReadRepository, ReadStorage, WriteStorage};
+use radicle::storage::{ReadRepository, ReadStorage, RemoteRepository as _, WriteStorage};
 use radicle_node::runtime::handle::Handle as NodeHandle;
 use radicle_node::runtime::Runtime;
 
@@ -1069,6 +1069,8 @@ impl Embedded {
     }
 
     fn list_repos_metered(&self, meter: &mut Meter) -> Result<Vec<RepoInfo>, Error> {
+        let loading = meter.bounds().loading();
+        let mut read = Meter::new(&loading);
         let policies = self.profile.policies()?;
         let mut repos = Vec::new();
         let entries = std::fs::read_dir(self.profile.storage.path())?;
@@ -1083,7 +1085,7 @@ impl Embedded {
                 continue;
             }
             meter.admits(REPO_JSON)?;
-            if !self.is_listed(rid)? {
+            if !self.is_listed(rid, &mut read)? {
                 continue;
             }
             let info = self.repo_info(rid)?;
@@ -1098,7 +1100,12 @@ impl Embedded {
     /// document and a head is skipped; one whose local signed refs don't
     /// read is an error, the error it returns. Signed refs that are absent,
     /// or that need migrating, are accepted, as it accepts them.
-    fn is_listed(&self, rid: RepoId) -> Result<bool, Error> {
+    ///
+    /// Within a loads budget, `read` sizes first what those checks load
+    /// (review of libradicle #15): the identity document, and the local
+    /// signed refs. One with no room is `TooLarge`; one whose identity can't
+    /// be sized up front (no `refs/rad/id`) is skipped as invalid.
+    fn is_listed(&self, rid: RepoId, read: &mut Meter) -> Result<bool, Error> {
         use radicle::storage::refs::{sigrefs::read::error::Read, FeatureLevel, SignedRefs};
 
         #[cfg(test)]
@@ -1110,6 +1117,24 @@ impl Embedded {
                 return Ok(false);
             }
         };
+        let local = self.profile.storage.info().key;
+        if read.counts() {
+            let objects = Objects::new(&repo.backend, read.bounds().budget)?;
+            match Self::identity_fits(&repo, &objects, read) {
+                Ok(()) => {}
+                Err(e @ (Error::TooLarge { .. } | Error::Cancelled)) => return Err(e),
+                Err(e) => {
+                    log::warn!(target: "libradicle", "Repository {rid} is invalid: sizing its doc: {e}");
+                    return Ok(false);
+                }
+            }
+            match Self::sigrefs_fit(&repo, &local, &objects, read) {
+                Ok(()) => {}
+                Err(e @ (Error::TooLarge { .. } | Error::Cancelled)) => return Err(e),
+                // Unreadable: heartwood's load below reports it.
+                Err(_) => {}
+            }
+        }
         if let Err(e) = repo.identity_doc() {
             log::warn!(target: "libradicle", "Repository {rid} is invalid: looking up doc: {e}");
             return Ok(false);
@@ -1120,7 +1145,6 @@ impl Embedded {
         }
         // heartwood's `SignedRefsInfo::new`, private to it, and the sync time
         // it then reads for signed refs that need no migration.
-        let local = self.profile.storage.info().key;
         match SignedRefs::load(local, &repo) {
             Ok(Some(refs))
                 if refs.feature_level() >= FeatureLevel::LATEST && refs.parent().is_some() =>
@@ -1528,6 +1552,13 @@ impl Embedded {
     /// [`Embedded::repo_info`], within `bounds`: the result is charged as
     /// [`json::repo_info`] writes it.
     pub fn repo_info_bounded(&self, rid: RepoId, bounds: &Bounds) -> Result<RepoInfo, Error> {
+        let loading = bounds.loading();
+        let mut read = Meter::new(&loading);
+        if read.counts() {
+            let repo = self.profile.storage.repository(rid)?;
+            let objects = Objects::new(&repo.backend, bounds.loads)?;
+            Self::identity_fits(&repo, &objects, &mut read)?;
+        }
         let info = self.repo_info(rid)?;
         Meter::new(bounds).whole(|w| json::repo_info(w, &info))?;
         Ok(info)
@@ -1660,6 +1691,143 @@ impl Embedded {
         Ok(self.handle.seeds_for(rid, [*self.profile.did()])?.len())
     }
 
+    /// What heartwood's `identity_doc()` will load, sized first (review of
+    /// libradicle #15): the document blob, `embeds/radicle.json` in the
+    /// tree of the commit `refs/rad/id` names, and the commit and trees on
+    /// the way, each checked and charged through `objects`. Without
+    /// `refs/rad/id`, heartwood would search every remote's identity
+    /// history instead, which can't be sized before it is read: refused
+    /// with [`Error::NoIdentityHead`].
+    fn identity_fits(
+        repo: &radicle::storage::git::Repository,
+        objects: &Objects,
+        read: &mut Meter,
+    ) -> Result<(), Error> {
+        let head = match repo.backend.refname_to_id("refs/rad/id") {
+            Ok(head) => head,
+            Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                return Err(Error::NoIdentityHead(repo.id))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let commit = objects.commit(head, read)?;
+        Self::embedded_doc_fits(objects, &commit, read)
+    }
+
+    /// The identity document embedded in `commit`'s tree, at
+    /// `embeds/radicle.json`, sized and charged: what heartwood's
+    /// `Doc::blob_at` loads. Missing, it is heartwood's to report.
+    fn embedded_doc_fits(
+        objects: &Objects,
+        commit: &git2::Commit<'_>,
+        read: &mut Meter,
+    ) -> Result<(), Error> {
+        let root = objects.tree(commit.tree_id(), read)?;
+        let Some(embeds) = root.get_name("embeds") else {
+            return Ok(());
+        };
+        if embeds.kind() != Some(git2::ObjectType::Tree) {
+            return Ok(());
+        }
+        let embeds = objects.tree(embeds.id(), read)?;
+        if let Some(doc) = embeds.get_name("radicle.json") {
+            if doc.kind() == Some(git2::ObjectType::Blob) {
+                objects.blob(doc.id(), read)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// What heartwood's `SignedRefs::load` will load for `remote`, sized
+    /// first (review of libradicle #15):
+    /// - the blobs of its `rad/sigrefs` commit, `refs` and `signature`,
+    ///   charged;
+    /// - the identity root document those refs name (`refs/rad/root`),
+    ///   which heartwood loads to check it, charged;
+    /// - the earlier sigrefs commits, which heartwood walks when the head
+    ///   is of an older feature level, and their blobs: each within the
+    ///   per-object limit, uncharged, since a current head is read alone.
+    ///
+    /// Absent signed refs are heartwood's to report.
+    fn sigrefs_fit(
+        repo: &radicle::storage::git::Repository,
+        remote: &radicle::prelude::PublicKey,
+        objects: &Objects,
+        read: &mut Meter,
+    ) -> Result<(), Error> {
+        let name = format!("refs/namespaces/{remote}/refs/rad/sigrefs");
+        let head = match repo.backend.refname_to_id(&name) {
+            Ok(head) => head,
+            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let commit = objects.commit(head, read)?;
+        let tree = objects.tree(commit.tree_id(), read)?;
+        let mut refs = None;
+        for entry in tree.iter() {
+            if entry.kind() == Some(git2::ObjectType::Blob) {
+                objects.blob(entry.id(), read)?;
+                if entry.name().ok() == Some("refs") {
+                    refs = Some(entry.id());
+                }
+            }
+        }
+        if let Some(refs) = refs {
+            // Sized and charged above. Its lines are `<oid> <refname>`.
+            let blob = objects.repo().find_blob(refs)?;
+            let root = blob.content().split(|b| *b == b'\n').find_map(|line| {
+                let line = std::str::from_utf8(line).ok()?;
+                let (oid, name) = line.split_once(' ')?;
+                (name == "refs/rad/root")
+                    .then(|| git2::Oid::from_str(oid).ok())
+                    .flatten()
+            });
+            drop(blob);
+            if let Some(root) = root {
+                match objects.commit(root, read) {
+                    Ok(root) => Self::embedded_doc_fits(objects, &root, read)?,
+                    Err(e @ (Error::TooLarge { .. } | Error::Cancelled)) => return Err(e),
+                    // Not there, or not a commit: heartwood's to report.
+                    Err(_) => {}
+                }
+            }
+        }
+        let per_object = Bounds::new(read.bounds().cancel.clone(), u64::MAX);
+        let mut free = Meter::new(&per_object);
+        let mut next = commit.parent_id(0).ok();
+        while let Some(oid) = next {
+            let commit = objects.commit(oid, &mut free)?;
+            let tree = objects.tree(commit.tree_id(), &mut free)?;
+            for entry in tree.iter() {
+                if entry.kind() == Some(git2::ObjectType::Blob) {
+                    objects.blob(entry.id(), &mut free)?;
+                }
+            }
+            next = commit.parent_id(0).ok();
+        }
+        Ok(())
+    }
+
+    /// Every signed remote of `repo`, loaded by heartwood one at a time, each
+    /// sized first with [`Embedded::sigrefs_fit`] when `bounds` limits loads.
+    fn remotes_loaded(
+        repo: &radicle::storage::git::Repository,
+        objects: &Objects,
+        read: &mut Meter,
+        mut each: impl FnMut(radicle::prelude::PublicKey, radicle::storage::Remote) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let bounded = read.counts();
+        for id in repo.remote_ids()? {
+            read.check()?;
+            let id = id?;
+            if bounded {
+                Self::sigrefs_fit(repo, &id, objects, read)?;
+            }
+            each(id, repo.remote(&id)?)?;
+        }
+        Ok(())
+    }
+
     fn surf_repo(&self, rid: RepoId) -> Result<radicle_surf::Repository, Error> {
         let repo = self.profile.storage.repository(rid)?;
         Ok(radicle_surf::Repository::open(repo.backend.path())?)
@@ -1778,10 +1946,13 @@ impl Embedded {
         // The commit, its first parent and both root trees, each sized from
         // its header before it is loaded (review of libradicle #15): the
         // commit's message is part of the result.
-        let objects = Objects::new(repo, left.min(meter.bounds().loads))?;
+        // The commit is part of the result: within what is left of the
+        // budget too. Its parent and the trees only within the loads budget.
+        let commits = Objects::new(repo, left.min(meter.bounds().loads))?;
+        let objects = Objects::new(repo, meter.bounds().loads)?;
         let loading = meter.bounds().loading();
         let mut read_all = Meter::new(&loading);
-        let commit = objects.commit(oid, &mut read_all)?;
+        let commit = commits.commit(oid, &mut read_all)?;
         let new_tree = objects.tree(commit.tree_id(), &mut read_all)?;
         let old_tree = match commit.parent_ids().next() {
             Some(parent) => {
@@ -1790,6 +1961,9 @@ impl Embedded {
             }
             None => None,
         };
+        // Every tree the diff can descend into, sized before libgit2 loads
+        // it (review of libradicle #15, round 2).
+        Self::diff_trees_fit(&objects, old_tree.as_ref(), &new_tree, &mut read_all)?;
         let mut diff = repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)?;
 
         // Before renames and copies are found, the records can't be fewer than
@@ -1870,6 +2044,65 @@ impl Embedded {
         }
         walked?;
         Ok(())
+    }
+
+    /// Whether every tree a diff of `old` against `new` can make libgit2
+    /// load fits `read`, found without loading any over it: the subtrees on
+    /// one side only, and the pairs of subtrees under the same name that
+    /// differ, all the way down. A pair that is the same tree on both sides
+    /// is skipped, as libgit2's diff skips it. Each tree is sized from its
+    /// header and charged before it is loaded (its entries and names are in
+    /// those bytes), and a bounded walk refuses to descend past
+    /// [`MAX_TREE_DEPTH`].
+    fn diff_trees_fit(
+        objects: &Objects,
+        old: Option<&git2::Tree<'_>>,
+        new: &git2::Tree<'_>,
+        read: &mut Meter,
+    ) -> Result<(), Error> {
+        let mut pending = Vec::new();
+        Self::differing_subtrees(old, Some(new), 1, &mut pending);
+        while let Some((old, new, depth)) = pending.pop() {
+            read.check()?;
+            if depth > MAX_TREE_DEPTH {
+                return Err(Error::TooDeep {
+                    limit: MAX_TREE_DEPTH,
+                });
+            }
+            let old = old.map(|id| objects.tree(id, read)).transpose()?;
+            let new = new.map(|id| objects.tree(id, read)).transpose()?;
+            Self::differing_subtrees(old.as_ref(), new.as_ref(), depth + 1, &mut pending);
+        }
+        Ok(())
+    }
+
+    /// The subtrees of `old` and `new`, paired by name, that a diff of the
+    /// two descends into, queued at `depth`.
+    fn differing_subtrees(
+        old: Option<&git2::Tree<'_>>,
+        new: Option<&git2::Tree<'_>>,
+        depth: usize,
+        pending: &mut Vec<(Option<git2::Oid>, Option<git2::Oid>, usize)>,
+    ) {
+        let subtrees = |tree: Option<&git2::Tree<'_>>| -> BTreeMap<Vec<u8>, git2::Oid> {
+            tree.map(|tree| {
+                tree.iter()
+                    .filter(|e| e.kind() == Some(git2::ObjectType::Tree))
+                    .map(|e| (e.name_bytes().to_vec(), e.id()))
+                    .collect()
+            })
+            .unwrap_or_default()
+        };
+        let mut olds = subtrees(old);
+        for (name, new) in subtrees(new) {
+            match olds.remove(&name) {
+                Some(old) if old == new => {}
+                old => pending.push((old, Some(new), depth)),
+            }
+        }
+        for old in olds.into_values() {
+            pending.push((Some(old), None, depth));
+        }
     }
 
     fn commit_info(commit: &git2::Commit<'_>) -> CommitInfo {
@@ -2099,12 +2332,17 @@ impl Embedded {
     /// [`json::remotes`] writes it, before the next is read.
     pub fn remotes_bounded(&self, rid: RepoId, bounds: &Bounds) -> Result<Vec<RemoteInfo>, Error> {
         let mut meter = Meter::array(bounds)?;
+        let loading = bounds.loading();
+        let mut read = Meter::new(&loading);
         let repo = self.profile.storage.repository(rid)?;
+        let objects = Objects::new(&repo.backend, bounds.loads)?;
+        if read.counts() {
+            Self::identity_fits(&repo, &objects, &mut read)?;
+        }
         let doc = repo.identity_doc()?;
         let mut result = Vec::new();
-        for remote in repo.remotes()? {
+        Self::remotes_loaded(&repo, &objects, &mut read, |id, remote| {
             meter.check()?;
-            let (id, remote) = remote?;
             let heads = remote
                 .iter()
                 .filter_map(|(name, oid)| {
@@ -2121,7 +2359,8 @@ impl Embedded {
             };
             meter.item(|w| json::remote(w, &info))?;
             result.push(info);
-        }
+            Ok(())
+        })?;
         result.sort_by(|a, b| b.delegate.cmp(&a.delegate).then_with(|| a.id.cmp(&b.id)));
         Ok(result)
     }
@@ -2149,11 +2388,11 @@ impl Embedded {
         let mut meter = Meter::new(bounds);
         let repo = self.profile.storage.repository(rid)?;
         let head = parse_revision(revision)?;
-        // Each commit within the loads budget; the walk itself not counted:
-        // all of history is what it counts.
+        // All of history, within the loads budget: what doesn't fit is
+        // TooLarge, as for any other read.
         let objects = Objects::new(&repo.backend, bounds.loads)?;
-        let unlimited = Bounds::new(bounds.cancel.clone(), u64::MAX);
-        let mut read = Meter::new(&unlimited);
+        let loading = bounds.loading();
+        let mut read = Meter::new(&loading);
         let mut walk = Walk::new(&objects, head, &mut read)?;
 
         let mut commits = 0;
@@ -2176,15 +2415,17 @@ impl Embedded {
         }
 
         // The branches every signed remote publishes, as `remotes` reads them.
+        if read.counts() {
+            Self::identity_fits(&repo, &objects, &mut read)?;
+        }
         repo.identity_doc()?;
         let mut branches = HashSet::new();
-        for remote in repo.remotes()? {
+        Self::remotes_loaded(&repo, &objects, &mut read, |_, remote| {
             #[cfg(test)]
             seams::at(seams::Step::Remote, &bounds.cancel);
             meter.check()?;
             #[cfg(test)]
             seams::bump(&seams::REMOTES);
-            let (_, remote) = remote?;
             for (name, _) in remote.iter() {
                 if let Some(branch) = name.as_str().strip_prefix("refs/heads/") {
                     if !branches.contains(branch) {
@@ -2193,7 +2434,8 @@ impl Embedded {
                     }
                 }
             }
-        }
+            Ok(())
+        })?;
         let stats = RepoStats {
             commits,
             branches: branches.len(),

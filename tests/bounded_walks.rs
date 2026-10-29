@@ -980,3 +980,267 @@ fn history_is_walked_in_radicle_surfs_order() {
         .collect::<Vec<_>>();
     assert_eq!(walked, expected);
 }
+
+// Review of libradicle #15, round 2: what the bounded reads still loaded
+// before a budget applied. Each in a child, for its peak memory.
+
+/// The child's peak growth and its control's, from its stdout.
+fn growths(out: &str) -> (u64, u64) {
+    let read = |prefix: &str| -> u64 {
+        out.lines()
+            .find_map(|l| l.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("no {prefix:?} in {out}"))
+            .parse()
+            .unwrap()
+    };
+    (read("peak growth: "), read("control growth: "))
+}
+
+fn print_growth(grew: Option<u64>, control: Option<u64>) {
+    if let (Some(grew), Some(control)) = (grew, control) {
+        println!("peak growth: {grew}");
+        println!("control growth: {control}");
+    }
+}
+
+/// A commit adding one subtree of 100,000 names of 200 bytes (22.8 MB of
+/// tree): the diff preflight refuses it from that subtree's header, before
+/// libgit2's diff loads it.
+#[test]
+fn a_huge_subtree_in_a_diff_is_refused_before_it_is_loaded() {
+    const NAME: &str = "a_huge_subtree_in_a_diff_is_refused_before_it_is_loaded";
+    if !is_child(NAME) {
+        let out = in_child(NAME);
+        assert!(out.contains("commit: TooLarge"), "{out}");
+        if cfg!(target_os = "linux") {
+            let (grew, control) = growths(&out);
+            assert!(grew < 12 * MIB, "the diff grew the peak by {grew} bytes");
+            assert!(
+                control >= 20 * MIB,
+                "the measure missed a load: {control} bytes"
+            );
+        }
+        return;
+    }
+    let f = fixture("radhugediff");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let blob = git.blob(b"x").unwrap();
+    let mut big = git.treebuilder(None).unwrap();
+    for i in 0..100_000 {
+        big.insert(format!("{i:0>200}"), blob, 0o100644).unwrap();
+    }
+    let big = big.write().unwrap();
+    let head = git
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let mut root = git.treebuilder(Some(&head.tree().unwrap())).unwrap();
+    root.insert("big", big, 0o040000).unwrap();
+    let root = root.write().unwrap();
+    drop(head);
+    let oid = store_commit(&f, Some(root), "big subtree", false).to_string();
+
+    let mut result = None;
+    let grew = peak_growth(|| {
+        result = Some(
+            f.node
+                .commit_bounded(f.rid, &oid, &Bounds::for_binding())
+                .map(|_| ()),
+        );
+    });
+    match result.unwrap() {
+        Err(e @ Error::TooLarge { .. }) => println!("commit: {e:?}"),
+        other => println!("commit: unexpected {other:?}"),
+    }
+    let control = peak_growth(|| {
+        let tree = git.find_tree(big).unwrap();
+        assert_eq!(tree.len(), 100_000);
+    });
+    print_growth(grew, control);
+}
+
+/// An identity document of 32 MiB at `refs/rad/id`: every read that loads
+/// the identity refuses it from the blob's header.
+#[test]
+fn a_huge_identity_document_is_refused_before_it_is_loaded() {
+    const NAME: &str = "a_huge_identity_document_is_refused_before_it_is_loaded";
+    if !is_child(NAME) {
+        let out = in_child(NAME);
+        assert!(out.contains("refused: 4 of 4"), "{out}");
+        if cfg!(target_os = "linux") {
+            let (grew, control) = growths(&out);
+            assert!(grew < 12 * MIB, "the reads grew the peak by {grew} bytes");
+            assert!(
+                control >= 24 * MIB,
+                "the measure missed a load: {control} bytes"
+            );
+        }
+        return;
+    }
+    let f = fixture("radhugedoc");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let doc = {
+        let payload = format!(
+            "{{\"payload\":{{\"x\":\"{}\"}}}}",
+            "z".repeat(32 * MIB as usize)
+        );
+        git.blob(payload.as_bytes()).unwrap()
+    };
+    let mut embeds = git.treebuilder(None).unwrap();
+    embeds.insert("radicle.json", doc, 0o100644).unwrap();
+    let embeds = embeds.write().unwrap();
+    let mut root = git.treebuilder(None).unwrap();
+    root.insert("embeds", embeds, 0o040000).unwrap();
+    let root = git.find_tree(root.write().unwrap()).unwrap();
+    let signature =
+        git2::Signature::new("Test", "test@example.com", &git2::Time::new(1, 0)).unwrap();
+    let id = git
+        .commit(None, &signature, &signature, "huge doc", &root, &[])
+        .unwrap();
+    git.reference("refs/rad/id", id, true, "test").unwrap();
+
+    let (node, rid) = (&f.node, f.rid);
+    let head = f.commits[2].clone();
+    let mut refused = 0;
+    let grew = peak_growth(|| {
+        let b = Bounds::for_binding();
+        for result in [
+            node.repo_info_bounded(rid, &b).map(|_| ()),
+            node.remotes_bounded(rid, &b).map(|_| ()),
+            node.repo_stats_bounded(rid, &head, &b).map(|_| ()),
+            node.list_repos_bounded(&b).map(|_| ()),
+        ] {
+            if matches!(result, Err(Error::TooLarge { .. })) {
+                refused += 1;
+            } else {
+                println!("not refused: {result:?}");
+            }
+        }
+    });
+    println!("refused: {refused} of 4");
+    let control = peak_growth(|| {
+        assert!(git.find_blob(doc).unwrap().content().len() as u64 >= 32 * MIB);
+    });
+    print_growth(grew, control);
+}
+
+/// A signed-refs record of 80,000 branches with 190-byte names (about 18
+/// MB): the reads that load signed refs refuse it from the blob's header.
+#[test]
+fn huge_signed_refs_are_refused_before_they_are_loaded() {
+    const NAME: &str = "huge_signed_refs_are_refused_before_they_are_loaded";
+    if !is_child(NAME) {
+        let out = in_child(NAME);
+        assert!(out.contains("refused: 3 of 3"), "{out}");
+        if cfg!(target_os = "linux") {
+            let (grew, control) = growths(&out);
+            assert!(grew < 12 * MIB, "the reads grew the peak by {grew} bytes");
+            assert!(
+                control >= 16 * MIB,
+                "the measure missed a load: {control} bytes"
+            );
+        }
+        return;
+    }
+    let f = fixture("radhugesigrefs");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let nid = f.node.identity().nid;
+    let sigrefs = format!("refs/namespaces/{nid}/refs/rad/sigrefs");
+    let tip = git
+        .find_reference(&sigrefs)
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let refs = {
+        let oid = f.commits[2].as_str();
+        let mut text = String::new();
+        for i in 0..80_000 {
+            text.push_str(&format!("{oid} refs/heads/{i:0>190}\n"));
+        }
+        git.blob(text.as_bytes()).unwrap()
+    };
+    let signature_blob = git.blob(&[0u8; 64]).unwrap();
+    let mut tree = git.treebuilder(None).unwrap();
+    tree.insert("refs", refs, 0o100644).unwrap();
+    tree.insert("signature", signature_blob, 0o100644).unwrap();
+    let tree = git.find_tree(tree.write().unwrap()).unwrap();
+    let signature =
+        git2::Signature::new("Test", "test@example.com", &git2::Time::new(1, 0)).unwrap();
+    let huge = git
+        .commit(None, &signature, &signature, "huge sigrefs", &tree, &[&tip])
+        .unwrap();
+    git.reference(&sigrefs, huge, true, "test").unwrap();
+    drop((tree, tip));
+
+    let (node, rid) = (&f.node, f.rid);
+    let head = f.commits[2].clone();
+    let mut refused = 0;
+    let grew = peak_growth(|| {
+        let b = Bounds::for_binding();
+        for result in [
+            node.remotes_bounded(rid, &b).map(|_| ()),
+            node.repo_stats_bounded(rid, &head, &b).map(|_| ()),
+            node.list_repos_bounded(&b).map(|_| ()),
+        ] {
+            if matches!(result, Err(Error::TooLarge { .. })) {
+                refused += 1;
+            } else {
+                println!("not refused: {result:?}");
+            }
+        }
+    });
+    println!("refused: {refused} of 3");
+    let control = peak_growth(|| {
+        assert!(git.find_blob(refs).unwrap().content().len() as u64 >= 16 * MIB);
+    });
+    print_growth(grew, control);
+}
+
+/// 18,000 commits of 1 KiB messages (about 21 MB of commits): the whole
+/// history doesn't fit the binding's loads budget, so the stats refuse it,
+/// and fit a budget that holds it.
+#[test]
+fn repo_stats_count_all_of_history_against_the_loads_budget() {
+    const NAME: &str = "repo_stats_count_all_of_history_against_the_loads_budget";
+    if !is_child(NAME) {
+        let out = in_child(NAME);
+        assert!(out.contains("binding: TooLarge"), "{out}");
+        assert!(out.contains("larger: 18003 commits"), "{out}");
+        return;
+    }
+    let f = fixture("radlonghistory");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let message = "m".repeat(1024);
+    let signature =
+        git2::Signature::new("Test", "test@example.com", &git2::Time::new(1, 0)).unwrap();
+    let mut parent = git
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let tree = parent.tree().unwrap();
+    for _ in 0..18_000 {
+        let oid = git
+            .commit(None, &signature, &signature, &message, &tree, &[&parent])
+            .unwrap();
+        parent = git.find_commit(oid).unwrap();
+    }
+    let tip = parent.id().to_string();
+    match f
+        .node
+        .repo_stats_bounded(f.rid, &tip, &Bounds::for_binding())
+    {
+        Err(e @ Error::TooLarge { .. }) => println!("binding: {e:?}"),
+        other => println!("binding: unexpected {other:?}"),
+    }
+    let larger = budget(1 << 20).with_loads(64 * MIB);
+    match f.node.repo_stats_bounded(f.rid, &tip, &larger) {
+        Ok(stats) => println!("larger: {} commits", stats.commits),
+        other => println!("larger: unexpected {other:?}"),
+    }
+}
