@@ -239,30 +239,41 @@ fn patch_json(
     })
 }
 
+/// Start a node into `NODE` with `start`, answering `{"did": ...}` or an
+/// error payload. A panic in `start` is caught while the guard is held, as
+/// in `with_node`, so a failed start never poisons `NODE` for the next one.
+fn start_node(start: impl FnOnce() -> std::result::Result<Embedded, libradicle::Error>) -> String {
+    let mut guard = match NODE.lock() {
+        Ok(g) => g,
+        Err(_) => return err_json("node lock poisoned"),
+    };
+    if guard.is_some() {
+        return err_json("node already started");
+    }
+    guarded(|| match start() {
+        Ok(node) => {
+            let did = node.did();
+            *guard = Some(node);
+            serde_json::json!({ "did": did }).to_string()
+        }
+        Err(e) => err_json(e),
+    })
+}
+
 /// Start the embedded node with a profile at `home`. Resolves to
 /// `{"did": "..."}` once the node thread is up.
 #[napi]
 pub fn start(home: String, alias: String) -> AsyncTask<BlockingJson> {
-    blocking(move || {
-        let mut guard = match NODE.lock() {
-            Ok(g) => g,
-            Err(_) => return err_json("node lock poisoned"),
-        };
-        if guard.is_some() {
-            return err_json("node already started");
-        }
-        match Embedded::start(Options {
+    blocking(move || start_json(home, alias))
+}
+
+fn start_json(home: String, alias: String) -> String {
+    start_node(|| {
+        Embedded::start(Options {
             home: home.into(),
             alias,
             listen: vec![],
-        }) {
-            Ok(node) => {
-                let did = node.did();
-                *guard = Some(node);
-                serde_json::json!({ "did": did }).to_string()
-            }
-            Err(e) => err_json(e),
-        }
+        })
     })
 }
 
@@ -888,7 +899,7 @@ pub fn shutdown() -> AsyncTask<BlockingJson> {
 
 #[cfg(test)]
 mod tests {
-    use super::guarded;
+    use super::{guarded, start_json, start_node, with_node, NODE};
 
     #[test]
     fn a_panic_becomes_an_error_payload() {
@@ -901,5 +912,48 @@ mod tests {
         assert_eq!(json["error"], "libradicle panicked: owned");
 
         assert_eq!(guarded(|| "{}".to_string()), "{}");
+    }
+
+    fn error_of(json: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(json).expect("JSON");
+        value["error"].as_str().unwrap_or_default().to_string()
+    }
+
+    fn temp_home(name: &str) -> String {
+        let mut home = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        if home.join("node/control.sock").as_os_str().len() > 100 {
+            home = std::path::Path::new("/tmp").join(format!("{name}-{}", std::process::id()));
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        home.to_str().expect("utf-8 temp dir").to_owned()
+    }
+
+    /// One test drives `NODE` end to end, so no two tests race the global.
+    #[test]
+    fn a_failed_start_leaves_the_node_slot_usable() {
+        // A panic inside the startup lock is answered and does not poison it.
+        let failed = start_node(|| panic!("startup panic"));
+        assert_eq!(error_of(&failed), "libradicle panicked: startup panic");
+        assert!(NODE.lock().is_ok(), "NODE is not poisoned");
+
+        // An alias Radicle refuses is an error, not a panic.
+        let home = temp_home("lr-napi-start");
+        let invalid = start_json(home.clone(), "invalid alias".into());
+        assert!(error_of(&invalid).contains("alias"), "{invalid}");
+        assert!(NODE.lock().is_ok(), "NODE is not poisoned");
+
+        // The next, valid start works, and so do calls on the node.
+        let started: serde_json::Value =
+            serde_json::from_str(&start_json(home.clone(), "ValidAlias".into())).unwrap();
+        assert!(
+            started["did"].as_str().unwrap().starts_with("did:key:"),
+            "{started}"
+        );
+        let alias = with_node(|node| node.identity().alias);
+        assert_eq!(alias, "ValidAlias");
+
+        let node = NODE.lock().unwrap().take().expect("started");
+        node.shutdown().expect("clean shutdown");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

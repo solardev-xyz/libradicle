@@ -620,7 +620,7 @@ fn host_profile(home: Home, alias: &str, public_key: PublicKey) -> Result<Profil
     let config = if config_path.exists() {
         Config::load(config_path.as_path()).map_err(radicle::profile::Error::from)?
     } else {
-        Config::init(Alias::new(alias), config_path.as_path())
+        Config::init(alias.parse::<Alias>()?, config_path.as_path())
             .map_err(radicle::profile::Error::from)?
     };
     let storage = radicle::Storage::open(
@@ -716,7 +716,7 @@ impl Embedded {
                     .map_err(radicle::profile::Error::from)?;
                 Profile::load_from(home.clone())?
             } else {
-                Profile::init(home.clone(), Alias::new(&opts.alias), None, seed)?
+                Profile::init(home.clone(), opts.alias.parse::<Alias>()?, None, seed)?
             }
         };
         // In-process signer: load the (unencrypted) secret key.

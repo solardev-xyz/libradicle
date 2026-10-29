@@ -94,6 +94,38 @@ fn host_key_runs_as_that_key_and_keeps_the_profiles_own() {
 }
 
 #[test]
+fn an_invalid_alias_is_an_error_and_the_next_start_works() {
+    let name = format!("radalias-{}", std::process::id());
+    let mut home = std::env::temp_dir().join(&name);
+    if home.join("node/control.sock").as_os_str().len() > 100 {
+        home = std::path::Path::new("/tmp").join(&name);
+    }
+    let home = home.to_str().expect("utf-8 temp dir").to_owned();
+    let _ = std::fs::remove_dir_all(&home);
+    let invalid = |home: &str| Options {
+        alias: "invalid alias".into(),
+        ..opts(home)
+    };
+
+    // Radicle refuses an alias with whitespace. That used to panic in
+    // `Alias::new` on a fresh home; it is an error now, for both starts.
+    let err = Embedded::start_with_key(invalid(&home), key())
+        .err()
+        .expect("refused");
+    assert!(matches!(err, libradicle::Error::Alias(_)), "{err}");
+    let err = Embedded::start(invalid(&home)).err().expect("refused");
+    assert!(matches!(err, libradicle::Error::Alias(_)), "{err}");
+
+    let node = Embedded::start_with_key(opts(&home), key()).expect("start with a host key");
+    assert_eq!(node.did(), DID);
+    node.shutdown().expect("clean shutdown");
+    let node = Embedded::start(opts(&home)).expect("start with the profile's key");
+    node.shutdown().expect("clean shutdown");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn host_key_must_be_32_bytes_and_is_zeroed_regardless() {
     let mut short = vec![7u8; 31];
     assert!(HostKey::from_bytes(&mut short).is_none());

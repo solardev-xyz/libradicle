@@ -55,31 +55,55 @@ fn seed_report_json(report: SeedConnectReport) -> String {
     .to_string()
 }
 
-/// Run `f` on the started node, answering a panic with an `{"error": ...}`
-/// payload. UniFFI catches a panic too, but these exports do not throw, so
-/// the generated Swift calls them with `try!` and the app crashes; and a
-/// panic outside this catch, with the guard held, would poison `NODE` for
-/// every later call.
+/// Run `f`, answering a panic with an `{"error": ...}` payload instead.
+///
+/// UniFFI catches a panic too, but these exports do not throw, so the
+/// generated Swift calls them with `try!` and the app crashes.
+fn guarded(f: impl FnOnce() -> String) -> String {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(json) => json,
+        Err(payload) => err_json(format!(
+            "libradicle panicked: {}",
+            payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic")
+        )),
+    }
+}
+
+/// Run `f` on the started node. A panic in `f` is caught here, while the
+/// guard is still held, so it does not poison `NODE` for every later call.
 fn with_node(f: impl FnOnce(&mut Embedded) -> String) -> String {
     match NODE.lock() {
         Ok(mut guard) => match guard.as_mut() {
-            Some(node) => {
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(node))) {
-                    Ok(json) => json,
-                    Err(payload) => err_json(format!(
-                        "libradicle panicked: {}",
-                        payload
-                            .downcast_ref::<&str>()
-                            .copied()
-                            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                            .unwrap_or("unknown panic")
-                    )),
-                }
-            }
+            Some(node) => guarded(|| f(node)),
             None => err_json("node not started"),
         },
         Err(_) => err_json("node lock poisoned"),
     }
+}
+
+/// Start a node into `NODE` with `start`, answering `{"did": ...}` or an
+/// error payload. A panic in `start` is caught while the guard is held, so
+/// a failed start never poisons `NODE` for the next one.
+fn start_node(start: impl FnOnce() -> Result<Embedded, libradicle::Error>) -> String {
+    let mut guard = match NODE.lock() {
+        Ok(g) => g,
+        Err(_) => return err_json("node lock poisoned"),
+    };
+    if guard.is_some() {
+        return err_json("node already started");
+    }
+    guarded(|| match start() {
+        Ok(node) => {
+            let did = node.did();
+            *guard = Some(node);
+            serde_json::json!({ "did": did }).to_string()
+        }
+        Err(e) => err_json(e),
+    })
 }
 
 fn network() -> std::result::Result<Network, String> {
@@ -206,25 +230,13 @@ fn patch_json(
 /// Start the embedded node with a profile at `home`. `{"did": "..."}` on success.
 #[uniffi::export]
 pub fn start(home: String, alias: String) -> String {
-    let mut guard = match NODE.lock() {
-        Ok(g) => g,
-        Err(_) => return err_json("node lock poisoned"),
-    };
-    if guard.is_some() {
-        return err_json("node already started");
-    }
-    match Embedded::start(Options {
-        home: home.into(),
-        alias,
-        listen: vec![],
-    }) {
-        Ok(node) => {
-            let did = node.did();
-            *guard = Some(node);
-            serde_json::json!({ "did": did }).to_string()
-        }
-        Err(e) => err_json(e),
-    }
+    start_node(|| {
+        Embedded::start(Options {
+            home: home.into(),
+            alias,
+            listen: vec![],
+        })
+    })
 }
 
 /// Start the embedded node as `secret_key`, an identity the host keeps
@@ -243,34 +255,26 @@ pub fn start_with_key(home: String, alias: String, secret_key: Vec<u8>) -> Strin
     let Some(key) = key else {
         return err_json("secret key must be 32 bytes");
     };
-    let mut guard = match NODE.lock() {
-        Ok(g) => g,
-        Err(_) => return err_json("node lock poisoned"),
-    };
-    if guard.is_some() {
-        return err_json("node already started");
-    }
-    match Embedded::start_with_key(
-        Options {
-            home: home.into(),
-            alias,
-            listen: vec![],
-        },
-        key,
-    ) {
-        Ok(node) => {
-            let did = node.did();
-            *guard = Some(node);
-            serde_json::json!({ "did": did }).to_string()
-        }
-        Err(e) => err_json(e),
-    }
+    start_node(move || {
+        Embedded::start_with_key(
+            Options {
+                home: home.into(),
+                alias,
+                listen: vec![],
+            },
+            key,
+        )
+    })
 }
 
 /// Concurrently bootstrap from the effective seed book. The response retains
 /// `connected` and adds attempt/readiness diagnostics.
 #[uniffi::export]
 pub fn connect_seeds(timeout_ms: u32) -> String {
+    guarded(|| connect_seeds_json(timeout_ms))
+}
+
+fn connect_seeds_json(timeout_ms: u32) -> String {
     let mut network = match network() {
         Ok(network) => network,
         Err(e) => return err_json(e),
@@ -284,6 +288,10 @@ pub fn connect_seeds(timeout_ms: u32) -> String {
 /// Seed + fetch a repository into storage. `{"ok": true}`.
 #[uniffi::export]
 pub fn clone_repo(rid: String, timeout_ms: u32) -> String {
+    guarded(|| clone_repo_json(rid, timeout_ms))
+}
+
+fn clone_repo_json(rid: String, timeout_ms: u32) -> String {
     let rid = match parse_rid(&rid) {
         Ok(r) => r,
         Err(e) => return err_json(e),
@@ -303,6 +311,14 @@ pub fn clone_repo(rid: String, timeout_ms: u32) -> String {
 /// Cancel mid-flight with `cancelClone(rid)`.
 #[uniffi::export]
 pub fn clone_repo_with_progress(
+    rid: String,
+    timeout_ms: u32,
+    on_progress: Box<dyn ProgressListener>,
+) -> String {
+    guarded(|| clone_repo_with_progress_json(rid, timeout_ms, on_progress))
+}
+
+fn clone_repo_with_progress_json(
     rid: String,
     timeout_ms: u32,
     on_progress: Box<dyn ProgressListener>,
@@ -801,6 +817,10 @@ pub fn seeders(rid: String) -> String {
 /// Gracefully stop the node and join its thread. `{"ok": true}`.
 #[uniffi::export]
 pub fn shutdown() -> String {
+    guarded(shutdown_json)
+}
+
+fn shutdown_json() -> String {
     let node = match NODE.lock() {
         Ok(mut guard) => guard.take(),
         Err(_) => return err_json("node lock poisoned"),
@@ -818,10 +838,20 @@ pub fn shutdown() -> String {
 mod tests {
     use super::*;
 
+    /// Tests that use the global `NODE` take this, so they never interleave.
+    static NODE_TESTS: Mutex<()> = Mutex::new(());
+
+    fn node_tests() -> std::sync::MutexGuard<'static, ()> {
+        NODE_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// The exported surface is callable and returns the documented sentinels
     /// before a node is started (host-side smoke — device tests run on macOS).
     #[test]
     fn exports_return_not_started_sentinels() {
+        let _serial = node_tests();
         assert!(identity().contains("node not started"));
         assert!(list_repos().contains("node not started"));
         assert!(status().contains("node not started"));
@@ -830,6 +860,61 @@ mod tests {
         assert!(clone_repo("not-a-rid".into(), 1000).contains("invalid RID"));
         // Cancelling an unknown clone is a well-formed negative.
         assert_eq!(cancel_clone("whatever".into()), r#"{"cancelled":false}"#);
+    }
+
+    fn error_of(json: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(json).expect("JSON");
+        value["error"].as_str().unwrap_or_default().to_string()
+    }
+
+    fn temp_home(name: &str) -> String {
+        let mut home = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        if home.join("node/control.sock").as_os_str().len() > 100 {
+            home = std::path::Path::new("/tmp").join(format!("{name}-{}", std::process::id()));
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        home.to_str().expect("utf-8 temp dir").to_owned()
+    }
+
+    #[test]
+    fn a_failed_start_leaves_the_node_slot_usable() {
+        let _serial = node_tests();
+
+        // A panic inside the startup lock is answered and does not poison it.
+        let failed = start_node(|| panic!("startup panic"));
+        assert_eq!(error_of(&failed), "libradicle panicked: startup panic");
+        assert!(NODE.lock().is_ok(), "NODE is not poisoned");
+
+        // An alias Radicle refuses is an error, not a panic, for both starts.
+        let home = temp_home("lr-uniffi-start");
+        let invalid = start(home.clone(), "invalid alias".into());
+        assert!(error_of(&invalid).contains("alias"), "{invalid}");
+        let invalid = start_with_key(home.clone(), "invalid alias".into(), vec![7; 32]);
+        assert!(error_of(&invalid).contains("alias"), "{invalid}");
+        assert!(NODE.lock().is_ok(), "NODE is not poisoned");
+
+        // The next, valid starts work, host key first.
+        let started: serde_json::Value =
+            serde_json::from_str(&start_with_key(home.clone(), "HostKey".into(), vec![7; 32]))
+                .unwrap();
+        assert!(
+            started["did"].as_str().unwrap().starts_with("did:key:"),
+            "{started}"
+        );
+        assert!(identity().contains("HostKey"), "{}", identity());
+        assert_eq!(shutdown(), r#"{"ok":true}"#);
+
+        let home = temp_home("lr-uniffi-start-own");
+        assert!(error_of(&start(home.clone(), "invalid alias".into())).contains("alias"));
+        let started: serde_json::Value =
+            serde_json::from_str(&start(home.clone(), "ValidAlias".into())).unwrap();
+        assert!(
+            started["did"].as_str().unwrap().starts_with("did:key:"),
+            "{started}"
+        );
+        assert!(identity().contains("ValidAlias"), "{}", identity());
+        assert_eq!(shutdown(), r#"{"ok":true}"#);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
