@@ -89,4 +89,35 @@ pub enum Error {
     Policy(#[from] radicle::node::policy::store::Error),
     #[error(transparent)]
     Sqlite(#[from] sqlite::Error),
+    /// A unit of an online repair failed outside its repository (heartwood's
+    /// reconciliation driver): the progress state or the quarantine record.
+    ///
+    /// Boxed, as the next two are, so that every `Result` of this crate
+    /// stays small.
+    #[error(transparent)]
+    Reconcile(Box<radicle::storage::git::reconcile::driver::Error>),
+    #[error(transparent)]
+    Quarantine(Box<radicle::storage::git::reconcile::quarantine::Error>),
+    /// A quarantined repository's removal failed part way: its record stays,
+    /// and the removal completes when run again with the same `qid`.
+    #[error(transparent)]
+    Remove(Box<radicle::storage::git::reconcile::quarantine::RemoveError>),
+}
+
+impl From<radicle::storage::git::reconcile::driver::Error> for Error {
+    fn from(e: radicle::storage::git::reconcile::driver::Error) -> Self {
+        Self::Reconcile(Box::new(e))
+    }
+}
+
+impl From<radicle::storage::git::reconcile::quarantine::Error> for Error {
+    fn from(e: radicle::storage::git::reconcile::quarantine::Error) -> Self {
+        Self::Quarantine(Box::new(e))
+    }
+}
+
+impl From<radicle::storage::git::reconcile::quarantine::RemoveError> for Error {
+    fn from(e: radicle::storage::git::reconcile::quarantine::RemoveError) -> Self {
+        Self::Remove(Box::new(e))
+    }
 }

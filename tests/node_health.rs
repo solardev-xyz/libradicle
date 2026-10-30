@@ -38,6 +38,7 @@ fn start(home: &str) -> Embedded {
             control_socket: true,
             routing: None,
             isolated: false,
+            repositories: None,
         },
         key(),
     )

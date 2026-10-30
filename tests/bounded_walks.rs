@@ -93,6 +93,7 @@ fn fixture(name: &str) -> Fixture {
             control_socket: true,
             routing: None,
             isolated: false,
+            repositories: None,
         },
         key(),
     )

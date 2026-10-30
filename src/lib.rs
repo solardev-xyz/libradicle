@@ -29,6 +29,7 @@ use radicle::node::{ConnectOptions, ConnectResult, FetchResult, Handle as _};
 use radicle::patch::{cache::Patches as _, ByRevision};
 use radicle::prelude::*;
 use radicle::profile::{Home, Profile, Signer};
+use radicle::storage::git::reconcile;
 use radicle::storage::{ReadRepository, ReadStorage, RemoteRepository as _, WriteStorage};
 use radicle_node::runtime::handle::Handle as NodeHandle;
 use radicle_node::runtime::Runtime;
@@ -73,6 +74,15 @@ pub struct Options {
     ///
     /// It still serves the host from local storage.
     pub isolated: bool,
+    /// The repository gate the node consults before it fetches a
+    /// repository, updates its COB cache, announces it or serves it
+    /// (heartwood's `RepoGate`; freedom-core design 0008, "The repository
+    /// gate"). The host keeps a clone, which shares it, and sets each
+    /// repository's state through it: being repaired, or quarantined.
+    ///
+    /// `None` gives the node a gate that admits every repository, as the
+    /// node had before heartwood had one.
+    pub repositories: Option<radicle::node::gate::RepoGate>,
 }
 
 /// The dial gate of an isolated node: it refuses every target, and resolves
@@ -1053,7 +1063,7 @@ impl Embedded {
             sig_rx,
             signer,
             gate,
-            repositories(),
+            opts.repositories.clone().unwrap_or_else(repositories),
         )?;
         if !opts.isolated && !seed_book.is_empty() {
             seeds::install(&profile)?;
@@ -2741,6 +2751,80 @@ impl Embedded {
         Ok(())
     }
 
+    /// The online repair of `rid` after an uncertain write by this node: its
+    /// own namespace, then its COB cache (heartwood's
+    /// `reconcile::driver::Repair::online`, with the node's own ID). Run it a
+    /// unit at a time with [`Embedded::repair_step`].
+    pub fn online_repair(&self, rid: RepoId) -> reconcile::driver::Repair {
+        reconcile::driver::Repair::online(rid, *self.profile.id())
+    }
+
+    /// Runs the next unit of `repair` on this node's storage, signed with
+    /// the key the node runs as (freedom-core design 0008, "Writes": the
+    /// online repair after an uncertain write). A host that started the
+    /// node with [`Embedded::start_with_key`] so keeps no copy of the key
+    /// for it.
+    ///
+    /// The host holds the repository closed at the node's gate
+    /// ([`Options::repositories`]) as being repaired, for the whole repair,
+    /// and passes the progress state and the quarantine record it keeps. Its
+    /// watchdog is told of each unit through `watch`, and `stop` stops the
+    /// repair between units. Only the node's own namespace is ever signed.
+    pub fn repair_step(
+        &self,
+        repair: &mut reconcile::driver::Repair,
+        state: &mut reconcile::state::State,
+        quarantine: &mut reconcile::quarantine::Quarantine,
+        stop: &reconcile::driver::Stop,
+        watch: &dyn reconcile::driver::Watch,
+    ) -> Result<reconcile::driver::Progress, Error> {
+        let signer = self.signer()?;
+        let mut cx = reconcile::driver::Context {
+            storage: &self.profile.storage,
+            state,
+            quarantine,
+            signer: Some(&signer),
+            stop,
+            watch,
+        };
+        Ok(repair.step(&mut cx)?)
+    }
+
+    /// Removes the quarantined repository `rid`, if its quarantine record
+    /// has `qid`: the only way out of quarantine (freedom-core design 0008,
+    /// "The escape"). With no record of `rid`, or one with another `qid`,
+    /// nothing is touched, and the answer is `NotQuarantined`.
+    ///
+    /// Otherwise the node unseeds it first, so that it stops asking for it.
+    /// Then heartwood's `remove_repo` runs its steps, each durable before
+    /// the next: the seeding policy, `storage/<rid>`, the repository's COB
+    /// cache rows, and last the record. Cut off at any point, the record
+    /// stays, and the removal completes when run again with the same `qid`.
+    ///
+    /// Run it with the repository shut at the node's gate, as a quarantined
+    /// repository is.
+    pub fn remove_quarantined(
+        &self,
+        rid: RepoId,
+        qid: reconcile::quarantine::Qid,
+        quarantine: &mut reconcile::quarantine::Quarantine,
+    ) -> Result<reconcile::quarantine::Removal, Error> {
+        if quarantine.get(&rid)?.is_none_or(|record| record.qid != qid) {
+            return Ok(reconcile::quarantine::Removal::NotQuarantined);
+        }
+        self.handle.clone().unseed(rid)?;
+        let mut policies = self.profile.home.policies_mut()?;
+        let mut cache = self.profile.home.cobs_db_mut()?;
+        Ok(reconcile::quarantine::remove_repo(
+            quarantine,
+            &mut policies,
+            self.profile.storage.path(),
+            &mut cache,
+            rid,
+            qid,
+        )?)
+    }
+
     /// Whether the node's thread is still running. `false` once the node has
     /// stopped, whether it was asked to or ended by itself (an error in its
     /// runtime): a host can then restart it, or report why.
@@ -2901,10 +2985,9 @@ fn stored_repository(entry: &std::fs::DirEntry) -> Result<Option<RepoId>, Error>
     }
 }
 
-/// The node's repository gate: one that admits every repository, for every
-/// purpose, as the node did before heartwood had one. libradicle gives the
-/// node a gate of its own once the service work needs one (freedom-core
-/// design 0008).
+/// The node's repository gate when the host passes none
+/// ([`Options::repositories`]): one that admits every repository, for every
+/// purpose, as the node did before heartwood had one.
 fn repositories() -> radicle::node::gate::RepoGate {
     radicle::node::gate::RepoGate::new()
 }
@@ -3201,6 +3284,7 @@ mod tests {
                 gate: gate.clone(),
             }),
             isolated: false,
+            repositories: None,
         })
         .unwrap();
         gate.wait_for_a_lookup();

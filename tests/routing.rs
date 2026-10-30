@@ -54,6 +54,7 @@ fn start(home: &Path, routing: Option<Routing>) -> Embedded {
             control_socket: true,
             routing,
             isolated: false,
+            repositories: None,
         },
         key(),
     )

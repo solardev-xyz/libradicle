@@ -33,6 +33,7 @@ fn start(home: &Path) -> Result<Embedded, Error> {
         control_socket: true,
         routing: None,
         isolated: false,
+        repositories: None,
     })
 }
 
