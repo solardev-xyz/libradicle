@@ -97,7 +97,9 @@ impl radicle::node::dial::Gate for Isolated {
 #[derive(Debug, Clone)]
 pub struct Routing {
     /// The SOCKS5 proxy every peer dial goes through, or `None` to dial
-    /// directly (`node.proxy`).
+    /// directly (`node.proxy`). Through a proxy, the node isolates each
+    /// remote node's streams: it gives the proxy credentials of each peer's
+    /// own (RFC 1929), and only those.
     pub proxy: Option<std::net::SocketAddr>,
     /// How onion addresses are reached (`node.onion`). I2P addresses are
     /// always dropped (`node.i2p`).
@@ -117,6 +119,46 @@ impl Routing {
         config.i2p = radicle::node::config::AddressConfig::Drop;
         config.external_addresses = vec![];
         config
+    }
+
+    /// The gate the node dials through: the host's, isolating each remote
+    /// node's streams when the node dials through a proxy (freedom-core
+    /// design 0008, R-12 part 4). heartwood then gives the proxy credentials
+    /// of each remote node's own (RFC 1929), and only those, so that Arti
+    /// keeps each peer's connections on circuits of their own.
+    fn gate(&self) -> Arc<dyn radicle::node::dial::Gate> {
+        if self.proxy.is_some() {
+            Arc::new(Isolating(self.gate.clone()))
+        } else {
+            self.gate.clone()
+        }
+    }
+}
+
+/// A gate that isolates each remote node's streams through a proxy, and
+/// otherwise is the one it wraps.
+#[derive(Debug)]
+struct Isolating(Arc<dyn radicle::node::dial::Gate>);
+
+impl radicle::node::dial::Gate for Isolating {
+    fn allows(&self, target: &radicle::node::Address, addr: &std::net::SocketAddr) -> bool {
+        self.0.allows(target, addr)
+    }
+
+    fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        self.0.resolve(host, port)
+    }
+
+    fn resolve_timeout(&self) -> std::time::Duration {
+        self.0.resolve_timeout()
+    }
+
+    fn proxy_resolves_names(&self) -> bool {
+        self.0.proxy_resolves_names()
+    }
+
+    fn isolates_streams(&self) -> bool {
+        true
     }
 }
 
@@ -907,7 +949,7 @@ impl Embedded {
 
         let (sig_tx, sig_rx) = mpsc::channel();
         let (mut config, mut gate) = match &opts.routing {
-            Some(routing) => (routing.apply(&profile.config.node), routing.gate.clone()),
+            Some(routing) => (routing.apply(&profile.config.node), routing.gate()),
             None => (
                 profile.config.node.clone(),
                 Arc::new(radicle::node::dial::Open) as Arc<dyn radicle::node::dial::Gate>,

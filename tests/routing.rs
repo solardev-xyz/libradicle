@@ -182,3 +182,65 @@ fn routing_through_a_proxy_replaces_config_jsons_proxy() {
     node.shutdown().expect("clean shutdown");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A gate that answers every name with one address, and allows it.
+#[derive(Debug)]
+struct Answering(std::net::SocketAddr);
+
+impl radicle::node::dial::Gate for Answering {
+    fn allows(&self, _: &radicle::node::Address, _: &std::net::SocketAddr) -> bool {
+        true
+    }
+
+    fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        Ok(vec![self.0])
+    }
+}
+
+/// A SOCKS5 proxy that takes one connection, keeps its greeting, and turns
+/// down every method it offers.
+fn greeting_proxy() -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<u8>>) {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let greeting = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut head = [0u8; 2];
+        stream.read_exact(&mut head).unwrap();
+        let mut methods = vec![0u8; usize::from(head[1])];
+        stream.read_exact(&mut methods).unwrap();
+        stream.write_all(&[5, 0xff]).ok();
+        [head.to_vec(), methods].concat()
+    });
+    (addr, greeting)
+}
+
+// R-12 part 4: through a proxy, the node isolates each remote node's
+// streams, whatever the host's gate says: it offers the proxy
+// username/password authentication alone (RFC 1929), with credentials of the
+// peer's own, so that Arti keeps each peer on circuits of its own.
+#[test]
+fn a_node_through_a_proxy_isolates_each_peer_s_streams() {
+    let home = home("radroutingisolation");
+    let (proxy, greeting) = greeting_proxy();
+    let gate = Arc::new(Answering(([198, 51, 100, 7], 8776).into()));
+    assert!(!radicle::node::dial::Gate::isolates_streams(&*gate));
+    let node = start(
+        &home,
+        Some(Routing {
+            proxy: Some(proxy),
+            onion: AddressConfig::Drop,
+            gate,
+        }),
+    );
+
+    // Version 5, one method: username/password.
+    assert_eq!(greeting.join().unwrap(), [5, 1, 2]);
+
+    node.shutdown().expect("clean shutdown");
+    let _ = std::fs::remove_dir_all(&home);
+}
