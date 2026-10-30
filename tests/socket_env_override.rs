@@ -19,6 +19,7 @@ fn rad_socket_env_redirects_control_socket_away_from_long_home() {
         listen: vec![],
         control_socket: true,
         routing: None,
+        isolated: false,
     })
     .expect("start must bind the control socket at RAD_SOCKET, not under home");
     node.shutdown().expect("clean shutdown");

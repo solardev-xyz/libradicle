@@ -101,6 +101,7 @@ mod tests {
                 listen: vec![],
                 control_socket: false,
                 routing: None,
+                isolated: false,
             },
             key,
         )

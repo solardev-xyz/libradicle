@@ -32,7 +32,6 @@ struct Fixture {
     node: Embedded,
     rid: radicle::identity::RepoId,
     revision: String,
-    big: git2::Oid,
 }
 
 impl Drop for Fixture {
@@ -83,7 +82,6 @@ fn fixture(name: &str) -> Fixture {
         )
         .unwrap();
     repo.set_head("refs/heads/main").unwrap();
-    let big = tree.get_name("big.txt").unwrap().id();
 
     let mut node = Embedded::start_with_key(
         Options {
@@ -92,6 +90,7 @@ fn fixture(name: &str) -> Fixture {
             listen: vec![],
             control_socket: true,
             routing: None,
+            isolated: false,
         },
         key(),
     )
@@ -104,7 +103,6 @@ fn fixture(name: &str) -> Fixture {
         node,
         rid,
         revision: commit.to_string(),
-        big,
     }
 }
 
@@ -174,11 +172,16 @@ fn a_directory_or_a_submodule_is_not_a_blob() {
 
 #[test]
 fn a_file_over_the_cap_is_refused_before_it_is_loaded() {
-    let f = fixture("radblobload");
-    // `big.txt`'s stored object keeps its header (a 1000-byte blob) but loses
-    // its content: only a read that loads it can tell.
-    let object = loose_object(&f.dir.join("home/storage"), f.big);
+    let mut f = fixture("radblobload");
+    // The import fetches the repository into storage as a pack (heartwood's
+    // R-13), so `big.txt`'s blob is written again, of its own, loose, under a
+    // commit of its own.
+    let (revision, big) = loose_big(&f.dir.join("home/storage"), &f.revision);
+    // That stored object keeps its header (a 1000-byte blob) but loses its
+    // content: only a read that loads it can tell.
+    let object = loose_object(&f.dir.join("home/storage"), big);
     truncate_loose_object(&object, BIG);
+    f.revision = revision;
 
     let header = f
         .node
@@ -199,6 +202,31 @@ fn a_file_over_the_cap_is_refused_before_it_is_loaded() {
         .node
         .read_blob_at_capped(f.rid, &f.revision, "big.txt", BIG as u64);
     assert!(loaded.is_err(), "the damaged object loaded: {loaded:?}");
+}
+
+/// A commit on `revision`, written straight into the storage repository that
+/// has it, whose `big.txt` is a new 1000-byte blob: new, so both are written
+/// loose. Its ID, and the blob's.
+fn loose_big(storage: &Path, revision: &str) -> (String, git2::Oid) {
+    let revision = git2::Oid::from_str(revision).unwrap();
+    for repo in std::fs::read_dir(storage).unwrap() {
+        let Ok(repo) = git2::Repository::open_bare(repo.unwrap().path()) else {
+            continue;
+        };
+        let Ok(base) = repo.find_commit(revision) else {
+            continue;
+        };
+        let blob = repo.blob(&vec![b'y'; BIG]).unwrap();
+        let mut tree = repo.treebuilder(Some(&base.tree().unwrap())).unwrap();
+        tree.insert("big.txt", blob, 0o100644).unwrap();
+        let tree = repo.find_tree(tree.write().unwrap()).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let commit = repo
+            .commit(None, &signature, &signature, "big", &tree, &[&base])
+            .unwrap();
+        return (commit.to_string(), blob);
+    }
+    panic!("no repository under {storage:?} has {revision}");
 }
 
 /// The loose object for `oid` under `storage`, in whichever repository has it.
