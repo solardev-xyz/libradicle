@@ -903,6 +903,9 @@ pub struct Embedded {
     /// Whether the node's home has been seen let go of since its thread
     /// ended ([`Embedded::shutdown`]).
     released: bool,
+    /// How the node's thread ended, if with an error: kept until the home
+    /// is let go of, and then returned, once ([`Embedded::shutdown_within`]).
+    ended: Option<Error>,
 }
 
 impl Embedded {
@@ -1032,6 +1035,7 @@ impl Embedded {
             stop,
             _signals: sig_tx,
             released: false,
+            ended: None,
         })
     }
 
@@ -2618,15 +2622,19 @@ impl Embedded {
     /// [`Error::ShutdownTimeout`] past that.
     pub fn shutdown(mut self) -> Result<(), Error> {
         self.handle.clone().shutdown()?;
-        if let Some(t) = self.node_thread.take() {
-            t.join()
-                .map_err(|_| Error::NodeThread("node thread panicked".into()))?
-                .map_err(|e| Error::NodeThread(e.to_string()))?;
-        }
-        self.await_release(
+        let joined = match self.node_thread.take() {
+            Some(t) => t
+                .join()
+                .map_err(|_| Error::NodeThread("node thread panicked".into()))
+                .and_then(|ended| ended.map_err(|e| Error::NodeThread(e.to_string()))),
+            None => Ok(()),
+        };
+        // A thread that ended with an error still holds the home a while.
+        let released = self.await_release(
             std::time::Instant::now().checked_add(HOME_RELEASE_LIMIT),
             HOME_RELEASE_LIMIT,
-        )
+        );
+        joined.and(released)
     }
 
     /// Waits, until `deadline` if any, for the node, whose thread has ended,
@@ -2645,10 +2653,19 @@ impl Embedded {
                     self.released = true;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                        return Err(Error::ShutdownTimeout(timeout));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    let poll = std::time::Duration::from_millis(10);
+                    let pause = match deadline {
+                        Some(deadline) => {
+                            let left =
+                                deadline.saturating_duration_since(std::time::Instant::now());
+                            if left.is_zero() {
+                                return Err(Error::ShutdownTimeout(timeout));
+                            }
+                            left.min(poll)
+                        }
+                        None => poll,
+                    };
+                    std::thread::sleep(pause);
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -2679,6 +2696,9 @@ impl Embedded {
     ///   deadline, for the node to let go of its home, as
     ///   [`Embedded::shutdown`] does. Past it, [`Error::ShutdownTimeout`], and
     ///   another call waits again.
+    /// - **A thread that ended with an error,** or panicked, is
+    ///   [`Error::NodeThread`]: returned once the home is let go of, by
+    ///   whichever call finds it so.
     /// - **Once joined, and the home let go of,** a further call returns
     ///   `Ok` at once.
     ///
@@ -2687,7 +2707,8 @@ impl Embedded {
     pub fn shutdown_within(&mut self, timeout: std::time::Duration) -> Result<(), Error> {
         let deadline = std::time::Instant::now().checked_add(timeout);
         let Some(thread) = self.node_thread.as_ref() else {
-            return self.await_release(deadline, timeout);
+            self.await_release(deadline, timeout)?;
+            return self.ended.take().map_or(Ok(()), Err);
         };
         if !thread.is_finished() {
             (self.stop)();
@@ -2706,15 +2727,18 @@ impl Embedded {
                 std::thread::sleep(left.min(std::time::Duration::from_millis(10)));
             }
         }
-        let joined = match self.node_thread.take() {
-            Some(thread) => thread
-                .join()
-                .map_err(|_| Error::NodeThread("node thread panicked".into()))?
-                .map_err(|e| Error::NodeThread(e.to_string())),
-            None => Ok(()),
-        };
+        // How the thread ended is kept, so that a call past the deadline for
+        // the home's release loses none of it: the call that finds the home
+        // let go of returns it.
+        if let Some(thread) = self.node_thread.take() {
+            self.ended = match thread.join() {
+                Err(_) => Some(Error::NodeThread("node thread panicked".into())),
+                Ok(Err(e)) => Some(Error::NodeThread(e.to_string())),
+                Ok(Ok(())) => None,
+            };
+        }
         self.await_release(deadline, timeout)?;
-        joined
+        self.ended.take().map_or(Ok(()), Err)
     }
 }
 
@@ -3043,5 +3067,142 @@ mod tests {
         ] {
             assert_eq!(gate.admit_all(rids, purpose).rids(), rids);
         }
+    }
+
+    /// A gate whose name lookups wait until it is released.
+    #[derive(Debug, Default)]
+    struct Held {
+        state: std::sync::Mutex<(usize, bool)>,
+        changed: std::sync::Condvar,
+    }
+
+    impl Held {
+        fn wait_for_a_lookup(&self) {
+            let mut state = self.state.lock().unwrap();
+            while state.0 == 0 {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    impl radicle::node::dial::Gate for Held {
+        fn allows(&self, _: &radicle::node::Address, _: &std::net::SocketAddr) -> bool {
+            false
+        }
+
+        fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+            let mut state = self.state.lock().unwrap();
+            state.0 += 1;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self.changed.wait(state).unwrap();
+            }
+            Ok(vec![])
+        }
+    }
+
+    /// A node of a fresh home under /tmp, whose one name lookup `gate`
+    /// holds, its thread stopped and joined: the home stays held until the
+    /// lookup is released.
+    fn stopped_with_a_held_home(
+        name: &str,
+        gate: &std::sync::Arc<Held>,
+    ) -> (super::Embedded, std::path::PathBuf) {
+        use radicle::crypto::Signer as _;
+
+        let home =
+            std::path::Path::new("/tmp").join(format!("radunit-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let peer = *radicle::crypto::SigningKey::from_seed(radicle::crypto::Seed::new([7; 32]))
+            .public_key();
+        std::fs::write(
+            home.join("config.json"),
+            format!(
+                r#"{{"preferredSeeds":[],"node":{{"alias":"unit","network":"test","peers":{{"type":"static"}},"connect":["{peer}@held.test:8776"]}}}}"#
+            ),
+        )
+        .unwrap();
+        let mut node = super::Embedded::start(super::Options {
+            home: home.to_str().unwrap().into(),
+            alias: "unit".into(),
+            listen: vec![],
+            control_socket: true,
+            routing: Some(super::Routing {
+                proxy: None,
+                onion: radicle::node::config::AddressConfig::Drop,
+                gate: gate.clone(),
+            }),
+            isolated: false,
+        })
+        .unwrap();
+        gate.wait_for_a_lookup();
+        (node.stop)();
+        node.node_thread.take().unwrap().join().unwrap().unwrap();
+        (node, home)
+    }
+
+    #[test]
+    // Review of libradicle #19, round 2: a node whose thread ended with an
+    // error, while a lookup still holds its home past the deadline, keeps
+    // that error: the call past the deadline is `ShutdownTimeout`, and the
+    // one that finds the home let go of returns the error.
+    fn a_terminal_error_outlasts_a_held_home() {
+        let gate = std::sync::Arc::new(Held::default());
+        let (mut node, home) = stopped_with_a_held_home("terminal", &gate);
+        // The thread ended with an error of its runtime.
+        node.node_thread = Some(std::thread::spawn(|| {
+            Err(radicle_node::runtime::Error::Io(std::io::Error::other(
+                "the runtime failed",
+            )))
+        }));
+        while !node.node_thread.as_ref().unwrap().is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let result = node.shutdown_within(Duration::ZERO);
+        assert!(
+            matches!(result, Err(super::Error::ShutdownTimeout(_))),
+            "{result:?}"
+        );
+        gate.release();
+        let result = node.shutdown_within(Duration::from_secs(10));
+        assert!(
+            matches!(&result, Err(super::Error::NodeThread(e)) if e.contains("the runtime failed")),
+            "{result:?}"
+        );
+        // Returned once.
+        assert!(node.shutdown_within(Duration::ZERO).is_ok());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    // Review of libradicle #19, round 2: a short deadline bounds the wait for
+    // the home's release too, rather than the 10 ms it polls at.
+    fn a_short_deadline_bounds_the_wait_for_the_home() {
+        let gate = std::sync::Arc::new(Held::default());
+        let (mut node, home) = stopped_with_a_held_home("short", &gate);
+        for _ in 0..5 {
+            let started = Instant::now();
+            let result = node.shutdown_within(Duration::from_millis(1));
+            let took = started.elapsed();
+            assert!(
+                matches!(result, Err(super::Error::ShutdownTimeout(_))),
+                "{result:?}"
+            );
+            // Sleeps on Windows round up to its timer's tick.
+            if cfg!(not(windows)) {
+                assert!(took < Duration::from_millis(8), "the call took {took:?}");
+            }
+        }
+        gate.release();
+        node.shutdown_within(Duration::from_secs(10))
+            .expect("the home is let go of");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
