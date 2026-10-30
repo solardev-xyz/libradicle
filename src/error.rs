@@ -52,6 +52,21 @@ pub enum Error {
     NotABlob(String),
     #[error("{size} bytes is over the limit of {limit}")]
     TooLarge { size: u64, limit: u64 },
+    /// A bounded tree walk that would descend past
+    /// [`crate::MAX_TREE_DEPTH`].
+    #[error("the tree is nested deeper than {limit} levels")]
+    TooDeep { limit: usize },
+    /// A bounded read of a repository with no canonical identity head
+    /// (`refs/rad/id`): heartwood would search every remote's identity
+    /// history for it, which can't be sized before it is read.
+    #[error("{0} has no canonical identity head to size its identity document from")]
+    NoIdentityHead(RepoId),
+    /// A bounded read of a repository with no usable local `HEAD` whose
+    /// delegates' default branches point at different objects (commits,
+    /// tags, or a mix): for commits, finding its canonical head would need a
+    /// merge-base walk, which a bounded read doesn't make.
+    #[error("{0} has no usable local HEAD, and its delegates' default branches disagree: its canonical head can't be found within a bounded read")]
+    NoCanonicalHead(RepoId),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("invalid commit revision {0:?}")]
@@ -72,4 +87,6 @@ pub enum Error {
     Init(#[from] radicle::rad::InitError),
     #[error(transparent)]
     Policy(#[from] radicle::node::policy::store::Error),
+    #[error(transparent)]
+    Sqlite(#[from] sqlite::Error),
 }

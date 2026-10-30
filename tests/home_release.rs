@@ -153,3 +153,70 @@ fn shutdown_within_waits_for_the_home_within_its_deadline() {
     next.shutdown().expect("clean shutdown");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+// Review of libradicle #19, round 1: a deadline a host passes bounds the
+// whole shutdown, the stop, the thread's join and the home's release,
+// whatever the lookups that hold the home.
+fn a_passed_deadline_bounds_the_whole_shutdown() {
+    let home = home("deadline");
+    let gate = Arc::new(Held::default());
+    let mut node = start(&home, Some(gate.clone())).expect("start");
+    gate.wait_for_a_lookup();
+
+    let started = Instant::now();
+    let result = node.shutdown_within(Duration::from_millis(400));
+    let took = started.elapsed();
+    assert!(
+        matches!(result, Err(Error::ShutdownTimeout(_))),
+        "{result:?}"
+    );
+    assert!(
+        took < Duration::from_millis(900),
+        "the shutdown took {took:?}"
+    );
+
+    gate.release();
+    node.shutdown_within(Duration::from_secs(10))
+        .expect("the home is let go of");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+// Review of libradicle #19, round 1: a binding's node, kept in a slot, stays
+// there past a deadline, asked to stop, so that a retry finishes it; only a
+// stop that has let go of the home takes it out.
+fn a_slot_keeps_a_node_that_timed_out_until_a_retry_stops_it() {
+    let home = home("slot");
+    let gate = Arc::new(Held::default());
+    let mut slot = Some(start(&home, Some(gate.clone())).expect("start"));
+    gate.wait_for_a_lookup();
+
+    let result = libradicle::shutdown_slot(&mut slot, Duration::from_millis(1_500));
+    assert!(
+        matches!(result, Err(Error::ShutdownTimeout(_))),
+        "{result:?}"
+    );
+    assert!(slot.is_some(), "the node is kept");
+    assert!(matches!(
+        start(&home, None),
+        Err(Error::Runtime(radicle_node::runtime::Error::HomeLocked(_)))
+    ));
+
+    gate.release();
+    assert_eq!(
+        libradicle::shutdown_slot(&mut slot, Duration::from_secs(10)).unwrap(),
+        libradicle::Slot::Stopped
+    );
+    assert!(slot.is_none());
+    assert_eq!(
+        libradicle::shutdown_slot(&mut slot, Duration::ZERO).unwrap(),
+        libradicle::Slot::Empty
+    );
+    let mut slot = Some(start(&home, None).expect("a node starts on the home at once"));
+    assert_eq!(
+        libradicle::shutdown_slot(&mut slot, libradicle::SHUTDOWN_DEADLINE).unwrap(),
+        libradicle::Slot::Stopped
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
