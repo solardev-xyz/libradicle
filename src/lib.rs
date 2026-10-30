@@ -2620,21 +2620,47 @@ impl Embedded {
     /// past a second. So the home may be held a while after the thread ends:
     /// this waits for it up to [`HOME_RELEASE_LIMIT`], and is
     /// [`Error::ShutdownTimeout`] past that.
+    ///
+    /// A thread that ended with an error, or panicked, is
+    /// [`Error::NodeThread`], whether this call joins it or an earlier
+    /// [`Embedded::shutdown_within`] did, and whether or not the home is let
+    /// go of in time: this call is the last.
     pub fn shutdown(mut self) -> Result<(), Error> {
-        self.handle.clone().shutdown()?;
-        let joined = match self.node_thread.take() {
-            Some(t) => t
-                .join()
-                .map_err(|_| Error::NodeThread("node thread panicked".into()))
-                .and_then(|ended| ended.map_err(|e| Error::NodeThread(e.to_string()))),
-            None => Ok(()),
-        };
+        if self
+            .node_thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+            && self.handle.clone().shutdown().is_err()
+        {
+            // The node's control is gone, though its thread runs: its
+            // reactor is asked directly, which can't fail.
+            (self.stop)();
+        }
+        self.join_ended();
         // A thread that ended with an error still holds the home a while.
         let released = self.await_release(
             std::time::Instant::now().checked_add(HOME_RELEASE_LIMIT),
             HOME_RELEASE_LIMIT,
         );
-        joined.and(released)
+        // How the thread ended, if with an error, before the release's wait:
+        // this call is the last.
+        match self.ended.take() {
+            Some(e) => Err(e),
+            None => released,
+        }
+    }
+
+    /// Joins the node's thread, if one remains, keeping how it ended, if
+    /// with an error or a panic, in `self.ended`: for whichever stop finds
+    /// the home let go of to return.
+    fn join_ended(&mut self) {
+        if let Some(thread) = self.node_thread.take() {
+            self.ended = match thread.join() {
+                Err(_) => Some(Error::NodeThread("node thread panicked".into())),
+                Ok(Err(e)) => Some(Error::NodeThread(e.to_string())),
+                Ok(Ok(())) => None,
+            };
+        }
     }
 
     /// Waits, until `deadline` if any, for the node, whose thread has ended,
@@ -2730,13 +2756,7 @@ impl Embedded {
         // How the thread ended is kept, so that a call past the deadline for
         // the home's release loses none of it: the call that finds the home
         // let go of returns it.
-        if let Some(thread) = self.node_thread.take() {
-            self.ended = match thread.join() {
-                Err(_) => Some(Error::NodeThread("node thread panicked".into())),
-                Ok(Err(e)) => Some(Error::NodeThread(e.to_string())),
-                Ok(Ok(())) => None,
-            };
-        }
+        self.join_ended();
         self.await_release(deadline, timeout)?;
         self.ended.take().map_or(Ok(()), Err)
     }
@@ -3178,6 +3198,66 @@ mod tests {
         );
         // Returned once.
         assert!(node.shutdown_within(Duration::ZERO).is_ok());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    // Review of libradicle #19, round 3: the consuming `shutdown` returns a
+    // terminal error that a bounded call past its deadline kept, once the
+    // home is let go of.
+    fn a_terminal_error_kept_by_a_bounded_call_reaches_the_consuming_shutdown() {
+        let gate = std::sync::Arc::new(Held::default());
+        let (mut node, home) = stopped_with_a_held_home("consuming", &gate);
+        node.node_thread = Some(std::thread::spawn(|| {
+            Err(radicle_node::runtime::Error::Io(std::io::Error::other(
+                "the saved runtime failure",
+            )))
+        }));
+        while !node.node_thread.as_ref().unwrap().is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let result = node.shutdown_within(Duration::ZERO);
+        assert!(
+            matches!(result, Err(super::Error::ShutdownTimeout(_))),
+            "{result:?}"
+        );
+        let release = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                gate.release();
+            })
+        };
+        let result = node.shutdown();
+        assert!(
+            matches!(&result, Err(super::Error::NodeThread(e)) if e.contains("the saved runtime failure")),
+            "{result:?}"
+        );
+        release.join().unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    // Review of libradicle #19, round 3: the consuming `shutdown` of a node
+    // whose thread has ended with an error returns that error, though its
+    // control is gone.
+    fn the_consuming_shutdown_of_an_ended_node_returns_how_it_ended() {
+        let gate = std::sync::Arc::new(Held::default());
+        let (mut node, home) = stopped_with_a_held_home("ended", &gate);
+        node.node_thread = Some(std::thread::spawn(|| {
+            Err(radicle_node::runtime::Error::Io(std::io::Error::other(
+                "the runtime ended",
+            )))
+        }));
+        while !node.node_thread.as_ref().unwrap().is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        gate.release();
+        let result = node.shutdown();
+        assert!(
+            matches!(&result, Err(super::Error::NodeThread(e)) if e.contains("the runtime ended")),
+            "{result:?}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
