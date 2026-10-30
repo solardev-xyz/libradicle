@@ -58,6 +58,36 @@ pub struct Options {
     /// How the node reaches peers, set in memory over `config.json`. `None`
     /// leaves `config.json`'s routing as it is.
     pub routing: Option<Routing>,
+    /// Whether the node reaches no one, whatever `config.json` and `routing`
+    /// say (freedom-core design 0008, R-12 part 3):
+    /// - its peer set is static, with no `connect` peers, so it takes no
+    ///   bootstrap nodes and dials no one;
+    /// - its dial gate refuses every target and resolves no name, so an
+    ///   explicit connect, to the seed book among others, fails before any
+    ///   socket, and no address a peer announces enters its address book;
+    /// - it listens on no address, `listen` notwithstanding, and the shipped
+    ///   seeds aren't added to its address book.
+    ///
+    /// It still serves the host from local storage.
+    pub isolated: bool,
+}
+
+/// The dial gate of an isolated node: it refuses every target, and resolves
+/// no name.
+#[derive(Debug)]
+struct Isolated;
+
+impl radicle::node::dial::Gate for Isolated {
+    fn allows(&self, _: &radicle::node::Address, _: &std::net::SocketAddr) -> bool {
+        false
+    }
+
+    fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "an isolated node resolves no name",
+        ))
+    }
 }
 
 /// How the node reaches peers. Given in [`Options::routing`], it replaces
@@ -874,24 +904,31 @@ impl Embedded {
         };
 
         let (sig_tx, sig_rx) = mpsc::channel();
-        let (config, gate) = match &opts.routing {
+        let (mut config, mut gate) = match &opts.routing {
             Some(routing) => (routing.apply(&profile.config.node), routing.gate.clone()),
             None => (
                 profile.config.node.clone(),
                 Arc::new(radicle::node::dial::Open) as Arc<dyn radicle::node::dial::Gate>,
             ),
         };
+        let mut listen = opts.listen.clone();
+        if opts.isolated {
+            config.peers = radicle::node::config::PeerConfig::Static;
+            config.connect = Default::default();
+            gate = Arc::new(Isolated);
+            listen.clear();
+        }
         let runtime = Runtime::init(
             profile.home.clone(),
             config,
             socket,
-            opts.listen.clone(),
+            listen,
             sig_rx,
             signer,
             gate,
             repositories(),
         )?;
-        if !seed_book.is_empty() {
+        if !opts.isolated && !seed_book.is_empty() {
             seeds::install(&profile)?;
         }
         let handle = runtime.handle.clone();
