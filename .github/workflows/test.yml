@@ -10,7 +10,8 @@ on:
     paths:
       - ".github/workflows/test.yml"
       - "Cargo.lock"
-      - "Cargo.toml"
+      - "**/Cargo.toml"
+      - "deny.toml"
       - "build.rs"
       - "examples/**"
       - "rust-toolchain.toml"
@@ -21,7 +22,8 @@ on:
     paths:
       - ".github/workflows/test.yml"
       - "Cargo.lock"
-      - "Cargo.toml"
+      - "**/Cargo.toml"
+      - "deny.toml"
       - "build.rs"
       - "examples/**"
       - "rust-toolchain.toml"
@@ -48,3 +50,28 @@ jobs:
       - name: cargo test
         shell: bash
         run: cargo test --locked -p libradicle --features no-spawn
+
+  # Every crate's source, across the whole workspace (the bindings' graphs
+  # included): crates.io, or heartwood's canonical repository, and nothing
+  # else (deny.toml's [sources]). Then the library's full policy.
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_DENY_VERSION: "0.20.2"
+      CARGO_DENY_SHA256: "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+      - name: Install cargo-deny
+        run: |
+          tarball="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL -o "$tarball" "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${tarball}"
+          echo "${CARGO_DENY_SHA256}  ${tarball}" | sha256sum --check
+          tar -xzf "$tarball" --strip-components=1 -C "$HOME/.cargo/bin" "cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny"
+      - name: sources, the whole workspace
+        run: cargo deny --workspace --locked check sources
+      - name: the library's policy
+        run: cargo deny --locked check
