@@ -115,7 +115,11 @@ mod tests {
                 alias: "seams".into(),
                 listen: vec![],
                 control_socket: false,
-                routing: None,
+                routing: Some(crate::Routing {
+                    proxy: None,
+                    onion: radicle::node::config::AddressConfig::Drop,
+                    gate: crate::hermetic::gate(),
+                }),
                 isolated: false,
                 repositories: None,
             },

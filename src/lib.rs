@@ -36,6 +36,10 @@ use radicle_node::runtime::Runtime;
 
 pub mod error;
 pub use error::Error;
+/// The dial gate every unit test node gets: loopback only, and loudly.
+#[cfg(test)]
+#[path = "../tests/common/hermetic.rs"]
+mod hermetic;
 pub mod json;
 mod meter;
 mod objects;
@@ -3281,7 +3285,7 @@ mod tests {
             routing: Some(super::Routing {
                 proxy: None,
                 onion: radicle::node::config::AddressConfig::Drop,
-                gate: gate.clone(),
+                gate: super::hermetic::wrapping(gate.clone()),
             }),
             isolated: false,
             repositories: None,

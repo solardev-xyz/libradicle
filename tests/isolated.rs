@@ -2,6 +2,8 @@
 //! R-12 part 3). It dials no one, explicitly or not, takes no bootstrap node
 //! or shipped seed into its address book, and listens on no address.
 
+mod common;
+
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -58,7 +60,7 @@ fn start(home: &Path, isolated: bool, listen: Vec<SocketAddr>) -> Embedded {
             alias: "isolated".into(),
             listen,
             control_socket: true,
-            routing: None,
+            routing: Some(common::routing()),
             isolated,
             repositories: None,
         },

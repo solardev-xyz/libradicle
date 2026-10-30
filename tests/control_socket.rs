@@ -5,6 +5,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
@@ -31,7 +33,7 @@ fn start(home: &Path) -> Result<Embedded, Error> {
         alias: "control".into(),
         listen: vec![],
         control_socket: true,
-        routing: None,
+        routing: Some(common::routing()),
         isolated: false,
         repositories: None,
     })

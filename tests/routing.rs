@@ -1,6 +1,8 @@
 //! `Options::routing`: the node's routing, set in memory over `config.json`,
 //! which is never written; and the gate the node dials through.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -45,7 +47,15 @@ fn home(name: &str) -> PathBuf {
     home
 }
 
+/// Starts a node on `home` with `routing`, its gate inside the hermetic
+/// one. `None` is `routing: None` itself, which can't take a gate: its
+/// home's `config.json` routes every dial through a proxy at loopback, so it
+/// resolves no name and reaches nothing off this host.
 fn start(home: &Path, routing: Option<Routing>) -> Embedded {
+    let routing = routing.map(|routing| Routing {
+        gate: common::hermetic::wrapping(routing.gate),
+        ..routing
+    });
     Embedded::start_with_key(
         Options {
             home: home.to_str().expect("utf-8 temp dir").into(),
@@ -228,7 +238,9 @@ fn greeting_proxy() -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<u8>>) 
 fn a_node_through_a_proxy_isolates_each_peer_s_streams() {
     let home = home("radroutingisolation");
     let (proxy, greeting) = greeting_proxy();
-    let gate = Arc::new(Answering(([198, 51, 100, 7], 8776).into()));
+    // A loopback answer: the node only names it to the proxy, which is
+    // loopback too, and the hermetic gate admits nothing else.
+    let gate = Arc::new(Answering(([127, 0, 0, 7], 8776).into()));
     assert!(!radicle::node::dial::Gate::isolates_streams(&*gate));
     let node = start(
         &home,

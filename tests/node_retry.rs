@@ -3,6 +3,8 @@
 //! leaves no thread behind. These tests have a binary of their own, so that
 //! they can count the node threads in the process.
 
+mod common;
+
 use std::time::{Duration, Instant};
 
 use libradicle::{Embedded, Error, HostKey, Options};
@@ -51,7 +53,7 @@ fn start_with(home: &str, control_socket: bool) -> Embedded {
             alias: "health".into(),
             listen: vec![],
             control_socket,
-            routing: None,
+            routing: Some(common::routing()),
             isolated: false,
             repositories: None,
         },
