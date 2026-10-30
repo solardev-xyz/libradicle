@@ -1994,6 +1994,54 @@ impl Embedded {
 /// returns, as the system's resolver does within its own timeouts.
 pub const HOME_RELEASE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The deadline of [`shutdown_slot`] for a host that passes none: its
+/// stop, its thread's join and its home's release, all together.
+pub const SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What [`shutdown_slot`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Slot {
+    /// The node stopped, and let go of its home: the slot is empty.
+    Stopped,
+    /// The slot was empty: no node was started.
+    Empty,
+}
+
+/// Shuts down the node a binding keeps in `slot`, within `timeout` for all
+/// of it: its stop, its thread's join and its home's release
+/// ([`Embedded::shutdown_within`]).
+///
+/// - **Stopped,** and its home let go of: the node is taken out of the slot,
+///   [`Slot::Stopped`].
+/// - **Past the deadline:** [`Error::ShutdownTimeout`]. The node stays in the
+///   slot, asked to stop, so that another call waits again. A host retries
+///   until it is stopped before it starts a node on the home again, which
+///   is `HomeLocked` until then.
+/// - **Any other error is final:** the node is taken out, and the error
+///   returned.
+///
+/// A host passes a `timeout` below its own watchdog's, so that the call
+/// returns before the watchdog fires.
+pub fn shutdown_slot(
+    slot: &mut Option<Embedded>,
+    timeout: std::time::Duration,
+) -> Result<Slot, Error> {
+    let Some(node) = slot.as_mut() else {
+        return Ok(Slot::Empty);
+    };
+    match node.shutdown_within(timeout) {
+        Ok(()) => {
+            slot.take();
+            Ok(Slot::Stopped)
+        }
+        Err(e @ Error::ShutdownTimeout(_)) => Err(e),
+        Err(e) => {
+            slot.take();
+            Err(e)
+        }
+    }
+}
+
 /// How long dropping an [`Embedded`] waits for a node that still runs.
 pub const DROP_SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
