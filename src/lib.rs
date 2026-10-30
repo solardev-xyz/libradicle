@@ -1801,10 +1801,11 @@ impl Embedded {
     ///   [`objects::Tips`]: each delegate's tip is looked up once, sized and
     ///   charged, and only those pinned tips are used.
     ///
-    /// Tips that disagree would need a merge-base walk, unbounded and
-    /// uncancellable, so the read is refused with [`Error::NoCanonicalHead`]
-    /// instead: such a repository can't be browsed through a bounded read
-    /// until its `HEAD` is fixed or its delegates agree.
+    /// Tips that disagree in any way are refused with
+    /// [`Error::NoCanonicalHead`]: different commits would need a merge-base
+    /// walk, unbounded and uncancellable, and tags or a commit and a tag
+    /// are refused alike. Such a repository can't be browsed through a
+    /// bounded read until its `HEAD` is fixed or its delegates agree.
     ///
     /// Unbounded (`read` counts nothing), it is heartwood's `head()`.
     fn head_bounded(

@@ -418,9 +418,10 @@ mod sigrefs_reader {
 /// - `find_objects` looks each delegate's ref up once, sizes and charges
 ///   its target on the read's meter, and answers those pinned `(DID, OID,
 ///   type)` tips. Nothing looks the refs up again.
-/// - Tips that agree are their own merge base. A merge base of two
-///   different tips would mean an unbounded, uncancellable libgit2 walk: it
-///   isn't computed. The read is refused instead ([`Tips::diverged`]).
+/// - Tips that agree are their own merge base. Tips that differ in any
+///   way (commits, tags, or a commit and a tag) are refused as soon as they
+///   are pinned ([`Tips::diverged`]): different commits would need a merge
+///   base, an unbounded, uncancellable libgit2 walk, which isn't computed.
 pub(crate) struct Tips<'a, 'r, 'b> {
     repo: &'a radicle::storage::git::Repository,
     objects: &'a Objects<'r>,
@@ -449,7 +450,8 @@ impl<'a, 'r, 'b> Tips<'a, 'r, 'b> {
         self.refused.borrow_mut().take()
     }
 
-    /// Whether the tips diverged, so that a merge base was asked for.
+    /// Whether the pinned tips disagreed (any two different OIDs, of
+    /// either type), so the resolution was refused.
     pub(crate) fn diverged(&self) -> bool {
         self.diverged.get()
     }
@@ -468,13 +470,14 @@ mod canonical_tips {
 
     use super::{Refused, Tips};
 
-    /// What heartwood's merge-base caller sees: the read is refused.
+    /// What heartwood's canonical computation sees for disagreeing tips: the
+    /// read is refused.
     #[derive(Debug)]
     struct Diverged;
 
     impl std::fmt::Display for Diverged {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("divergent tips need a merge base, which a bounded read doesn't compute")
+            f.write_str("the pinned tips disagree, which a bounded read doesn't resolve")
         }
     }
 
@@ -538,6 +541,15 @@ mod canonical_tips {
                 };
                 objects.insert(*did, object);
             }
+            // Any disagreement among the pinned tips is refused here, before
+            // the quorum: commits would need a merge base, and tags or a
+            // mix of commit and tag would fail heartwood's quorum with no
+            // walk, but under its own error.
+            let distinct: BTreeSet<Oid> = objects.values().map(Object::id).collect();
+            if distinct.len() > 1 {
+                self.diverged.set(true);
+                return Err(FindObjectsError::other(Diverged));
+            }
             Ok(FoundObjects {
                 objects,
                 missing_refs,
@@ -549,7 +561,9 @@ mod canonical_tips {
     impl FindMergeBase for Tips<'_, '_, '_> {
         fn merge_base(&self, a: Oid, b: Oid) -> Result<MergeBase, MergeBaseError> {
             // Heartwood pairs every vote, agreeing ones too. A commit is its
-            // own merge base, which needs no walk.
+            // own merge base, which needs no walk. `find_objects` has
+            // already refused tips that differ; should two ever reach here,
+            // they are refused too.
             if a == b {
                 return Ok(MergeBase { a, b, base: a });
             }

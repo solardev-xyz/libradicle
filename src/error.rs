@@ -62,8 +62,9 @@ pub enum Error {
     #[error("{0} has no canonical identity head to size its identity document from")]
     NoIdentityHead(RepoId),
     /// A bounded read of a repository with no usable local `HEAD` whose
-    /// delegates' default branches disagree: finding its canonical head
-    /// would need a merge-base walk, which a bounded read doesn't make.
+    /// delegates' default branches point at different objects (commits,
+    /// tags, or a mix): for commits, finding its canonical head would need a
+    /// merge-base walk, which a bounded read doesn't make.
     #[error("{0} has no usable local HEAD, and its delegates' default branches disagree: its canonical head can't be found within a bounded read")]
     NoCanonicalHead(RepoId),
     #[error(transparent)]

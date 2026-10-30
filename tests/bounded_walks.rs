@@ -1633,43 +1633,10 @@ fn a_dangling_head_with_a_huge_identity_is_refused_before_it_is_loaded() {
     print_growth(grew, control);
 }
 
-/// LR15 round 5, 2: a dangling HEAD, an identity of three delegates at a
-/// threshold of two, the third's branch absent, and the other two on
-/// separate 20,000-commit histories with 1 KiB messages (the reviewer's
-/// reproduction). heartwood would walk them for a merge base, unbounded and
-/// uncancellable; a bounded read refuses at once with NoCanonicalHead. In a
-/// child, for its time and peak memory, against heartwood's own resolution
-/// as the control.
-#[test]
-fn divergent_delegates_are_refused_without_a_merge_base_walk() {
-    const NAME: &str = "divergent_delegates_are_refused_without_a_merge_base_walk";
-    if !is_child(NAME) {
-        let out = in_child(NAME);
-        assert!(out.contains("bounded: NoCanonicalHead"), "{out}");
-        let millis: u128 = out
-            .lines()
-            .find_map(|l| l.strip_prefix("bounded took ms: "))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(millis < 2_000, "the refusal took {millis} ms");
-        if cfg!(target_os = "linux") {
-            let (grew, control) = growths(&out);
-            assert!(grew < 4 * MIB, "the refusal grew the peak by {grew} bytes");
-            assert!(
-                control >= 16 * MIB,
-                "the walk stayed within the binding's budget: {control} bytes"
-            );
-        }
-        return;
-    }
-    let f = fixture("raddiverged");
-    let stored = storage(&f).repository(f.rid).unwrap();
-    let git = &stored.backend;
-    let nid = f.node.identity().nid;
+/// Makes the identity at `refs/rad/id` the node and two more delegates, two
+/// of three needed, and returns the two others' keys. Neither has a branch.
+fn two_of_three(git: &git2::Repository, nid: &str) -> [radicle::crypto::PublicKey; 2] {
     let others = [1u8, 2u8].map(|seed| radicle::crypto::PublicKey::from_bytes([seed; 32]));
-
-    // The identity: the node and two more delegates, two of three needed.
     let id = git.refname_to_id("refs/rad/id").unwrap();
     let commit = git.find_commit(id).unwrap();
     let doc_entry = commit
@@ -1707,15 +1674,54 @@ fn divergent_delegates_are_refused_without_a_merge_base_walk() {
         )
         .unwrap();
     git.reference("refs/rad/id", id, true, "test").unwrap();
-    drop((root, commit));
+    others
+}
 
-    // Two divergent histories of the default branch, 10,000 commits each.
+/// LR15 round 5, 2: a dangling HEAD, an identity of three delegates at a
+/// threshold of two, the third's branch absent, and the other two on
+/// separate 20,000-commit histories with 1 KiB messages (the reviewer's
+/// reproduction). heartwood would walk them for a merge base, unbounded and
+/// uncancellable; a bounded read refuses at once with NoCanonicalHead. In a
+/// child, for its time and peak memory, against heartwood's own resolution
+/// as the control.
+#[test]
+fn divergent_delegates_are_refused_without_a_merge_base_walk() {
+    const NAME: &str = "divergent_delegates_are_refused_without_a_merge_base_walk";
+    if !is_child(NAME) {
+        let out = in_child(NAME);
+        assert!(out.contains("bounded: NoCanonicalHead"), "{out}");
+        let millis: u128 = out
+            .lines()
+            .find_map(|l| l.strip_prefix("bounded took ms: "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(millis < 2_000, "the refusal took {millis} ms");
+        if cfg!(target_os = "linux") {
+            let (grew, control) = growths(&out);
+            assert!(grew < 4 * MIB, "the refusal grew the peak by {grew} bytes");
+            assert!(
+                control >= 16 * MIB,
+                "the walk stayed within the binding's budget: {control} bytes"
+            );
+        }
+        return;
+    }
+    let f = fixture("raddiverged");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let nid = f.node.identity().nid;
+    let others = two_of_three(git, &nid);
+
+    // Two divergent histories of the default branch, 20,000 commits each.
     let base = git
         .find_reference("refs/heads/main")
         .unwrap()
         .peel_to_commit()
         .unwrap();
     let tree = base.tree().unwrap();
+    let signature =
+        git2::Signature::new("Test", "test@example.com", &git2::Time::new(1, 0)).unwrap();
     let message = "d".repeat(1024);
     for (i, key) in [
         nid.parse::<radicle::crypto::PublicKey>().unwrap(),
@@ -1773,44 +1779,7 @@ fn agreeing_delegates_give_heartwoods_canonical_head() {
     let stored = storage(&f).repository(f.rid).unwrap();
     let git = &stored.backend;
     let nid = f.node.identity().nid;
-    let others = [1u8, 2u8].map(|seed| radicle::crypto::PublicKey::from_bytes([seed; 32]));
-    let id = git.refname_to_id("refs/rad/id").unwrap();
-    let commit = git.find_commit(id).unwrap();
-    let doc_entry = commit
-        .tree()
-        .unwrap()
-        .get_path(std::path::Path::new("embeds/radicle.json"))
-        .unwrap();
-    let mut doc: serde_json::Value =
-        serde_json::from_slice(git.find_blob(doc_entry.id()).unwrap().content()).unwrap();
-    let mut delegates = vec![format!("did:key:{nid}")];
-    delegates.extend(
-        others
-            .iter()
-            .map(|key| radicle::identity::Did::from(*key).to_string()),
-    );
-    doc["delegates"] = serde_json::json!(delegates);
-    doc["threshold"] = serde_json::json!(2);
-    let blob = git.blob(&serde_json::to_vec(&doc).unwrap()).unwrap();
-    let mut embeds = git.treebuilder(None).unwrap();
-    embeds.insert("radicle.json", blob, 0o100644).unwrap();
-    let embeds = embeds.write().unwrap();
-    let mut root = git.treebuilder(None).unwrap();
-    root.insert("embeds", embeds, 0o040000).unwrap();
-    let root = git.find_tree(root.write().unwrap()).unwrap();
-    let signature =
-        git2::Signature::new("Test", "test@example.com", &git2::Time::new(1, 0)).unwrap();
-    let id = git
-        .commit(
-            None,
-            &signature,
-            &signature,
-            "three delegates",
-            &root,
-            &[&commit],
-        )
-        .unwrap();
-    git.reference("refs/rad/id", id, true, "test").unwrap();
+    let others = two_of_three(git, &nid);
     let tip = git
         .refname_to_id(&format!("refs/namespaces/{nid}/refs/heads/main"))
         .unwrap();
@@ -1829,4 +1798,71 @@ fn agreeing_delegates_give_heartwoods_canonical_head() {
         .unwrap();
     assert_eq!(bounded.head, tip.to_string());
     assert_eq!(bounded.head, f.node.repo_info(f.rid).unwrap().head);
+}
+
+/// The two present delegates of [`two_of_three`] with their default branch
+/// pointed straight at `tips`, and a dangling local HEAD.
+fn with_tips(git: &git2::Repository, nid: &str, tips: [git2::Oid; 2]) {
+    let others = two_of_three(git, nid);
+    let keys = [
+        nid.parse::<radicle::crypto::PublicKey>().unwrap(),
+        others[0],
+    ];
+    for (key, tip) in keys.iter().zip(tips) {
+        git.reference(
+            &format!("refs/namespaces/{key}/refs/heads/main"),
+            tip,
+            true,
+            "test",
+        )
+        .unwrap();
+    }
+    git.set_head("refs/heads/does-not-exist").unwrap();
+}
+
+/// An annotated tag of `target`, named and messaged `name`.
+fn annotated(git: &git2::Repository, target: git2::Oid, name: &str) -> git2::Oid {
+    let signature =
+        git2::Signature::new("Test", "test@example.com", &git2::Time::new(1, 0)).unwrap();
+    let object = git.find_object(target, None).unwrap();
+    git.tag(name, &object, &signature, name, false).unwrap()
+}
+
+/// LR15 round 6: two delegates' default branches on two different annotated
+/// tags. heartwood's tag quorum needs no merge base, and would answer
+/// `Quorum(NoCandidates)`; the bounded read refuses the disagreement as it
+/// does for commits, with NoCanonicalHead.
+#[test]
+fn differing_tag_tips_are_refused_as_disagreement() {
+    let f = fixture("radtagtips");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let nid = f.node.identity().nid;
+    let head = git.refname_to_id("refs/heads/main").unwrap();
+    let tags = [annotated(git, head, "one"), annotated(git, head, "two")];
+    assert_ne!(tags[0], tags[1]);
+    with_tips(git, &nid, tags);
+
+    match f.node.repo_info_bounded(f.rid, &Bounds::for_binding()) {
+        Err(Error::NoCanonicalHead(rid)) => assert_eq!(rid, f.rid),
+        other => panic!("expected NoCanonicalHead, got {other:?}"),
+    }
+}
+
+/// LR15 round 6: one delegate's default branch on a commit, the other's on
+/// an annotated tag of it. Different OIDs of different types, so the bounded
+/// read refuses with NoCanonicalHead, not heartwood's quorum error.
+#[test]
+fn a_commit_and_a_tag_tip_are_refused_as_disagreement() {
+    let f = fixture("radmixedtips");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let nid = f.node.identity().nid;
+    let head = git.refname_to_id("refs/heads/main").unwrap();
+    with_tips(git, &nid, [head, annotated(git, head, "one")]);
+
+    match f.node.repo_info_bounded(f.rid, &Bounds::for_binding()) {
+        Err(Error::NoCanonicalHead(rid)) => assert_eq!(rid, f.rid),
+        other => panic!("expected NoCanonicalHead, got {other:?}"),
+    }
 }
