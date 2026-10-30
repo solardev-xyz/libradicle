@@ -13,6 +13,7 @@ use std::io;
 
 use radicle::cob;
 use radicle::identity::RepoId;
+use serde::ser::{SerializeMap as _, Serializer};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -26,6 +27,45 @@ pub type Written = serde_json::Result<()>;
 
 fn put(w: &mut impl io::Write, value: &Value) -> Written {
     serde_json::to_writer(w, value)
+}
+
+// The repository-controlled results (trees, COBs, remotes, repositories)
+// are written field by field as they are serialized, never built as a
+// `Value` first: a bounded read counts them through `meter::Count`, and a
+// copy of the whole result would be the very allocation the budget is
+// there to prevent (review of libradicle #15). The keys and their order
+// are the `json!` shapes these replaced, byte for byte.
+
+/// A value written through its `Display`, with no `String` built.
+struct Shown<T>(T);
+
+impl<T: Display> Serialize for Shown<T> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(&self.0)
+    }
+}
+
+/// An array of what the iterator `F` makes, each written as it comes.
+struct Seq<F>(F);
+
+impl<F, I> Serialize for Seq<F>
+where
+    F: Fn() -> I,
+    I: Iterator,
+    I::Item: Serialize,
+{
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq((self.0)())
+    }
+}
+
+/// An object of its entries, written in order.
+macro_rules! object {
+    ($s:expr, { $($key:literal : $value:expr),* $(,)? }) => {{
+        let mut map = $s.serialize_map(None)?;
+        $(map.serialize_entry($key, &$value)?;)*
+        map.end()
+    }};
 }
 
 /// One result, collected into a `String`. A write that fails is written as
@@ -140,140 +180,186 @@ pub fn identity(w: &mut impl io::Write, identity: &Identity) -> Written {
     )
 }
 
-fn repo_value(repo: &RepoInfo) -> Value {
-    json!({
-        "rid": repo.rid.to_string(),
-        "name": repo.name,
-        "description": repo.description,
-    })
+/// `{"rid","name","description"}`: a listed repository, or a seeded one.
+struct RepoJson<'a> {
+    rid: &'a RepoId,
+    name: Option<&'a str>,
+    description: Option<&'a str>,
+}
+
+impl Serialize for RepoJson<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        object!(s, {
+            "rid": Shown(self.rid),
+            "name": self.name,
+            "description": self.description,
+        })
+    }
+}
+
+impl<'a> From<&'a RepoInfo> for RepoJson<'a> {
+    fn from(repo: &'a RepoInfo) -> Self {
+        Self {
+            rid: &repo.rid,
+            name: Some(&repo.name),
+            description: Some(&repo.description),
+        }
+    }
+}
+
+impl<'a> From<&'a SeededRepoInfo> for RepoJson<'a> {
+    fn from(repo: &'a SeededRepoInfo) -> Self {
+        Self {
+            rid: &repo.rid,
+            name: repo.name.as_deref(),
+            description: repo.description.as_deref(),
+        }
+    }
 }
 
 /// The repositories in local storage.
 pub fn repos(w: &mut impl io::Write, repos: &[RepoInfo]) -> Written {
-    put(w, &json!(repos.iter().map(repo_value).collect::<Vec<_>>()))
+    serde_json::to_writer(w, &Seq(|| repos.iter().map(RepoJson::from)))
 }
 
 /// One repository, as an item of [`repos`].
 pub fn repo(w: &mut impl io::Write, repo: &RepoInfo) -> Written {
-    put(w, &repo_value(repo))
+    serde_json::to_writer(w, &RepoJson::from(repo))
 }
 
 /// The repositories with an explicit allow-seeding policy.
 pub fn seeded_repos(w: &mut impl io::Write, repos: &[SeededRepoInfo]) -> Written {
-    put(
-        w,
-        &json!(repos
-            .iter()
-            .map(|repo| json!({
-                "rid": repo.rid.to_string(),
-                "name": repo.name,
-                "description": repo.description,
-            }))
-            .collect::<Vec<_>>()),
-    )
+    serde_json::to_writer(w, &Seq(|| repos.iter().map(RepoJson::from)))
 }
 
-fn comment<L>(id: &cob::EntryId, comment: &cob::thread::Comment<L>) -> Value {
-    json!({
-        "id": id.to_string(),
-        "author": cob::common::Author::new(comment.author()),
-        "body": comment.body(),
-        "timestamp": comment.timestamp(),
-        "replyTo": comment.reply_to().map(|id| id.to_string()),
-    })
+/// One seeded repository, as an item of [`seeded_repos`].
+pub fn seeded_repo(w: &mut impl io::Write, repo: &SeededRepoInfo) -> Written {
+    serde_json::to_writer(w, &RepoJson::from(repo))
 }
 
-fn issue_value(id: &cob::ObjectId, issue: &cob::issue::Issue) -> Value {
-    json!({
-        "id": id.to_string(),
-        "author": issue.author(),
-        "title": issue.title(),
-        "state": issue.state(),
-        "labels": issue.labels().map(ToString::to_string).collect::<Vec<_>>(),
-        "assignees": issue.assignees().map(ToString::to_string).collect::<Vec<_>>(),
-        "discussion": issue.comments().map(|(id, c)| comment(id, c)).collect::<Vec<_>>(),
-    })
-}
+/// A thread comment: `{"id","author","body","timestamp","replyTo"}`.
+struct CommentJson<'a, L>(&'a cob::EntryId, &'a cob::thread::Comment<L>);
 
-fn patch_value(id: &cob::ObjectId, patch: &cob::patch::Patch) -> Value {
-    let revisions = patch
-        .revisions()
-        .map(|(id, revision)| {
-            json!({
-                "id": id.to_string(),
-                "author": revision.author(),
-                "description": revision.description(),
-                "base": revision.base().to_string(),
-                "oid": revision.head().to_string(),
-                "timestamp": revision.timestamp(),
-                "discussions": revision.discussion().comments()
-                    .map(|(id, c)| comment(id, c))
-                    .collect::<Vec<_>>(),
-                "reviews": revision.reviews().map(|(_, review)| json!({
-                    "id": review.id().to_string(),
-                    "author": review.author(),
-                    "verdict": review.verdict().map(|verdict| verdict.to_string()),
-                    "summary": review.summary(),
-                    "timestamp": review.timestamp(),
-                })).collect::<Vec<_>>(),
-            })
+impl<L> Serialize for CommentJson<'_, L> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let (id, comment) = (self.0, self.1);
+        object!(s, {
+            "id": Shown(id),
+            "author": cob::common::Author::new(comment.author()),
+            "body": comment.body(),
+            "timestamp": comment.timestamp(),
+            "replyTo": comment.reply_to().map(Shown),
         })
-        .collect::<Vec<_>>();
-    let merges = patch
-        .merges()
-        .map(|(author, merge)| {
-            json!({
-                "author": cob::common::Author::new(author),
-                "revision": merge.revision.to_string(),
-                "commit": merge.commit.to_string(),
-                "timestamp": merge.timestamp,
-            })
-        })
-        .collect::<Vec<_>>();
+    }
+}
 
-    json!({
-        "id": id.to_string(),
-        "author": patch.author(),
-        "title": patch.title(),
-        "state": patch.state(),
-        "target": patch.target(),
-        "labels": patch.labels().map(ToString::to_string).collect::<Vec<_>>(),
-        "assignees": patch.assignees().map(|did| did.to_string()).collect::<Vec<_>>(),
-        "revisions": revisions,
-        "merges": merges,
-    })
+struct IssueJson<'a>(&'a cob::ObjectId, &'a cob::issue::Issue);
+
+impl Serialize for IssueJson<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let (id, issue) = (self.0, self.1);
+        object!(s, {
+            "id": Shown(id),
+            "author": issue.author(),
+            "title": issue.title(),
+            "state": issue.state(),
+            "labels": Seq(|| issue.labels().map(Shown)),
+            "assignees": Seq(|| issue.assignees().map(Shown)),
+            "discussion": Seq(|| issue.comments().map(|(id, c)| CommentJson(id, c))),
+        })
+    }
+}
+
+struct ReviewJson<'a>(&'a cob::patch::Review);
+
+impl Serialize for ReviewJson<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let review = self.0;
+        object!(s, {
+            "id": Shown(review.id()),
+            "author": review.author(),
+            "verdict": review.verdict().map(Shown),
+            "summary": review.summary(),
+            "timestamp": review.timestamp(),
+        })
+    }
+}
+
+struct RevisionJson<'a>(cob::patch::RevisionId, &'a cob::patch::Revision);
+
+impl Serialize for RevisionJson<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let (id, revision) = (self.0, self.1);
+        object!(s, {
+            "id": Shown(id),
+            "author": revision.author(),
+            "description": revision.description(),
+            "base": Shown(revision.base()),
+            "oid": Shown(revision.head()),
+            "timestamp": revision.timestamp(),
+            "discussions": Seq(|| revision.discussion().comments().map(|(id, c)| CommentJson(id, c))),
+            "reviews": Seq(|| revision.reviews().map(|(_, review)| ReviewJson(review))),
+        })
+    }
+}
+
+struct MergeJson<'a>(&'a cob::ActorId, &'a cob::patch::Merge);
+
+impl Serialize for MergeJson<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let (author, merge) = (self.0, self.1);
+        object!(s, {
+            "author": cob::common::Author::new(author),
+            "revision": Shown(merge.revision),
+            "commit": Shown(merge.commit),
+            "timestamp": merge.timestamp,
+        })
+    }
+}
+
+struct PatchJson<'a>(&'a cob::ObjectId, &'a cob::patch::Patch);
+
+impl Serialize for PatchJson<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let (id, patch) = (self.0, self.1);
+        object!(s, {
+            "id": Shown(id),
+            "author": patch.author(),
+            "title": patch.title(),
+            "state": patch.state(),
+            "target": patch.target(),
+            "labels": Seq(|| patch.labels().map(Shown)),
+            "assignees": Seq(|| patch.assignees().map(Shown)),
+            "revisions": Seq(|| patch.revisions().map(|(id, revision)| RevisionJson(id, revision))),
+            "merges": Seq(|| patch.merges().map(|(author, merge)| MergeJson(author, merge))),
+        })
+    }
 }
 
 /// All issues of a repository, radicle-httpd-shaped.
 pub fn issues(w: &mut impl io::Write, issues: &[(cob::ObjectId, cob::issue::Issue)]) -> Written {
-    put(
+    serde_json::to_writer(
         w,
-        &json!(issues
-            .iter()
-            .map(|(id, issue)| issue_value(id, issue))
-            .collect::<Vec<_>>()),
+        &Seq(|| issues.iter().map(|(id, issue)| IssueJson(id, issue))),
     )
 }
 
 /// One issue, radicle-httpd-shaped.
 pub fn issue(w: &mut impl io::Write, id: &cob::ObjectId, issue: &cob::issue::Issue) -> Written {
-    put(w, &issue_value(id, issue))
+    serde_json::to_writer(w, &IssueJson(id, issue))
 }
 
 /// All patches of a repository, radicle-httpd-shaped.
 pub fn patches(w: &mut impl io::Write, patches: &[(cob::ObjectId, cob::patch::Patch)]) -> Written {
-    put(
+    serde_json::to_writer(
         w,
-        &json!(patches
-            .iter()
-            .map(|(id, patch)| patch_value(id, patch))
-            .collect::<Vec<_>>()),
+        &Seq(|| patches.iter().map(|(id, patch)| PatchJson(id, patch))),
     )
 }
 
 /// One patch, radicle-httpd-shaped.
 pub fn patch(w: &mut impl io::Write, id: &cob::ObjectId, patch: &cob::patch::Patch) -> Written {
-    put(w, &patch_value(id, patch))
+    serde_json::to_writer(w, &PatchJson(id, patch))
 }
 
 /// `{"id": <id>}`: what a COB write made.
@@ -328,50 +414,78 @@ pub fn commit(w: &mut impl io::Write, detail: &CommitDetail) -> Written {
 
 /// File paths, as an array.
 pub fn files(w: &mut impl io::Write, files: &[String]) -> Written {
-    put(w, &json!(files))
+    serde_json::to_writer(w, files)
 }
 
-fn entries(entries: &[TreeEntry]) -> Vec<Value> {
-    entries
-        .iter()
-        .map(|e| {
-            json!({
-                "name": e.name,
-                "path": e.path,
-                "kind": e.kind,
-            })
+struct EntryJson<'a>(&'a TreeEntry);
+
+impl Serialize for EntryJson<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let e = self.0;
+        object!(s, {
+            "name": e.name,
+            "path": e.path,
+            "kind": e.kind,
         })
-        .collect()
+    }
+}
+
+/// One tree entry, as an item of [`tree`]'s `entries`.
+pub fn tree_entry(w: &mut impl io::Write, entry: &TreeEntry) -> Written {
+    serde_json::to_writer(w, &EntryJson(entry))
+}
+
+struct SignatureJson<'a>(&'a crate::CommitSignature);
+
+impl Serialize for SignatureJson<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let signature = self.0;
+        object!(s, {
+            "name": signature.name,
+            "email": signature.email,
+            "time": signature.time,
+        })
+    }
+}
+
+struct LastCommitJson<'a>(&'a CommitInfo);
+
+impl Serialize for LastCommitJson<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let commit = self.0;
+        object!(s, {
+            "id": commit.id,
+            "summary": commit.summary,
+            "description": commit.description,
+            "author": SignatureJson(&commit.author),
+            "committer": SignatureJson(&commit.committer),
+        })
+    }
+}
+
+struct TreeJson<'a>(&'a [TreeEntry], Option<&'a CommitInfo>);
+
+impl Serialize for TreeJson<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let entries = Seq(|| self.0.iter().map(EntryJson));
+        match self.1 {
+            None => object!(s, { "entries": entries }),
+            Some(commit) => object!(s, {
+                "entries": entries,
+                "lastCommit": LastCommitJson(commit),
+            }),
+        }
+    }
 }
 
 /// A tree's entries, httpd-shaped: `{"entries":[{"name","path","kind"}]}`.
 pub fn tree(w: &mut impl io::Write, tree: &[TreeEntry]) -> Written {
-    put(w, &json!({ "entries": entries(tree) }))
+    serde_json::to_writer(w, &TreeJson(tree, None))
 }
 
 /// A tree's entries at a revision, with that revision's commit metadata.
 pub fn tree_at(w: &mut impl io::Write, tree: &[TreeEntry], commit: &CommitInfo) -> Written {
-    put(
-        w,
-        &json!({
-            "entries": entries(tree),
-            "lastCommit": {
-                "id": commit.id,
-                "summary": commit.summary,
-                "description": commit.description,
-                "author": {
-                    "name": commit.author.name,
-                    "email": commit.author.email,
-                    "time": commit.author.time,
-                },
-                "committer": {
-                    "name": commit.committer.name,
-                    "email": commit.committer.email,
-                    "time": commit.committer.time,
-                },
-            },
-        }),
-    )
+    serde_json::to_writer(w, &TreeJson(tree, Some(commit)))
 }
 
 /// A blob read at `path`, httpd-shaped: `{"binary":bool,"content":"...",
@@ -399,20 +513,28 @@ pub fn blob(w: &mut impl io::Write, path: &str, blob: &Blob) -> Written {
     }
 }
 
+struct RemoteJson<'a>(&'a RemoteInfo);
+
+impl Serialize for RemoteJson<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let remote = self.0;
+        object!(s, {
+            "id": remote.id,
+            "did": remote.did,
+            "delegate": remote.delegate,
+            "heads": remote.heads,
+        })
+    }
+}
+
 /// Signed remotes and their branch heads.
 pub fn remotes(w: &mut impl io::Write, remotes: &[RemoteInfo]) -> Written {
-    put(
-        w,
-        &json!(remotes
-            .iter()
-            .map(|remote| json!({
-                "id": remote.id,
-                "did": remote.did,
-                "delegate": remote.delegate,
-                "heads": remote.heads,
-            }))
-            .collect::<Vec<_>>()),
-    )
+    serde_json::to_writer(w, &Seq(|| remotes.iter().map(RemoteJson)))
+}
+
+/// One remote, as an item of [`remotes`].
+pub fn remote(w: &mut impl io::Write, remote: &RemoteInfo) -> Written {
+    serde_json::to_writer(w, &RemoteJson(remote))
 }
 
 /// A repository's history statistics.
