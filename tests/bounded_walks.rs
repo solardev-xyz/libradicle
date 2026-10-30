@@ -1532,3 +1532,103 @@ fn a_diffs_trees_and_blobs_share_the_loads_budget() {
         other => println!("larger: unexpected {other:?}"),
     }
 }
+
+// Review of libradicle #15, round 4: with no usable local HEAD, heartwood's
+// `head()` falls back to the canonical head, through an unmetered read of
+// the identity document. The bounded reads resolve it themselves.
+
+/// A dangling local HEAD: the reads that resolve the head find the same
+/// canonical head heartwood does, from the identity they size.
+#[test]
+fn a_dangling_head_resolves_to_the_canonical_head() {
+    let f = fixture("raddangling");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    stored
+        .backend
+        .set_head("refs/heads/does-not-exist")
+        .unwrap();
+    let (node, rid) = (&f.node, f.rid);
+    let b = Bounds::for_binding();
+    assert_eq!(
+        node.list_files_bounded(rid, &b).unwrap(),
+        node.list_files(rid).unwrap()
+    );
+    assert_eq!(
+        node.tree_bounded(rid, "", &b).unwrap().len(),
+        node.tree(rid, "").unwrap().len()
+    );
+    assert_eq!(
+        node.read_blob_capped(rid, "a.txt", libradicle::BINDING_READ_BUDGET)
+            .unwrap()
+            .content,
+        node.read_blob(rid, "a.txt").unwrap().content
+    );
+    assert_eq!(
+        node.repo_info_bounded(rid, &b).unwrap().head,
+        node.repo_info(rid).unwrap().head
+    );
+    assert_eq!(node.list_repos_bounded(&b).unwrap().len(), 1);
+}
+
+/// A dangling local HEAD and a 32 MiB identity document: every read that
+/// resolves the head refuses it from the document's header, instead of
+/// heartwood loading it on the way to the canonical head. In a child.
+#[test]
+fn a_dangling_head_with_a_huge_identity_is_refused_before_it_is_loaded() {
+    const NAME: &str = "a_dangling_head_with_a_huge_identity_is_refused_before_it_is_loaded";
+    if !is_child(NAME) {
+        let out = in_child(NAME);
+        assert!(out.contains("refused: 5 of 5"), "{out}");
+        if cfg!(target_os = "linux") {
+            let (grew, control) = growths(&out);
+            assert!(grew < 12 * MIB, "the reads grew the peak by {grew} bytes");
+            assert!(
+                control >= 24 * MIB,
+                "the measure missed a load: {control} bytes"
+            );
+        }
+        return;
+    }
+    let f = fixture("raddanglinghuge");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let doc = git.blob(&vec![b'z'; 32 * MIB as usize]).unwrap();
+    let mut embeds = git.treebuilder(None).unwrap();
+    embeds.insert("radicle.json", doc, 0o100644).unwrap();
+    let embeds = embeds.write().unwrap();
+    let mut root = git.treebuilder(None).unwrap();
+    root.insert("embeds", embeds, 0o040000).unwrap();
+    let root = git.find_tree(root.write().unwrap()).unwrap();
+    let signature =
+        git2::Signature::new("Test", "test@example.com", &git2::Time::new(1, 0)).unwrap();
+    let id = git
+        .commit(None, &signature, &signature, "huge doc", &root, &[])
+        .unwrap();
+    git.reference("refs/rad/id", id, true, "test").unwrap();
+    git.set_head("refs/heads/does-not-exist").unwrap();
+
+    let (node, rid) = (&f.node, f.rid);
+    let mut refused = 0;
+    let grew = peak_growth(|| {
+        let b = Bounds::for_binding();
+        for result in [
+            node.list_files_bounded(rid, &b).map(|_| ()),
+            node.tree_bounded(rid, "", &b).map(|_| ()),
+            node.read_blob_capped(rid, "a.txt", libradicle::BINDING_READ_BUDGET)
+                .map(|_| ()),
+            node.repo_info_bounded(rid, &b).map(|_| ()),
+            node.list_repos_bounded(&b).map(|_| ()),
+        ] {
+            if matches!(result, Err(Error::TooLarge { .. })) {
+                refused += 1;
+            } else {
+                println!("not refused: {result:?}");
+            }
+        }
+    });
+    println!("refused: {refused} of 5");
+    let control = peak_growth(|| {
+        assert!(git.find_blob(doc).unwrap().content().len() as u64 >= 32 * MIB);
+    });
+    print_growth(grew, control);
+}

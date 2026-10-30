@@ -66,6 +66,25 @@ impl<'r> Objects<'r> {
         self.admit(oid, git2::ObjectType::Blob, read)
     }
 
+    /// The object `oid`, of any kind, sized from its header, checked and
+    /// charged; nothing of it is loaded here. Missing is fine: whoever
+    /// loads it reports that.
+    pub(crate) fn any(&self, oid: git2::Oid, read: &mut Meter) -> Result<(), Error> {
+        read.check()?;
+        let size = match self.odb.read_header(oid) {
+            Ok((size, _)) => size as u64,
+            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if size > self.limit {
+            return Err(Error::TooLarge {
+                size,
+                limit: self.limit,
+            });
+        }
+        read.charge(size)
+    }
+
     /// The commit `oid`, its size checked and charged before it is loaded.
     pub(crate) fn commit(
         &self,

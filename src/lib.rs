@@ -1127,7 +1127,7 @@ impl Embedded {
             let Some(identity) = self.is_listed(rid, &read)? else {
                 continue;
             };
-            let info = self.repo_info_with(rid, identity)?;
+            let info = self.repo_info_with(rid, identity, &mut read.borrow_mut())?;
             meter.item(|w| json::repo(w, &info))?;
             repos.push(info);
         }
@@ -1182,9 +1182,14 @@ impl Embedded {
             log::warn!(target: "libradicle", "Repository {rid} is invalid: looking up doc: {e}");
             return Ok(None);
         }
-        if let Err(e) = repo.head() {
-            log::warn!(target: "libradicle", "Repository {rid} is invalid: looking up head: {e}");
-            return Ok(None);
+        let head = Self::head_bounded(&repo, &objects, &mut read.borrow_mut(), identity);
+        match head {
+            Ok(_) => {}
+            Err(e @ (Error::TooLarge { .. } | Error::Cancelled)) => return Err(e),
+            Err(e) => {
+                log::warn!(target: "libradicle", "Repository {rid} is invalid: looking up head: {e}");
+                return Ok(None);
+            }
         }
         // heartwood's `SignedRefsInfo::new`, private to it, and the sync time
         // it then reads for signed refs that need no migration. Within a
@@ -1610,23 +1615,31 @@ impl Embedded {
         } else {
             None
         };
-        let info = self.repo_info_with(rid, identity)?;
+        let info = self.repo_info_with(rid, identity, &mut read)?;
         Meter::new(bounds).whole(|w| json::repo_info(w, &info))?;
         Ok(info)
     }
 
     /// Read a repository's identity payload + head from local storage.
     pub fn repo_info(&self, rid: RepoId) -> Result<RepoInfo, Error> {
-        self.repo_info_with(rid, None)
+        let unbounded = Bounds::unbounded();
+        self.repo_info_with(rid, None, &mut Meter::new(&unbounded))
     }
 
     /// [`Embedded::repo_info`], its identity document read at `identity`
-    /// when a bounded read sized one there.
-    fn repo_info_with(&self, rid: RepoId, identity: Option<git2::Oid>) -> Result<RepoInfo, Error> {
+    /// when a bounded read sized one there, and its head resolved within
+    /// `read` ([`Embedded::head_bounded`]).
+    fn repo_info_with(
+        &self,
+        rid: RepoId,
+        identity: Option<git2::Oid>,
+        read: &mut Meter,
+    ) -> Result<RepoInfo, Error> {
         let repo = self.profile.storage.repository(rid)?;
+        let objects = Objects::new(&repo.backend, read.bounds().budget)?;
         let doc = Self::identity_doc(&repo, identity)?;
         let proj = doc.project()?;
-        let (_, head) = repo.head()?;
+        let head = Self::head_bounded(&repo, &objects, read, identity)?;
 
         let issues = self.profile.issues(&repo)?;
         let patches = self.profile.patches(&repo)?;
@@ -1672,9 +1685,9 @@ impl Embedded {
         let mut read = Meter::new(&loading);
         let bounded = meter.counts() || read.counts();
         let repo = self.profile.storage.repository(rid)?;
-        let (_, head) = repo.head()?;
         let objects = Objects::new(&repo.backend, bounds.loads)?;
-        let commit = objects.commit(head.into(), &mut read)?;
+        let head = Self::head_bounded(&repo, &objects, &mut read, None)?;
+        let commit = objects.commit(head, &mut read)?;
         let root = objects.tree(commit.tree_id(), &mut read)?;
         drop(commit);
 
@@ -1775,6 +1788,57 @@ impl Embedded {
         let commit = objects.commit(head, read)?;
         Self::embedded_doc_fits(objects, &commit, read)?;
         Ok(head)
+    }
+
+    /// The head heartwood's `ReadRepository::head()` answers, within a loads
+    /// budget (review of libradicle #15, round 4): the local `HEAD` when it
+    /// resolves; otherwise the canonical head of the default branch,
+    /// computed from the identity document at `identity` (sized there by
+    /// [`Embedded::identity_fits`] on `read` unless the caller already did),
+    /// never through `repo.head()` or `identity_doc()`, which would load the
+    /// document again, unmetered. The delegates' tips the quorum reads are
+    /// sized and charged first.
+    ///
+    /// Unbounded (`read` counts nothing), it is heartwood's `head()`.
+    fn head_bounded(
+        repo: &radicle::storage::git::Repository,
+        objects: &Objects,
+        read: &mut Meter,
+        identity: Option<git2::Oid>,
+    ) -> Result<git2::Oid, Error> {
+        if !read.counts() {
+            return Ok(repo.head()?.1.into());
+        }
+        if let Ok(head) = repo.backend.head() {
+            if let Ok((_, oid)) = radicle::git::refs::qualified_from(&head) {
+                return Ok(oid.into());
+            }
+        }
+        let identity = match identity {
+            Some(identity) => identity,
+            None => Self::identity_fits(repo, objects, read)?,
+        };
+        let doc = repo.identity_doc_at(identity.into())?;
+        let branch = doc
+            .default_branch()
+            .map_err(radicle::storage::RepositoryError::from)?
+            .to_owned();
+        for delegate in doc.delegates().iter() {
+            let tip = format!("refs/namespaces/{}/refs/heads/{branch}", delegate.as_key());
+            if let Ok(oid) = repo.backend.refname_to_id(&tip) {
+                objects.any(oid, read)?;
+            }
+        }
+        let quorum = (|| -> Result<_, radicle::storage::RepositoryError> {
+            Ok(doc
+                .canonical_refs()?
+                .rules()
+                .canonical(doc.default_branch()?, repo)
+                .ok_or(radicle::storage::RepositoryError::MissingBranchRule)?
+                .find_objects()?
+                .quorum()?)
+        })()?;
+        Ok(quorum.object.id().into())
     }
 
     /// The identity document: at `pinned`, a head [`Embedded::identity_fits`]
@@ -2210,7 +2274,11 @@ impl Embedded {
         bounds: &Bounds,
     ) -> Result<(Vec<TreeEntry>, CommitInfo), Error> {
         let repo = self.profile.storage.repository(rid)?;
-        let (entries, commit) = Self::entries_at(&repo, parse_revision(revision)?, path, bounds)?;
+        let objects = Objects::new(&repo.backend, bounds.loads)?;
+        let loading = bounds.loading();
+        let mut read = Meter::new(&loading);
+        let (entries, commit) =
+            Self::entries_at(&objects, &mut read, parse_revision(revision)?, path, bounds)?;
         Meter::new(bounds).whole(|w| json::tree_at(w, &entries, &commit))?;
         Ok((entries, commit))
     }
@@ -2230,26 +2298,27 @@ impl Embedded {
         bounds: &Bounds,
     ) -> Result<Vec<TreeEntry>, Error> {
         let repo = self.profile.storage.repository(rid)?;
-        let (_, head) = repo.head()?;
-        let (entries, _) = Self::entries_at(&repo, head.into(), path, bounds)?;
+        let objects = Objects::new(&repo.backend, bounds.loads)?;
+        let loading = bounds.loading();
+        let mut read = Meter::new(&loading);
+        let head = Self::head_bounded(&repo, &objects, &mut read, None)?;
+        let (entries, _) = Self::entries_at(&objects, &mut read, head, path, bounds)?;
         Meter::new(bounds).whole(|w| json::tree(w, &entries))?;
         Ok(entries)
     }
 
     fn entries_at(
-        repo: &radicle::storage::git::Repository,
+        objects: &Objects,
+        read: &mut Meter,
         oid: git2::Oid,
         path: &str,
         bounds: &Bounds,
     ) -> Result<(Vec<TreeEntry>, CommitInfo), Error> {
         let mut meter = Meter::array(bounds)?;
-        let loading = bounds.loading();
-        let mut read = Meter::new(&loading);
-        let objects = Objects::new(&repo.backend, bounds.loads)?;
-        let commit = objects.commit(oid, &mut read)?;
+        let commit = objects.commit(oid, read)?;
         let commit_info = Self::commit_info(&commit);
-        let root = objects.tree(commit.tree_id(), &mut read)?;
-        let tree = objects.tree_at_path(root, path, &mut read)?;
+        let root = objects.tree(commit.tree_id(), read)?;
+        let tree = objects.tree_at_path(root, path, read)?;
         let prefix = if path.is_empty() {
             String::new()
         } else {
@@ -2379,7 +2448,17 @@ impl Embedded {
     /// [`Embedded::read_blob_at_capped`].
     pub fn read_blob_capped(&self, rid: RepoId, path: &str, limit: u64) -> Result<Blob, Error> {
         let repo = self.profile.storage.repository(rid)?;
-        let (_, head) = repo.head()?;
+        // The head within the loads its commit and trees get (see
+        // `read_blob_at_capped`); an uncapped read resolves it as heartwood
+        // does.
+        let loads = if limit == u64::MAX {
+            u64::MAX
+        } else {
+            limit.max(BINDING_READ_BUDGET)
+        };
+        let objects = Objects::new(&repo.backend, loads)?;
+        let loading = Bounds::new(CancelToken::new(), loads);
+        let head = Self::head_bounded(&repo, &objects, &mut Meter::new(&loading), None)?;
         self.read_blob_at_capped(rid, &head.to_string(), path, limit)
     }
 
