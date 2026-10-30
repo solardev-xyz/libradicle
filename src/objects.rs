@@ -495,14 +495,18 @@ mod canonical_tips {
             for did in dids {
                 let name = refname.with_namespace(did.as_key().into());
                 // The one lookup of this ref: its target is what is sized
-                // and answered.
-                let oid = match self.repo.backend.refname_to_id(name.as_str()) {
-                    Ok(oid) => oid,
+                // and answered. As in heartwood, a ref with no direct
+                // target (a symbolic one) is skipped, not followed.
+                let reference = match self.repo.backend.find_reference(name.as_str()) {
+                    Ok(reference) => reference,
                     Err(e) if e.code() == git2::ErrorCode::NotFound => {
                         missing_refs.insert(name.to_owned());
                         continue;
                     }
                     Err(e) => return Err(FindObjectsError::find_reference(name.to_owned(), e)),
+                };
+                let Some(oid) = reference.target() else {
+                    continue;
                 };
                 #[cfg(test)]
                 crate::seams::tip_pinned();
