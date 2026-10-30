@@ -2,7 +2,7 @@
 //! and a hook that cancels a walk's token where a test asks. Test builds
 //! only, and per thread: a test reads what its own calls did.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::thread::LocalKey;
 
 use crate::CancelToken;
@@ -29,6 +29,19 @@ thread_local! {
     pub(crate) static REMOTES: Cell<usize> = const { Cell::new(0) };
     /// The step `repo_stats_bounded` cancels its token at, if any.
     static CANCEL_AT: Cell<Option<Step>> = const { Cell::new(None) };
+    /// What a test runs once a signed-refs read has resolved the head it
+    /// reads at, before it reads there.
+    static RESOLVED: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+}
+
+/// Runs the test's hook, if any, once a signed-refs read has resolved its
+/// head.
+pub(crate) fn resolved() {
+    RESOLVED.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
 }
 
 pub(crate) fn bump(counter: &'static LocalKey<Cell<usize>>) {
@@ -203,5 +216,134 @@ mod tests {
             .unwrap();
         assert_eq!((stats.commits, stats.branches), (1, 1));
         assert_eq!((read(&COMMITS), read(&REMOTES)), (1, 1));
+    }
+
+    /// The bytes this process's peak resident set grew while `run` ran
+    /// (Linux), or `None` elsewhere.
+    fn peak_growth(run: impl FnOnce()) -> Option<u64> {
+        fn status(field: &str) -> u64 {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let line = status.lines().find(|l| l.starts_with(field)).unwrap();
+            line.split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                * 1024
+        }
+        if !cfg!(target_os = "linux") {
+            run();
+            return None;
+        }
+        std::fs::write("/proc/self/clear_refs", "5").unwrap();
+        let before = status("VmRSS:");
+        run();
+        Some(status("VmHWM:").saturating_sub(before))
+    }
+
+    // Review of libradicle #15, round 3: a signed-refs read is pinned to the
+    // head it resolved. A fetch moving the ref in between (here, the moment
+    // after it is resolved) to a commit with a 20 MiB `refs` blob changes
+    // only the next read. In a child, for its peak memory.
+    #[test]
+    fn a_signed_refs_read_is_pinned_to_the_head_it_resolved() {
+        const NAME: &str = "seams::tests::a_signed_refs_read_is_pinned_to_the_head_it_resolved";
+        if std::env::var("LIBRADICLE_CHILD").as_deref() != Ok(NAME) {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+                .env("LIBRADICLE_CHILD", NAME)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "the child died: {:?}\n{stdout}",
+                out.status
+            );
+            assert!(
+                stdout.contains("pinned: 1 remote, moved 1 time"),
+                "{stdout}"
+            );
+            assert!(stdout.contains("next: TooLarge"), "{stdout}");
+            if cfg!(target_os = "linux") {
+                let read = |prefix: &str| -> u64 {
+                    stdout
+                        .lines()
+                        .find_map(|l| l.strip_prefix(prefix))
+                        .unwrap_or_else(|| panic!("no {prefix:?} in {stdout}"))
+                        .parse()
+                        .unwrap()
+                };
+                let (grew, control) = (read("peak growth: "), read("control growth: "));
+                assert!(
+                    grew < 8 * 1024 * 1024,
+                    "the read grew the peak by {grew} bytes"
+                );
+                assert!(
+                    control >= 16 * 1024 * 1024,
+                    "the measure missed a load: {control}"
+                );
+            }
+            return;
+        }
+        let f = fixture("rspinned", 1);
+        let (rid, _) = f.repos[0];
+        let nid = f.node.identity().nid;
+        let sigrefs = format!("refs/namespaces/{nid}/refs/rad/sigrefs");
+        let stored =
+            radicle::storage::ReadStorage::repository(&f.node.profile.storage, rid).unwrap();
+        let git = &stored.backend;
+        let tip = git
+            .find_reference(&sigrefs)
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        let huge = git.blob(&vec![b'x'; 20 * 1024 * 1024]).unwrap();
+        let replacement = {
+            let mut tree = git.treebuilder(Some(&tip.tree().unwrap())).unwrap();
+            tree.insert("refs", huge, 0o100644).unwrap();
+            let tree = git.find_tree(tree.write().unwrap()).unwrap();
+            let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+            git.commit(None, &signature, &signature, "replacement", &tree, &[&tip])
+                .unwrap()
+        };
+        let moved = std::rc::Rc::new(Cell::new(0));
+        let path = git.path().to_owned();
+        let name = sigrefs.clone();
+        let counter = moved.clone();
+        RESOLVED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if counter.get() == 0 {
+                    let repo = git2::Repository::open_bare(&path).unwrap();
+                    repo.reference(&name, replacement, true, "a fetch").unwrap();
+                }
+                counter.set(counter.get() + 1);
+            }));
+        });
+        let mut result = None;
+        let grew = peak_growth(|| {
+            result = Some(f.node.remotes_bounded(rid, &Bounds::for_binding()));
+        });
+        RESOLVED.with(|hook| *hook.borrow_mut() = None);
+        match result.unwrap() {
+            Ok(remotes) => println!(
+                "pinned: {} remote, moved {} time",
+                remotes.len(),
+                moved.get()
+            ),
+            Err(e) => println!("pinned: unexpected {e:?}"),
+        }
+        // The next read resolves the moved ref, and refuses the replacement.
+        match f.node.remotes_bounded(rid, &Bounds::for_binding()) {
+            Err(e @ Error::TooLarge { .. }) => println!("next: {e:?}"),
+            other => println!("next: unexpected {other:?}"),
+        }
+        let control = peak_growth(|| {
+            assert!(git.find_blob(huge).unwrap().content().len() >= 20 * 1024 * 1024);
+        });
+        if let (Some(grew), Some(control)) = (grew, control) {
+            println!("peak growth: {grew}");
+            println!("control growth: {control}");
+        }
     }
 }

@@ -8,6 +8,7 @@
 //! This is the shared core for the Freedom Browser desktop (napi-rs)
 //! and iOS (UniFFI) bindings.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1070,7 +1071,7 @@ impl Embedded {
 
     fn list_repos_metered(&self, meter: &mut Meter) -> Result<Vec<RepoInfo>, Error> {
         let loading = meter.bounds().loading();
-        let mut read = Meter::new(&loading);
+        let read = RefCell::new(Meter::new(&loading));
         let policies = self.profile.policies()?;
         let mut repos = Vec::new();
         let entries = std::fs::read_dir(self.profile.storage.path())?;
@@ -1085,10 +1086,10 @@ impl Embedded {
                 continue;
             }
             meter.admits(REPO_JSON)?;
-            if !self.is_listed(rid, &mut read)? {
+            let Some(identity) = self.is_listed(rid, &read)? else {
                 continue;
-            }
-            let info = self.repo_info(rid)?;
+            };
+            let info = self.repo_info_with(rid, identity)?;
             meter.item(|w| json::repo(w, &info))?;
             repos.push(info);
         }
@@ -1105,7 +1106,14 @@ impl Embedded {
     /// (review of libradicle #15): the identity document, and the local
     /// signed refs. One with no room is `TooLarge`; one whose identity can't
     /// be sized up front (no `refs/rad/id`) is skipped as invalid.
-    fn is_listed(&self, rid: RepoId, read: &mut Meter) -> Result<bool, Error> {
+    ///
+    /// Listed, it answers the identity head it sized, for the read of the
+    /// repository's details to use (`None` for an unbounded listing).
+    fn is_listed(
+        &self,
+        rid: RepoId,
+        read: &RefCell<Meter>,
+    ) -> Result<Option<Option<git2::Oid>>, Error> {
         use radicle::storage::refs::{sigrefs::read::error::Read, FeatureLevel, SignedRefs};
 
         #[cfg(test)]
@@ -1114,38 +1122,41 @@ impl Embedded {
             Ok(repo) => repo,
             Err(e) => {
                 log::warn!(target: "libradicle", "Repository {rid} is invalid: {e}");
-                return Ok(false);
+                return Ok(None);
             }
         };
         let local = self.profile.storage.info().key;
-        if read.counts() {
-            let objects = Objects::new(&repo.backend, read.bounds().budget)?;
-            match Self::identity_fits(&repo, &objects, read) {
-                Ok(()) => {}
+        let bounded = read.borrow().counts();
+        let objects = Objects::new(&repo.backend, read.borrow().bounds().budget)?;
+        let identity = if bounded {
+            match Self::identity_fits(&repo, &objects, &mut read.borrow_mut()) {
+                Ok(head) => Some(head),
                 Err(e @ (Error::TooLarge { .. } | Error::Cancelled)) => return Err(e),
                 Err(e) => {
                     log::warn!(target: "libradicle", "Repository {rid} is invalid: sizing its doc: {e}");
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
-            match Self::sigrefs_fit(&repo, &local, &objects, read) {
-                Ok(()) => {}
-                Err(e @ (Error::TooLarge { .. } | Error::Cancelled)) => return Err(e),
-                // Unreadable: heartwood's load below reports it.
-                Err(_) => {}
-            }
-        }
-        if let Err(e) = repo.identity_doc() {
+        } else {
+            None
+        };
+        if let Err(e) = Self::identity_doc(&repo, identity) {
             log::warn!(target: "libradicle", "Repository {rid} is invalid: looking up doc: {e}");
-            return Ok(false);
+            return Ok(None);
         }
         if let Err(e) = repo.head() {
             log::warn!(target: "libradicle", "Repository {rid} is invalid: looking up head: {e}");
-            return Ok(false);
+            return Ok(None);
         }
         // heartwood's `SignedRefsInfo::new`, private to it, and the sync time
-        // it then reads for signed refs that need no migration.
-        match SignedRefs::load(local, &repo) {
+        // it then reads for signed refs that need no migration. Within a
+        // loads budget, read through the metered reader, pinned to its head.
+        let loaded = if bounded {
+            Self::signed_refs_at(&repo, &local, &objects, read)?
+        } else {
+            SignedRefs::load(local, &repo)
+        };
+        match loaded {
             Ok(Some(refs))
                 if refs.feature_level() >= FeatureLevel::LATEST && refs.parent().is_some() =>
             {
@@ -1158,7 +1169,7 @@ impl Embedded {
                 return Err(radicle::storage::Error::from(err).into());
             }
         }
-        Ok(true)
+        Ok(Some(identity))
     }
 
     /// List explicit allow-seeding policies, including repositories whose
@@ -1554,20 +1565,28 @@ impl Embedded {
     pub fn repo_info_bounded(&self, rid: RepoId, bounds: &Bounds) -> Result<RepoInfo, Error> {
         let loading = bounds.loading();
         let mut read = Meter::new(&loading);
-        if read.counts() {
+        let identity = if read.counts() {
             let repo = self.profile.storage.repository(rid)?;
             let objects = Objects::new(&repo.backend, bounds.loads)?;
-            Self::identity_fits(&repo, &objects, &mut read)?;
-        }
-        let info = self.repo_info(rid)?;
+            Some(Self::identity_fits(&repo, &objects, &mut read)?)
+        } else {
+            None
+        };
+        let info = self.repo_info_with(rid, identity)?;
         Meter::new(bounds).whole(|w| json::repo_info(w, &info))?;
         Ok(info)
     }
 
     /// Read a repository's identity payload + head from local storage.
     pub fn repo_info(&self, rid: RepoId) -> Result<RepoInfo, Error> {
+        self.repo_info_with(rid, None)
+    }
+
+    /// [`Embedded::repo_info`], its identity document read at `identity`
+    /// when a bounded read sized one there.
+    fn repo_info_with(&self, rid: RepoId, identity: Option<git2::Oid>) -> Result<RepoInfo, Error> {
         let repo = self.profile.storage.repository(rid)?;
-        let doc = repo.identity_doc()?;
+        let doc = Self::identity_doc(&repo, identity)?;
         let proj = doc.project()?;
         let (_, head) = repo.head()?;
 
@@ -1698,11 +1717,16 @@ impl Embedded {
     /// `refs/rad/id`, heartwood would search every remote's identity
     /// history instead, which can't be sized before it is read: refused
     /// with [`Error::NoIdentityHead`].
+    ///
+    /// Returns the head it sized: the caller reads the document there
+    /// (`identity_doc_at`), never through `refs/rad/id` again, so a fetch
+    /// moving the ref meanwhile changes only the next read. Objects are named
+    /// by their content, so the head pins everything under it.
     fn identity_fits(
         repo: &radicle::storage::git::Repository,
         objects: &Objects,
         read: &mut Meter,
-    ) -> Result<(), Error> {
+    ) -> Result<git2::Oid, Error> {
         let head = match repo.backend.refname_to_id("refs/rad/id") {
             Ok(head) => head,
             Err(e) if e.code() == git2::ErrorCode::NotFound => {
@@ -1711,7 +1735,20 @@ impl Embedded {
             Err(e) => return Err(e.into()),
         };
         let commit = objects.commit(head, read)?;
-        Self::embedded_doc_fits(objects, &commit, read)
+        Self::embedded_doc_fits(objects, &commit, read)?;
+        Ok(head)
+    }
+
+    /// The identity document: at `pinned`, a head [`Embedded::identity_fits`]
+    /// sized, or, for an unbounded read, wherever heartwood finds it.
+    fn identity_doc(
+        repo: &radicle::storage::git::Repository,
+        pinned: Option<git2::Oid>,
+    ) -> Result<radicle::identity::DocAt, Error> {
+        Ok(match pinned {
+            Some(head) => repo.identity_doc_at(head.into())?,
+            None => repo.identity_doc()?,
+        })
     }
 
     /// The identity document embedded in `commit`'s tree, at
@@ -1738,92 +1775,66 @@ impl Embedded {
         Ok(())
     }
 
-    /// What heartwood's `SignedRefs::load` will load for `remote`, sized
-    /// first (review of libradicle #15):
-    /// - the blobs of its `rad/sigrefs` commit, `refs` and `signature`,
-    ///   charged;
-    /// - the identity root document those refs name (`refs/rad/root`),
-    ///   which heartwood loads to check it, charged;
-    /// - the earlier sigrefs commits, which heartwood walks when the head
-    ///   is of an older feature level, and their blobs: each within the
-    ///   per-object limit, uncharged, since a current head is read alone.
+    /// `remote`'s signed refs, read by heartwood's own reader at the head
+    /// its `rad/sigrefs` names now, through [`objects::Metered`] (review of
+    /// libradicle #15, round 3): every commit and blob heartwood reads,
+    /// current or old-format history and the identity-root documents named
+    /// along it, is sized and charged to `read` before it is loaded. The
+    /// head is resolved once and the read pinned to it (`load_at`).
     ///
-    /// Absent signed refs are heartwood's to report.
-    fn sigrefs_fit(
+    /// `Ok(Ok(None))` when the remote has no signed refs; `Ok(Err(_))` what
+    /// heartwood's reader answers; `Err(_)` a refusal of the bounds.
+    fn signed_refs_at(
         repo: &radicle::storage::git::Repository,
         remote: &radicle::prelude::PublicKey,
         objects: &Objects,
-        read: &mut Meter,
-    ) -> Result<(), Error> {
+        read: &RefCell<Meter>,
+    ) -> Result<
+        Result<
+            Option<radicle::storage::refs::SignedRefs>,
+            radicle::storage::refs::sigrefs::read::error::Read,
+        >,
+        Error,
+    > {
         let name = format!("refs/namespaces/{remote}/refs/rad/sigrefs");
         let head = match repo.backend.refname_to_id(&name) {
             Ok(head) => head,
-            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(()),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(Ok(None)),
             Err(e) => return Err(e.into()),
         };
-        let commit = objects.commit(head, read)?;
-        let tree = objects.tree(commit.tree_id(), read)?;
-        let mut refs = None;
-        for entry in tree.iter() {
-            if entry.kind() == Some(git2::ObjectType::Blob) {
-                objects.blob(entry.id(), read)?;
-                if entry.name().ok() == Some("refs") {
-                    refs = Some(entry.id());
-                }
-            }
+        #[cfg(test)]
+        seams::resolved();
+        let reader = objects::Metered::new(repo, objects, read);
+        let loaded = radicle::storage::refs::SignedRefs::load_at(head.into(), *remote, &reader);
+        if let Some(refused) = reader.refused() {
+            return Err(refused);
         }
-        if let Some(refs) = refs {
-            // Sized and charged above. Its lines are `<oid> <refname>`.
-            let blob = objects.repo().find_blob(refs)?;
-            let root = blob.content().split(|b| *b == b'\n').find_map(|line| {
-                let line = std::str::from_utf8(line).ok()?;
-                let (oid, name) = line.split_once(' ')?;
-                (name == "refs/rad/root")
-                    .then(|| git2::Oid::from_str(oid).ok())
-                    .flatten()
-            });
-            drop(blob);
-            if let Some(root) = root {
-                match objects.commit(root, read) {
-                    Ok(root) => Self::embedded_doc_fits(objects, &root, read)?,
-                    Err(e @ (Error::TooLarge { .. } | Error::Cancelled)) => return Err(e),
-                    // Not there, or not a commit: heartwood's to report.
-                    Err(_) => {}
-                }
-            }
-        }
-        let per_object = Bounds::new(read.bounds().cancel.clone(), u64::MAX);
-        let mut free = Meter::new(&per_object);
-        let mut next = commit.parent_id(0).ok();
-        while let Some(oid) = next {
-            let commit = objects.commit(oid, &mut free)?;
-            let tree = objects.tree(commit.tree_id(), &mut free)?;
-            for entry in tree.iter() {
-                if entry.kind() == Some(git2::ObjectType::Blob) {
-                    objects.blob(entry.id(), &mut free)?;
-                }
-            }
-            next = commit.parent_id(0).ok();
-        }
-        Ok(())
+        Ok(loaded)
     }
 
-    /// Every signed remote of `repo`, loaded by heartwood one at a time, each
-    /// sized first with [`Embedded::sigrefs_fit`] when `bounds` limits loads.
+    /// Every signed remote of `repo`, loaded one at a time: within a loads
+    /// budget through [`Embedded::signed_refs_at`], otherwise by heartwood's
+    /// `remote()`.
     fn remotes_loaded(
         repo: &radicle::storage::git::Repository,
         objects: &Objects,
-        read: &mut Meter,
+        read: &RefCell<Meter>,
         mut each: impl FnMut(radicle::prelude::PublicKey, radicle::storage::Remote) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let bounded = read.counts();
+        let bounded = read.borrow().counts();
         for id in repo.remote_ids()? {
-            read.check()?;
+            read.borrow().check()?;
             let id = id?;
-            if bounded {
-                Self::sigrefs_fit(repo, &id, objects, read)?;
-            }
-            each(id, repo.remote(&id)?)?;
+            let remote = if bounded {
+                match Self::signed_refs_at(repo, &id, objects, read)? {
+                    Ok(Some(refs)) => radicle::storage::Remote::new(refs),
+                    Ok(None) => return Err(Error::NodeThread(format!("{id} has no signed refs"))),
+                    Err(e) => return Err(radicle::storage::refs::Error::Read(e).into()),
+                }
+            } else {
+                repo.remote(&id)?
+            };
+            each(id, remote)?;
         }
         Ok(())
     }
@@ -1973,7 +1984,10 @@ impl Embedded {
             return Err(over(floor));
         }
         // Every blob the diff will load, sized from its header, all of them
-        // together.
+        // together: within what is left of the JSON budget (their lines are
+        // the result), and charged to the same loads meter as the commits
+        // and trees above, each within the per-object limit (review of
+        // libradicle #15, round 3).
         let odb = repo.odb()?;
         let mut loaded = 0u64;
         for delta in diff.deltas() {
@@ -1983,7 +1997,15 @@ impl Embedded {
                     continue;
                 }
                 let (size, _) = odb.read_header(file.id())?;
-                loaded = loaded.saturating_add(size as u64);
+                let size = size as u64;
+                if size > meter.bounds().loads {
+                    return Err(Error::TooLarge {
+                        size,
+                        limit: meter.bounds().loads,
+                    });
+                }
+                read_all.charge(size)?;
+                loaded = loaded.saturating_add(size);
                 if loaded > left {
                     return Err(over(loaded));
                 }
@@ -2333,15 +2355,21 @@ impl Embedded {
     pub fn remotes_bounded(&self, rid: RepoId, bounds: &Bounds) -> Result<Vec<RemoteInfo>, Error> {
         let mut meter = Meter::array(bounds)?;
         let loading = bounds.loading();
-        let mut read = Meter::new(&loading);
+        let read = RefCell::new(Meter::new(&loading));
         let repo = self.profile.storage.repository(rid)?;
         let objects = Objects::new(&repo.backend, bounds.loads)?;
-        if read.counts() {
-            Self::identity_fits(&repo, &objects, &mut read)?;
-        }
-        let doc = repo.identity_doc()?;
+        let identity = if read.borrow().counts() {
+            Some(Self::identity_fits(
+                &repo,
+                &objects,
+                &mut read.borrow_mut(),
+            )?)
+        } else {
+            None
+        };
+        let doc = Self::identity_doc(&repo, identity)?;
         let mut result = Vec::new();
-        Self::remotes_loaded(&repo, &objects, &mut read, |id, remote| {
+        Self::remotes_loaded(&repo, &objects, &read, |id, remote| {
             meter.check()?;
             let heads = remote
                 .iter()
@@ -2415,12 +2443,15 @@ impl Embedded {
         }
 
         // The branches every signed remote publishes, as `remotes` reads them.
-        if read.counts() {
-            Self::identity_fits(&repo, &objects, &mut read)?;
-        }
-        repo.identity_doc()?;
+        let identity = if read.counts() {
+            Some(Self::identity_fits(&repo, &objects, &mut read)?)
+        } else {
+            None
+        };
+        Self::identity_doc(&repo, identity)?;
+        let read = RefCell::new(read);
         let mut branches = HashSet::new();
-        Self::remotes_loaded(&repo, &objects, &mut read, |_, remote| {
+        Self::remotes_loaded(&repo, &objects, &read, |_, remote| {
             #[cfg(test)]
             seams::at(seams::Step::Remote, &bounds.cancel);
             meter.check()?;

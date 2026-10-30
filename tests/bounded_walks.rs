@@ -1244,3 +1244,290 @@ fn repo_stats_count_all_of_history_against_the_loads_budget() {
         other => println!("larger: unexpected {other:?}"),
     }
 }
+
+// Review of libradicle #15, round 3: signed refs are read by heartwood's own
+// reader, through a metered object reader, so every object it reads counts.
+
+/// The node's current signed refs, as an old-format record (no
+/// `refs/rad/sigrefs-parent`), signed with its key, in a tree with its
+/// signature: what an older client wrote. heartwood walks the history under
+/// a head of this kind.
+fn old_format_tree(f: &Fixture, git: &git2::Repository) -> git2::Oid {
+    use ed25519_dalek::Signer as _;
+
+    let nid = f.node.identity().nid;
+    let sigrefs = format!("refs/namespaces/{nid}/refs/rad/sigrefs");
+    let tip = git
+        .find_reference(&sigrefs)
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let tree = tip.tree().unwrap();
+    let refs = git.find_blob(tree.get_name("refs").unwrap().id()).unwrap();
+    let old = std::str::from_utf8(refs.content())
+        .unwrap()
+        .lines()
+        .filter(|line| !line.ends_with(" refs/rad/sigrefs-parent"))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    // The fixture's host key: its seed is the node's signing key.
+    let key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+    let signature = key.sign(old.as_bytes()).to_bytes();
+    let mut builder = git.treebuilder(None).unwrap();
+    builder
+        .insert("refs", git.blob(old.as_bytes()).unwrap(), 0o100644)
+        .unwrap();
+    builder
+        .insert("signature", git.blob(&signature).unwrap(), 0o100644)
+        .unwrap();
+    builder.write().unwrap()
+}
+
+fn sigrefs_commit(
+    git: &git2::Repository,
+    tree: git2::Oid,
+    message: &str,
+    parent: Option<git2::Oid>,
+) -> git2::Oid {
+    let signature = git2::Signature::new("radicle", "z6Mk", &git2::Time::new(1, 0)).unwrap();
+    let tree = git.find_tree(tree).unwrap();
+    let parents = parent
+        .map(|p| git.find_commit(p).unwrap())
+        .into_iter()
+        .collect::<Vec<_>>();
+    git.commit(
+        None,
+        &signature,
+        &signature,
+        message,
+        &tree,
+        &parents.iter().collect::<Vec<_>>(),
+    )
+    .unwrap()
+}
+
+fn set_sigrefs(f: &Fixture, git: &git2::Repository, head: git2::Oid) {
+    let nid = f.node.identity().nid;
+    git.reference(
+        &format!("refs/namespaces/{nid}/refs/rad/sigrefs"),
+        head,
+        true,
+        "test",
+    )
+    .unwrap();
+}
+
+/// LR15 round 3, 1: an old-format head whose parent record names, as its
+/// identity root, a commit with a 32 MiB `embeds/radicle.json`. heartwood
+/// reads that document before it verifies the record; the metered reader
+/// refuses it from its header.
+#[test]
+fn an_old_records_identity_root_is_refused_before_it_is_loaded() {
+    const NAME: &str = "an_old_records_identity_root_is_refused_before_it_is_loaded";
+    if !is_child(NAME) {
+        let out = in_child(NAME);
+        assert!(out.contains("valid: true"), "{out}");
+        assert!(out.contains("remotes: TooLarge"), "{out}");
+        if cfg!(target_os = "linux") {
+            let (grew, control) = growths(&out);
+            assert!(grew < 12 * MIB, "the read grew the peak by {grew} bytes");
+            assert!(
+                control >= 24 * MIB,
+                "the measure missed a load: {control} bytes"
+            );
+        }
+        return;
+    }
+    let f = fixture("radoldroot");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let old = old_format_tree(&f, git);
+
+    // The signature is the node's: an old-format root record verifies.
+    let root = sigrefs_commit(git, old, "old root", None);
+    set_sigrefs(&f, git, root);
+    let nid: radicle::prelude::PublicKey = f.node.identity().nid.parse().unwrap();
+    println!(
+        "valid: {}",
+        matches!(
+            radicle::storage::refs::SignedRefs::load(nid, &stored),
+            Ok(Some(_))
+        )
+    );
+
+    // The record under the head names a huge identity root.
+    let doc = git.blob(&vec![b'z'; 32 * MIB as usize]).unwrap();
+    let mut embeds = git.treebuilder(None).unwrap();
+    embeds.insert("radicle.json", doc, 0o100644).unwrap();
+    let embeds = embeds.write().unwrap();
+    let mut identity = git.treebuilder(None).unwrap();
+    identity.insert("embeds", embeds, 0o040000).unwrap();
+    let huge_root = sigrefs_commit(git, identity.write().unwrap(), "huge identity", None);
+    let ancestor_refs = format!("{huge_root} refs/rad/root\n");
+    let mut ancestor = git.treebuilder(None).unwrap();
+    ancestor
+        .insert(
+            "refs",
+            git.blob(ancestor_refs.as_bytes()).unwrap(),
+            0o100644,
+        )
+        .unwrap();
+    ancestor
+        .insert("signature", git.blob(&[0u8; 64]).unwrap(), 0o100644)
+        .unwrap();
+    let ancestor = sigrefs_commit(git, ancestor.write().unwrap(), "ancestor", None);
+    let head = sigrefs_commit(git, old, "old head", Some(ancestor));
+    set_sigrefs(&f, git, head);
+
+    let mut result = None;
+    let grew = peak_growth(|| {
+        result = Some(
+            f.node
+                .remotes_bounded(f.rid, &Bounds::for_binding())
+                .map(|_| ()),
+        );
+    });
+    match result.unwrap() {
+        Err(e @ Error::TooLarge { .. }) => println!("remotes: {e:?}"),
+        other => println!("remotes: unexpected {other:?}"),
+    }
+    let control = peak_growth(|| {
+        assert!(git.find_blob(doc).unwrap().content().len() as u64 >= 32 * MIB);
+    });
+    print_growth(grew, control);
+}
+
+/// LR15 round 3, 1: a valid old-format chain of 600 records, each a commit
+/// with a 28 KiB message (16.8 MB of commits alone, each well under the
+/// per-object limit). heartwood walks all of it, reading each record's
+/// commit for itself and again for its two blobs, and walks it twice when
+/// signatures repeat: every one of those loads counts against the loads
+/// budget, so the binding refuses it, and a budget that holds them all
+/// reads it.
+#[test]
+fn an_old_records_history_counts_against_the_loads_budget() {
+    const NAME: &str = "an_old_records_history_counts_against_the_loads_budget";
+    if !is_child(NAME) {
+        let out = in_child(NAME);
+        assert!(out.contains("valid: true"), "{out}");
+        assert!(out.contains("binding: TooLarge"), "{out}");
+        assert!(out.contains("larger: 1 remote"), "{out}");
+        return;
+    }
+    let f = fixture("radoldchain");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let old = old_format_tree(&f, git);
+    let message = "m".repeat(28 * 1024);
+    let mut head = sigrefs_commit(git, old, &message, None);
+    for _ in 1..600 {
+        head = sigrefs_commit(git, old, &message, Some(head));
+    }
+    set_sigrefs(&f, git, head);
+    let nid: radicle::prelude::PublicKey = f.node.identity().nid.parse().unwrap();
+    println!(
+        "valid: {}",
+        matches!(
+            radicle::storage::refs::SignedRefs::load(nid, &stored),
+            Ok(Some(_))
+        )
+    );
+    match f.node.remotes_bounded(f.rid, &Bounds::for_binding()) {
+        Err(e @ Error::TooLarge { .. }) => println!("binding: {e:?}"),
+        other => println!("binding: unexpected {other:?}"),
+    }
+    let larger = budget(1 << 20).with_loads(512 * MIB);
+    match f.node.remotes_bounded(f.rid, &larger) {
+        Ok(remotes) => println!("larger: {} remote", remotes.len()),
+        other => println!("larger: unexpected {other:?}"),
+    }
+}
+
+/// LR15 round 3, 4: a valid root record whose tree also holds a 20 MiB blob
+/// nobody reads. heartwood reads only `refs` and `signature`, so the bounded
+/// read accepts it, as the unbounded one does.
+#[test]
+fn a_blob_heartwood_never_reads_is_not_charged() {
+    let f = fixture("radunusedblob");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let nid = f.node.identity().nid;
+    let sigrefs = format!("refs/namespaces/{nid}/refs/rad/sigrefs");
+    let mut root = git
+        .find_reference(&sigrefs)
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    while let Ok(parent) = root.parent(0) {
+        root = parent;
+    }
+    let mut tree = git.treebuilder(Some(&root.tree().unwrap())).unwrap();
+    tree.insert(
+        "unused",
+        git.blob(&vec![0u8; 20 * MIB as usize]).unwrap(),
+        0o100644,
+    )
+    .unwrap();
+    let head = sigrefs_commit(git, tree.write().unwrap(), "unused blob", None);
+    set_sigrefs(&f, git, head);
+
+    assert_eq!(f.node.remotes(f.rid).expect("unbounded").len(), 1);
+    assert_eq!(
+        f.node
+            .remotes_bounded(f.rid, &Bounds::for_binding())
+            .expect("bounded")
+            .len(),
+        1
+    );
+}
+
+/// LR15 round 3, 3: a commit adding a subtree of 40,000 empty files (an
+/// 8.3 MB tree) and one 9 MiB binary file: the tree and the blob, 17.7 MB
+/// together, are over the loads budget, though each fits it and the diff's
+/// JSON would too. They count against the same meter, so it is refused.
+#[test]
+fn a_diffs_trees_and_blobs_share_the_loads_budget() {
+    const NAME: &str = "a_diffs_trees_and_blobs_share_the_loads_budget";
+    if !is_child(NAME) {
+        let out = in_child(NAME);
+        assert!(out.contains("commit: TooLarge"), "{out}");
+        assert!(out.contains("larger: ok"), "{out}");
+        return;
+    }
+    let f = fixture("radshareddiff");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let empty = git.blob(b"").unwrap();
+    let mut files = git.treebuilder(None).unwrap();
+    for i in 0..40_000 {
+        files.insert(format!("{i:0>178}"), empty, 0o100644).unwrap();
+    }
+    let files = files.write().unwrap();
+    let tree_size = git.odb().unwrap().read_header(files).unwrap().0 as u64;
+    assert!(tree_size > 8 * 1000 * 1000, "{tree_size}");
+    let mut binary = vec![0u8; 9 * MIB as usize];
+    binary[0] = 1;
+    let binary = git.blob(&binary).unwrap();
+    let head = git
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let mut root = git.treebuilder(Some(&head.tree().unwrap())).unwrap();
+    root.insert("files", files, 0o040000).unwrap();
+    root.insert("big.bin", binary, 0o100644).unwrap();
+    let root = root.write().unwrap();
+    drop(head);
+    let oid = store_commit(&f, Some(root), "files and a binary", false).to_string();
+
+    match f.node.commit_bounded(f.rid, &oid, &Bounds::for_binding()) {
+        Err(e @ Error::TooLarge { .. }) => println!("commit: {e:?}"),
+        other => println!("commit: unexpected {other:?}"),
+    }
+    // With room for both, the same diff is read.
+    let larger = Bounds::for_binding().with_loads(64 * MIB);
+    match f.node.commit_bounded(f.rid, &oid, &larger) {
+        Ok(_) => println!("larger: ok"),
+        other => println!("larger: unexpected {other:?}"),
+    }
+}
