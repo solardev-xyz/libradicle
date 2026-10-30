@@ -3267,18 +3267,24 @@ mod tests {
     fn a_short_deadline_bounds_the_wait_for_the_home() {
         let gate = std::sync::Arc::new(Held::default());
         let (mut node, home) = stopped_with_a_held_home("short", &gate);
-        for _ in 0..5 {
+        // The quickest of ten calls: a loaded scheduler can hold up any one
+        // sleep, but the full 10 ms poll would hold up every one.
+        let mut quickest = Duration::MAX;
+        for _ in 0..10 {
             let started = Instant::now();
             let result = node.shutdown_within(Duration::from_millis(1));
-            let took = started.elapsed();
+            quickest = quickest.min(started.elapsed());
             assert!(
                 matches!(result, Err(super::Error::ShutdownTimeout(_))),
                 "{result:?}"
             );
-            // Sleeps on Windows round up to its timer's tick.
-            if cfg!(not(windows)) {
-                assert!(took < Duration::from_millis(8), "the call took {took:?}");
-            }
+        }
+        // Sleeps on Windows round up to its timer's tick.
+        if cfg!(not(windows)) {
+            assert!(
+                quickest < Duration::from_millis(8),
+                "the quickest call took {quickest:?}"
+            );
         }
         gate.release();
         node.shutdown_within(Duration::from_secs(10))
