@@ -597,19 +597,29 @@ pub fn seeders(rid: String) -> String {
     })
 }
 
-/// Gracefully stop the node and join its thread. `{"ok": true}`.
+/// Stop the node, join its thread, and wait for it to let go of its home,
+/// within `timeout_ms` for all of it ([`libradicle::shutdown_slot`]), or
+/// [`libradicle::SHUTDOWN_DEADLINE`] (30 s) if none is passed. A host passes
+/// a deadline below its own watchdog's.
+///
+/// `{"ok": true}` once the node has stopped and its home is free. Past the
+/// deadline, `{"error": "...", "stopping": true}`: the node stays, asked to
+/// stop, and another `shutdown` waits again; a start before then is
+/// `HomeLocked`. Any other error is final, and the node gone.
 #[uniffi::export]
-pub fn shutdown() -> String {
-    let node = match NODE.lock() {
-        Ok(mut guard) => guard.take(),
+pub fn shutdown(timeout_ms: Option<u32>) -> String {
+    let timeout = timeout_ms.map_or(libradicle::SHUTDOWN_DEADLINE, |ms| {
+        Duration::from_millis(u64::from(ms))
+    });
+    let mut guard = match NODE.lock() {
+        Ok(guard) => guard,
         Err(_) => return err_json("node lock poisoned"),
     };
-    match node {
-        Some(node) => match node.shutdown() {
-            Ok(()) => json::to_string(json::ok),
-            Err(e) => err_json(e),
-        },
-        None => err_json("node not started"),
+    match libradicle::shutdown_slot(&mut guard, timeout) {
+        Ok(libradicle::Slot::Stopped) => json::to_string(json::ok),
+        Ok(libradicle::Slot::Empty) => err_json("node not started"),
+        Err(e @ libradicle::Error::ShutdownTimeout(_)) => json::to_string(|w| json::stopping(w, e)),
+        Err(e) => err_json(e),
     }
 }
 
@@ -634,7 +644,7 @@ mod tests {
         assert!(identity().contains("node not started"));
         assert!(list_repos().contains("node not started"));
         assert!(status().contains("node not started"));
-        assert!(shutdown().contains("node not started"));
+        assert!(shutdown(None).contains("node not started"));
         // Argument validation happens before the node check.
         assert!(clone_repo("not-a-rid".into(), 1000).contains("invalid RID"));
         // Cancelling an unknown clone is a well-formed negative.
@@ -749,7 +759,7 @@ mod tests {
         let missing = issue(rid.clone(), "0000000000".into());
         assert!(error_of(&missing).contains("not found"), "{missing}");
 
-        assert_eq!(shutdown(), r#"{"ok":true}"#);
+        assert_eq!(shutdown(None), r#"{"ok":true}"#);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -773,5 +783,92 @@ mod tests {
         assert_eq!(v["phase"], "connecting");
         assert_eq!(v["nid"], "z6Mk");
         assert_eq!(v["total"], 3);
+    }
+
+    /// A gate whose name lookups wait until it is released.
+    #[derive(Debug, Default)]
+    struct Held {
+        state: Mutex<(usize, bool)>,
+        changed: std::sync::Condvar,
+    }
+
+    impl radicle::node::dial::Gate for Held {
+        fn allows(&self, _: &radicle::node::Address, _: &std::net::SocketAddr) -> bool {
+            false
+        }
+
+        fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+            let mut state = self.state.lock().unwrap();
+            state.0 += 1;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self.changed.wait(state).unwrap();
+            }
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    // Review of libradicle #19, round 1: a shutdown past its deadline, while
+    // a name lookup keeps the node's home, keeps the node, says it is
+    // stopping, and returns by the deadline. A start then finds the node
+    // still there; another shutdown, once the lookup ends, finishes it, and
+    // a node starts on the home at once.
+    fn a_shutdown_past_its_deadline_keeps_the_node_for_a_retry() {
+        let _serial = node_tests();
+        let home = std::path::Path::new("/tmp").join(format!("radufi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let peer = {
+            use radicle::crypto::Signer as _;
+            *radicle::crypto::SigningKey::from_seed(radicle::crypto::Seed::new([6; 32]))
+                .public_key()
+        };
+        std::fs::write(
+            home.join("config.json"),
+            format!(
+                r#"{{"preferredSeeds":[],"node":{{"alias":"uniffi","network":"test","peers":{{"type":"static"}},"connect":["{peer}@held.test:8776"]}}}}"#
+            ),
+        )
+        .unwrap();
+        let gate = std::sync::Arc::new(Held::default());
+        let node = Embedded::start(Options {
+            home: home.to_str().unwrap().into(),
+            alias: "uniffi".into(),
+            listen: vec![],
+            control_socket: true,
+            routing: Some(libradicle::Routing {
+                proxy: None,
+                onion: radicle::node::config::AddressConfig::Drop,
+                gate: gate.clone(),
+            }),
+            isolated: false,
+        })
+        .unwrap();
+        *NODE.lock().unwrap() = Some(node);
+        {
+            let mut state = gate.state.lock().unwrap();
+            while state.0 == 0 {
+                state = gate.changed.wait(state).unwrap();
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let stopping: serde_json::Value = serde_json::from_str(&shutdown(Some(1_500))).unwrap();
+        assert_eq!(stopping["stopping"], true, "{stopping}");
+        assert!(started.elapsed() < Duration::from_millis(2_500));
+        assert!(NODE.lock().unwrap().is_some(), "the node is kept");
+        let home_str = home.to_str().unwrap().to_owned();
+        assert!(start(home_str.clone(), "uniffi".into()).contains("node already started"));
+
+        {
+            gate.state.lock().unwrap().1 = true;
+            gate.changed.notify_all();
+        }
+        assert_eq!(shutdown(Some(10_000)), r#"{"ok":true}"#);
+        assert!(NODE.lock().unwrap().is_none());
+        assert!(start(home_str, "uniffi".into()).contains("did"));
+        assert_eq!(shutdown(None), r#"{"ok":true}"#);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

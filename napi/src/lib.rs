@@ -644,22 +644,34 @@ pub fn seeders(rid: String) -> AsyncTask<BlockingJson> {
     })
 }
 
-/// Gracefully stop the node and join its thread. Resolves to `{"ok": true}`.
+/// Stop the node, join its thread, and wait for it to let go of its home,
+/// within `timeoutMs` for all of it ([`libradicle::shutdown_slot`]), or
+/// [`libradicle::SHUTDOWN_DEADLINE`] (30 s) if none is passed. A host passes
+/// a deadline below its own quit watchdog's.
+///
+/// Resolves to `{"ok": true}` once the node has stopped and its home is
+/// free. Past the deadline, to `{"error": "...", "stopping": true}`: the
+/// node stays, asked to stop, and another `shutdown` waits again; a start
+/// before then is `HomeLocked`. Any other error is final, and the node gone.
 #[napi]
-pub fn shutdown() -> AsyncTask<BlockingJson> {
-    blocking(|| {
-        let node = match NODE.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(_) => return err_json("node lock poisoned"),
-        };
-        match node {
-            Some(node) => match node.shutdown() {
-                Ok(()) => json::to_string(json::ok),
-                Err(e) => err_json(e),
-            },
-            None => err_json("node not started"),
-        }
-    })
+pub fn shutdown(timeout_ms: Option<u32>) -> AsyncTask<BlockingJson> {
+    blocking(move || shutdown_json(timeout_ms))
+}
+
+fn shutdown_json(timeout_ms: Option<u32>) -> String {
+    let timeout = timeout_ms.map_or(libradicle::SHUTDOWN_DEADLINE, |ms| {
+        Duration::from_millis(u64::from(ms))
+    });
+    let mut guard = match NODE.lock() {
+        Ok(guard) => guard,
+        Err(_) => return err_json("node lock poisoned"),
+    };
+    match libradicle::shutdown_slot(&mut guard, timeout) {
+        Ok(libradicle::Slot::Stopped) => json::to_string(json::ok),
+        Ok(libradicle::Slot::Empty) => err_json("node not started"),
+        Err(e @ libradicle::Error::ShutdownTimeout(_)) => json::to_string(|w| json::stopping(w, e)),
+        Err(e) => err_json(e),
+    }
 }
 
 #[cfg(test)]

@@ -91,6 +91,13 @@ pub fn error(w: &mut impl io::Write, e: impl Display) -> Written {
     put(w, &json!({ "error": e.to_string() }))
 }
 
+/// `{"error": "<e>", "stopping": true}`: a node asked to stop that hasn't
+/// yet, or hasn't let go of its home, within the deadline. Another shutdown
+/// waits again.
+pub fn stopping(w: &mut impl io::Write, e: impl Display) -> Written {
+    put(w, &json!({ "error": e.to_string(), "stopping": true }))
+}
+
 /// `{"ok": true}`.
 pub fn ok(w: &mut impl io::Write) -> Written {
     w.write_all(br#"{"ok":true}"#)
