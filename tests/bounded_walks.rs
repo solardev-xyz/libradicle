@@ -1635,10 +1635,11 @@ fn a_dangling_head_with_a_huge_identity_is_refused_before_it_is_loaded() {
 
 /// LR15 round 5, 2: a dangling HEAD, an identity of three delegates at a
 /// threshold of two, the third's branch absent, and the other two on
-/// separate 10,000-commit histories. heartwood would walk them for a merge
-/// base, unbounded and uncancellable; a bounded read refuses at once with
-/// NoCanonicalHead. In a child, for its time and peak memory, against
-/// heartwood's own resolution as the control.
+/// separate 20,000-commit histories with 1 KiB messages (the reviewer's
+/// reproduction). heartwood would walk them for a merge base, unbounded and
+/// uncancellable; a bounded read refuses at once with NoCanonicalHead. In a
+/// child, for its time and peak memory, against heartwood's own resolution
+/// as the control.
 #[test]
 fn divergent_delegates_are_refused_without_a_merge_base_walk() {
     const NAME: &str = "divergent_delegates_are_refused_without_a_merge_base_walk";
@@ -1656,8 +1657,8 @@ fn divergent_delegates_are_refused_without_a_merge_base_walk() {
             let (grew, control) = growths(&out);
             assert!(grew < 4 * MIB, "the refusal grew the peak by {grew} bytes");
             assert!(
-                control >= 8 * MIB,
-                "the measure missed the walk: {control} bytes"
+                control >= 16 * MIB,
+                "the walk stayed within the binding's budget: {control} bytes"
             );
         }
         return;
@@ -1724,7 +1725,7 @@ fn divergent_delegates_are_refused_without_a_merge_base_walk() {
     .enumerate()
     {
         let mut tip = base.clone();
-        for n in 0..10_000 {
+        for n in 0..20_000 {
             let message = format!("{i} {n} {message}");
             let oid = git
                 .commit(None, &signature, &signature, &message, &tree, &[&tip])
