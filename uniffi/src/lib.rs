@@ -16,7 +16,10 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use libradicle::{json, CancelToken, Embedded, FetchPolicy, Network, Options, Progress};
+use libradicle::{
+    json, Bounds, CancelToken, Embedded, FetchPolicy, Network, Options, Progress,
+    BINDING_MAX_PER_PAGE, BINDING_READ_BUDGET,
+};
 
 uniffi::setup_scaffolding!();
 
@@ -55,6 +58,13 @@ fn network() -> std::result::Result<Network, String> {
             .ok_or_else(|| "node not started".to_string()),
         Err(_) => Err("node lock poisoned".to_string()),
     }
+}
+
+/// The page size a `commits` call gets: what it asked for, up to
+/// [`BINDING_MAX_PER_PAGE`]. Every read here is bounded too (R-18): walks by
+/// [`Bounds::for_binding`], blobs by [`BINDING_READ_BUDGET`].
+fn page_size(per_page: u32) -> usize {
+    (per_page as usize).min(BINDING_MAX_PER_PAGE)
 }
 
 fn parse_rid(rid: &str) -> std::result::Result<radicle::identity::RepoId, String> {
@@ -236,20 +246,24 @@ pub fn identity() -> String {
 /// Repositories the local node is currently seeding.
 #[uniffi::export]
 pub fn list_repos() -> String {
-    with_node(|node| match node.list_repos() {
-        Ok(repos) => json::to_string(|w| json::repos(w, &repos)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.list_repos_bounded(&Bounds::for_binding()) {
+            Ok(repos) => json::to_string(|w| json::repos(w, &repos)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// Explicit allow-seeding policies, including repositories still awaiting a
 /// successful first fetch.
 #[uniffi::export]
 pub fn list_seeded_repos() -> String {
-    with_node(|node| match node.list_seeded_repos() {
-        Ok(repos) => json::to_string(|w| json::seeded_repos(w, &repos)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.list_seeded_repos_bounded(&Bounds::for_binding()) {
+            Ok(repos) => json::to_string(|w| json::seeded_repos(w, &repos)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// All issues in a repository, in radicle-httpd-compatible JSON shape.
@@ -259,10 +273,12 @@ pub fn issues(rid: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.issues(rid) {
-        Ok(issues) => json::to_string(|w| json::issues(w, &issues)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.issues_bounded(rid, &Bounds::for_binding()) {
+            Ok(issues) => json::to_string(|w| json::issues(w, &issues)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// One issue in radicle-httpd-compatible JSON shape.
@@ -272,10 +288,12 @@ pub fn issue(rid: String, issue_id: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.issue(rid, &issue_id) {
-        Ok((id, issue)) => json::to_string(|w| json::issue(w, &id, &issue)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.issue_bounded(rid, &issue_id, &Bounds::for_binding()) {
+            Ok((id, issue)) => json::to_string(|w| json::issue(w, &id, &issue)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// All patches in a repository, in radicle-httpd-compatible JSON shape.
@@ -285,10 +303,12 @@ pub fn patches(rid: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.patches(rid) {
-        Ok(patches) => json::to_string(|w| json::patches(w, &patches)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.patches_bounded(rid, &Bounds::for_binding()) {
+            Ok(patches) => json::to_string(|w| json::patches(w, &patches)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// One patch in radicle-httpd-compatible JSON shape.
@@ -298,10 +318,12 @@ pub fn patch(rid: String, patch_id: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.patch(rid, &patch_id) {
-        Ok((id, patch)) => json::to_string(|w| json::patch(w, &id, &patch)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.patch_bounded(rid, &patch_id, &Bounds::for_binding()) {
+            Ok((id, patch)) => json::to_string(|w| json::patch(w, &id, &patch)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// Create an issue directly in the COB store. `labels_json` is a JSON string array.
@@ -404,10 +426,12 @@ pub fn repo_info(rid: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.repo_info(rid) {
-        Ok(info) => json::to_string(|w| json::repo_info(w, &info)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.repo_info_bounded(rid, &Bounds::for_binding()) {
+            Ok(info) => json::to_string(|w| json::repo_info(w, &info)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// Paginated commit history reachable from a validated full commit id.
@@ -417,12 +441,18 @@ pub fn commits(rid: String, parent: String, page: u32, per_page: u32) -> String 
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(
-        |node| match node.commits(rid, &parent, page as usize, per_page as usize) {
+    with_node(|node| {
+        match node.commits_bounded(
+            rid,
+            &parent,
+            page as usize,
+            page_size(per_page),
+            &Bounds::for_binding(),
+        ) {
             Ok(commits) => json::to_string(|w| json::commits(w, &commits)),
             Err(e) => err_json(e),
-        },
-    )
+        }
+    })
 }
 
 /// Commit metadata plus its structured first-parent diff.
@@ -432,10 +462,12 @@ pub fn commit(rid: String, revision: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.commit(rid, &revision) {
-        Ok(detail) => json::to_string(|w| json::commit(w, &detail)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.commit_bounded(rid, &revision, &Bounds::for_binding()) {
+            Ok(detail) => json::to_string(|w| json::commit(w, &detail)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// File paths at the head of the default branch, as a JSON array.
@@ -445,10 +477,12 @@ pub fn list_files(rid: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.list_files(rid) {
-        Ok(files) => json::to_string(|w| json::files(w, &files)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.list_files_bounded(rid, &Bounds::for_binding()) {
+            Ok(files) => json::to_string(|w| json::files(w, &files)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// Tree entries at the head of the default branch, httpd-shaped.
@@ -458,10 +492,12 @@ pub fn tree(rid: String, path: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.tree(rid, &path) {
-        Ok(entries) => json::to_string(|w| json::tree(w, &entries)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.tree_bounded(rid, &path, &Bounds::for_binding()) {
+            Ok(entries) => json::to_string(|w| json::tree(w, &entries)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// Tree entries at a validated full commit id, including commit metadata.
@@ -471,10 +507,12 @@ pub fn tree_at(rid: String, revision: String, path: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.tree_at(rid, &revision, &path) {
-        Ok((entries, commit)) => json::to_string(|w| json::tree_at(w, &entries, &commit)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.tree_at_bounded(rid, &revision, &path, &Bounds::for_binding()) {
+            Ok((entries, commit)) => json::to_string(|w| json::tree_at(w, &entries, &commit)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// Blob at the head of the default branch, httpd-shaped. Binary blobs omit content.
@@ -484,10 +522,12 @@ pub fn blob(rid: String, path: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.read_blob(rid, &path) {
-        Ok(b) => json::to_string(|w| json::blob(w, &path, &b)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.read_blob_capped(rid, &path, BINDING_READ_BUDGET) {
+            Ok(b) => json::to_string(|w| json::blob(w, &path, &b)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// Blob at a validated full commit id.
@@ -497,10 +537,12 @@ pub fn blob_at(rid: String, revision: String, path: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.read_blob_at(rid, &revision, &path) {
-        Ok(b) => json::to_string(|w| json::blob(w, &path, &b)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.read_blob_at_capped(rid, &revision, &path, BINDING_READ_BUDGET) {
+            Ok(b) => json::to_string(|w| json::blob(w, &path, &b)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// Signed remotes and their branch heads.
@@ -510,10 +552,12 @@ pub fn remotes(rid: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.remotes(rid) {
-        Ok(remotes) => json::to_string(|w| json::remotes(w, &remotes)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.remotes_bounded(rid, &Bounds::for_binding()) {
+            Ok(remotes) => json::to_string(|w| json::remotes(w, &remotes)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// Repository history statistics reachable from a validated full commit id.
@@ -523,10 +567,12 @@ pub fn repo_stats(rid: String, revision: String) -> String {
         Ok(r) => r,
         Err(e) => return err_json(e),
     };
-    with_node(|node| match node.repo_stats(rid, &revision) {
-        Ok(stats) => json::to_string(|w| json::repo_stats(w, &stats)),
-        Err(e) => err_json(e),
-    })
+    with_node(
+        |node| match node.repo_stats_bounded(rid, &revision, &Bounds::for_binding()) {
+            Ok(stats) => json::to_string(|w| json::repo_stats(w, &stats)),
+            Err(e) => err_json(e),
+        },
+    )
 }
 
 /// Node status: `{"connectedPeers": n}`.
@@ -571,10 +617,20 @@ pub fn shutdown() -> String {
 mod tests {
     use super::*;
 
+    /// Tests that use the global `NODE` take this, so they never interleave.
+    static NODE_TESTS: Mutex<()> = Mutex::new(());
+
+    fn node_tests() -> std::sync::MutexGuard<'static, ()> {
+        NODE_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// The exported surface is callable and returns the documented sentinels
     /// before a node is started (host-side smoke — device tests run on macOS).
     #[test]
     fn exports_return_not_started_sentinels() {
+        let _serial = node_tests();
         assert!(identity().contains("node not started"));
         assert!(list_repos().contains("node not started"));
         assert!(status().contains("node not started"));
@@ -583,6 +639,125 @@ mod tests {
         assert!(clone_repo("not-a-rid".into(), 1000).contains("invalid RID"));
         // Cancelling an unknown clone is a well-formed negative.
         assert_eq!(cancel_clone("whatever".into()), r#"{"cancelled":false}"#);
+    }
+
+    fn error_of(json: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(json).expect("JSON");
+        value["error"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// R-18: the reads a host calls are bounded. A started node (dialing
+    /// nobody) with one repository: a file one byte over the binding budget,
+    /// added in the last of more commits than a page may hold.
+    #[test]
+    fn binding_reads_are_bounded() {
+        let _serial = node_tests();
+        let name = format!("lr-uniffi-bounded-{}", std::process::id());
+        let mut dir = std::env::temp_dir().join(&name);
+        if dir.join("home/node/control.sock").as_os_str().len() > 100 {
+            dir = std::path::Path::new("/tmp").join(&name);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.json"),
+            r#"{"preferredSeeds":[],"node":{"alias":"bounded","network":"test","connect":[],"peers":{"type":"static"}}}"#,
+        )
+        .unwrap();
+
+        let work = dir.join("work");
+        let repo = git2::Repository::init(&work).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let mut parent: Option<git2::Oid> = None;
+        let commits = BINDING_MAX_PER_PAGE + 5;
+        for i in 0..commits {
+            let mut tree = repo.treebuilder(None).unwrap();
+            let small = repo.blob(format!("commit {i}\n").as_bytes()).unwrap();
+            tree.insert("small.txt", small, 0o100644).unwrap();
+            if i + 1 == commits {
+                let big = repo
+                    .blob(&vec![b'x'; BINDING_READ_BUDGET as usize + 1])
+                    .unwrap();
+                tree.insert("big.txt", big, 0o100644).unwrap();
+            }
+            let tree = repo.find_tree(tree.write().unwrap()).unwrap();
+            let parents: Vec<git2::Commit> = parent
+                .map(|oid| repo.find_commit(oid).unwrap())
+                .into_iter()
+                .collect();
+            let parents: Vec<&git2::Commit> = parents.iter().collect();
+            parent = Some(
+                repo.commit(
+                    Some("refs/heads/main"),
+                    &signature,
+                    &signature,
+                    "change",
+                    &tree,
+                    &parents,
+                )
+                .unwrap(),
+            );
+        }
+        repo.set_head("refs/heads/main").unwrap();
+        let head = parent.unwrap().to_string();
+
+        let started = start(home.to_str().unwrap().into(), "bounded".into());
+        assert!(started.contains("did:key:"), "{started}");
+        let imported: serde_json::Value = serde_json::from_str(&import_repo(
+            work.to_str().unwrap().into(),
+            "bounded".into(),
+            String::new(),
+            "main".into(),
+        ))
+        .unwrap();
+        let rid = imported["rid"].as_str().expect("rid").to_string();
+
+        // A page size far over the cap returns a capped page.
+        let page: serde_json::Value =
+            serde_json::from_str(&super::commits(rid.clone(), head.clone(), 0, u32::MAX)).unwrap();
+        assert_eq!(
+            page.as_array().map(Vec::len),
+            Some(BINDING_MAX_PER_PAGE),
+            "{page}"
+        );
+
+        // A blob over the budget is refused before it is loaded, at head and
+        // at a revision; a small one still reads.
+        for refused in [
+            blob(rid.clone(), "big.txt".into()),
+            blob_at(rid.clone(), head.clone(), "big.txt".into()),
+        ] {
+            assert!(error_of(&refused).contains("over the limit"), "{refused}");
+        }
+        assert!(blob(rid.clone(), "small.txt".into()).contains("commit"));
+
+        // The diff that adds it does not fit the budget either.
+        let diff = commit(rid.clone(), head.clone());
+        assert!(error_of(&diff).contains("over the limit"), "{diff}");
+
+        // Walks within the budget answer as before.
+        assert!(list_files(rid.clone()).contains("big.txt"));
+        assert!(repo_stats(rid.clone(), head.clone()).contains("\"commits\""));
+        assert!(error_of(&issues(rid.clone())).is_empty());
+        // So do the reads bounded since (review of libradicle #15).
+        assert!(tree(rid.clone(), String::new()).contains("big.txt"));
+        assert!(tree_at(rid.clone(), head.clone(), String::new()).contains("lastCommit"));
+        assert!(error_of(&remotes(rid.clone())).is_empty());
+        assert!(list_seeded_repos().contains(&rid));
+        assert!(repo_info(rid.clone()).contains("\"defaultBranch\""));
+        let missing = issue(rid.clone(), "0000000000".into());
+        assert!(error_of(&missing).contains("not found"), "{missing}");
+
+        assert_eq!(shutdown(), r#"{"ok":true}"#);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_size_is_capped() {
+        assert_eq!(page_size(0), 0);
+        assert_eq!(page_size(30), 30);
+        assert_eq!(page_size(u32::MAX), BINDING_MAX_PER_PAGE);
     }
 
     #[test]

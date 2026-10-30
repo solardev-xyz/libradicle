@@ -123,6 +123,11 @@ impl<'a> Meter<'a> {
     pub(crate) fn left(&self) -> u64 {
         self.bounds.budget - self.used
     }
+
+    /// The bounds it charges against.
+    pub(crate) fn bounds(&self) -> &'a Bounds {
+        self.bounds
+    }
 }
 
 #[cfg(test)]
