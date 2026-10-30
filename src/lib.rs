@@ -1791,13 +1791,20 @@ impl Embedded {
     }
 
     /// The head heartwood's `ReadRepository::head()` answers, within a loads
-    /// budget (review of libradicle #15, round 4): the local `HEAD` when it
-    /// resolves; otherwise the canonical head of the default branch,
-    /// computed from the identity document at `identity` (sized there by
-    /// [`Embedded::identity_fits`] on `read` unless the caller already did),
-    /// never through `repo.head()` or `identity_doc()`, which would load the
-    /// document again, unmetered. The delegates' tips the quorum reads are
-    /// sized and charged first.
+    /// budget (review of libradicle #15, rounds 4 and 5):
+    /// - the local `HEAD`, when it resolves;
+    /// - otherwise the canonical head of the default branch, computed from
+    ///   the identity document at `identity` (sized there by
+    ///   [`Embedded::identity_fits`] on `read` unless the caller already
+    ///   did), never through `repo.head()` or `identity_doc()`. heartwood's
+    ///   own canonical-ref rules and quorum compute it, over
+    ///   [`objects::Tips`]: each delegate's tip is looked up once, sized and
+    ///   charged, and only those pinned tips are used.
+    ///
+    /// Tips that disagree would need a merge-base walk, unbounded and
+    /// uncancellable, so the read is refused with [`Error::NoCanonicalHead`]
+    /// instead: such a repository can't be browsed through a bounded read
+    /// until its `HEAD` is fixed or its delegates agree.
     ///
     /// Unbounded (`read` counts nothing), it is heartwood's `head()`.
     fn head_bounded(
@@ -1819,26 +1826,30 @@ impl Embedded {
             None => Self::identity_fits(repo, objects, read)?,
         };
         let doc = repo.identity_doc_at(identity.into())?;
-        let branch = doc
-            .default_branch()
-            .map_err(radicle::storage::RepositoryError::from)?
-            .to_owned();
-        for delegate in doc.delegates().iter() {
-            let tip = format!("refs/namespaces/{}/refs/heads/{branch}", delegate.as_key());
-            if let Ok(oid) = repo.backend.refname_to_id(&tip) {
-                objects.any(oid, read)?;
-            }
-        }
+        // The tips adapter charges the caller's meter through a cell, and
+        // hands it back after.
+        let placeholder = Meter::new(read.bounds());
+        let cell = RefCell::new(std::mem::replace(read, placeholder));
+        let tips = objects::Tips::new(repo, objects, &cell);
         let quorum = (|| -> Result<_, radicle::storage::RepositoryError> {
             Ok(doc
                 .canonical_refs()?
                 .rules()
-                .canonical(doc.default_branch()?, repo)
+                .canonical(doc.default_branch()?, &tips)
                 .ok_or(radicle::storage::RepositoryError::MissingBranchRule)?
                 .find_objects()?
                 .quorum()?)
-        })()?;
-        Ok(quorum.object.id().into())
+        })();
+        let (refused, diverged) = (tips.refused(), tips.diverged());
+        drop(tips);
+        *read = cell.into_inner();
+        if let Some(refused) = refused {
+            return Err(refused);
+        }
+        if diverged {
+            return Err(Error::NoCanonicalHead(repo.id));
+        }
+        Ok(quorum?.object.id().into())
     }
 
     /// The identity document: at `pinned`, a head [`Embedded::identity_fits`]

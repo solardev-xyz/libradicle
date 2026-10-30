@@ -67,13 +67,17 @@ impl<'r> Objects<'r> {
     }
 
     /// The object `oid`, of any kind, sized from its header, checked and
-    /// charged; nothing of it is loaded here. Missing is fine: whoever
-    /// loads it reports that.
-    pub(crate) fn any(&self, oid: git2::Oid, read: &mut Meter) -> Result<(), Error> {
+    /// charged; nothing of it is loaded here. Its kind, or `None` when it is
+    /// missing: whoever loads it reports that.
+    pub(crate) fn any(
+        &self,
+        oid: git2::Oid,
+        read: &mut Meter,
+    ) -> Result<Option<git2::ObjectType>, Error> {
         read.check()?;
-        let size = match self.odb.read_header(oid) {
-            Ok((size, _)) => size as u64,
-            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(()),
+        let (size, kind) = match self.odb.read_header(oid) {
+            Ok((size, kind)) => (size as u64, kind),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         if size > self.limit {
@@ -82,7 +86,8 @@ impl<'r> Objects<'r> {
                 limit: self.limit,
             });
         }
-        read.charge(size)
+        read.charge(size)?;
+        Ok(Some(kind))
     }
 
     /// The commit `oid`, its size checked and charged before it is loaded.
@@ -403,6 +408,166 @@ mod sigrefs_reader {
                 };
             }
             Ok(None)
+        }
+    }
+}
+
+/// heartwood's canonical-ref effects (`FindObjects`, `FindMergeBase`,
+/// `Ancestry`) over a stored repository, for a bounded read's canonical head
+/// (review of libradicle #15, round 5):
+/// - `find_objects` looks each delegate's ref up once, sizes and charges
+///   its target on the read's meter, and answers those pinned `(DID, OID,
+///   type)` tips. Nothing looks the refs up again.
+/// - Tips that agree are their own merge base. A merge base of two
+///   different tips would mean an unbounded, uncancellable libgit2 walk: it
+///   isn't computed. The read is refused instead ([`Tips::diverged`]).
+pub(crate) struct Tips<'a, 'r, 'b> {
+    repo: &'a radicle::storage::git::Repository,
+    objects: &'a Objects<'r>,
+    read: &'a RefCell<Meter<'b>>,
+    refused: RefCell<Option<Error>>,
+    diverged: std::cell::Cell<bool>,
+}
+
+impl<'a, 'r, 'b> Tips<'a, 'r, 'b> {
+    pub(crate) fn new(
+        repo: &'a radicle::storage::git::Repository,
+        objects: &'a Objects<'r>,
+        read: &'a RefCell<Meter<'b>>,
+    ) -> Self {
+        Self {
+            repo,
+            objects,
+            read,
+            refused: RefCell::new(None),
+            diverged: std::cell::Cell::new(false),
+        }
+    }
+
+    /// The refusal of the bounds that failed the resolution, if one did.
+    pub(crate) fn refused(&self) -> Option<Error> {
+        self.refused.borrow_mut().take()
+    }
+
+    /// Whether the tips diverged, so that a merge base was asked for.
+    pub(crate) fn diverged(&self) -> bool {
+        self.diverged.get()
+    }
+}
+
+mod canonical_tips {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use radicle::git::canonical::effects::{
+        Ancestry, FindMergeBase, FindObjects, FindObjectsError, GraphDescendant, MergeBaseError,
+    };
+    use radicle::git::canonical::{FoundObjects, GraphAheadBehind, MergeBase, Object};
+    use radicle::git::fmt::Qualified;
+    use radicle::git::Oid;
+    use radicle::prelude::Did;
+
+    use super::{Refused, Tips};
+
+    /// What heartwood's merge-base caller sees: the read is refused.
+    #[derive(Debug)]
+    struct Diverged;
+
+    impl std::fmt::Display for Diverged {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("divergent tips need a merge base, which a bounded read doesn't compute")
+        }
+    }
+
+    impl std::error::Error for Diverged {}
+
+    impl FindObjects for Tips<'_, '_, '_> {
+        fn find_objects<'a, 'b, I>(
+            &self,
+            refname: &Qualified<'a>,
+            dids: I,
+        ) -> Result<FoundObjects, FindObjectsError>
+        where
+            I: Iterator<Item = &'b Did>,
+        {
+            let mut objects = BTreeMap::new();
+            let mut missing_refs = BTreeSet::new();
+            let mut missing_objects = BTreeMap::new();
+            for did in dids {
+                let name = refname.with_namespace(did.as_key().into());
+                // The one lookup of this ref: its target is what is sized
+                // and answered.
+                let oid = match self.repo.backend.refname_to_id(name.as_str()) {
+                    Ok(oid) => oid,
+                    Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                        missing_refs.insert(name.to_owned());
+                        continue;
+                    }
+                    Err(e) => return Err(FindObjectsError::find_reference(name.to_owned(), e)),
+                };
+                #[cfg(test)]
+                crate::seams::tip_pinned();
+                let kind = {
+                    let mut read = self.read.borrow_mut();
+                    match self.objects.any(oid, &mut read) {
+                        Ok(kind) => kind,
+                        Err(e) => {
+                            *self.refused.borrow_mut() = Some(e);
+                            return Err(FindObjectsError::other(Refused));
+                        }
+                    }
+                };
+                let id = Oid::from(oid);
+                let object = match kind {
+                    None => {
+                        missing_objects.insert(*did, id);
+                        continue;
+                    }
+                    Some(git2::ObjectType::Commit) => Object::Commit { id },
+                    Some(git2::ObjectType::Tag) => Object::Tag { id },
+                    Some(other) => {
+                        return Err(FindObjectsError::invalid_object_type(
+                            *did,
+                            id,
+                            Some(other.to_string()),
+                        ))
+                    }
+                };
+                objects.insert(*did, object);
+            }
+            Ok(FoundObjects {
+                objects,
+                missing_refs,
+                missing_objects,
+            })
+        }
+    }
+
+    impl FindMergeBase for Tips<'_, '_, '_> {
+        fn merge_base(&self, a: Oid, b: Oid) -> Result<MergeBase, MergeBaseError> {
+            // Heartwood pairs every vote, agreeing ones too. A commit is its
+            // own merge base, which needs no walk.
+            if a == b {
+                return Ok(MergeBase { a, b, base: a });
+            }
+            self.diverged.set(true);
+            Err(MergeBaseError::new(a, b, Diverged))
+        }
+    }
+
+    impl Ancestry for Tips<'_, '_, '_> {
+        // Only convergence checks ask this, and the canonical head doesn't
+        // check convergence. Should one ever ask, the read is refused as for
+        // a merge base.
+        fn graph_ahead_behind(
+            &self,
+            _commit: Oid,
+            _upstream: Oid,
+        ) -> Result<GraphAheadBehind, GraphDescendant> {
+            self.diverged.set(true);
+            Ok(GraphAheadBehind {
+                ahead: 0,
+                behind: 0,
+            })
         }
     }
 }

@@ -34,6 +34,21 @@ thread_local! {
     static RESOLVED: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
 }
 
+thread_local! {
+    /// What a test runs once a canonical-head resolution has looked a
+    /// delegate's tip up, before it sizes it.
+    static TIP_PINNED: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+}
+
+/// Runs the test's hook, if any, once a delegate's tip is looked up.
+pub(crate) fn tip_pinned() {
+    TIP_PINNED.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
 /// Runs the test's hook, if any, once a signed-refs read has resolved its
 /// head.
 pub(crate) fn resolved() {
@@ -341,6 +356,99 @@ mod tests {
         }
         let control = peak_growth(|| {
             assert!(git.find_blob(huge).unwrap().content().len() >= 20 * 1024 * 1024);
+        });
+        if let (Some(grew), Some(control)) = (grew, control) {
+            println!("peak growth: {grew}");
+            println!("control growth: {control}");
+        }
+    }
+
+    // Review of libradicle #15, round 5: with no usable local HEAD, the
+    // canonical head uses the delegate tips it looked up, sized and charged.
+    // A ref moved the moment after its lookup (here, to a 32 MiB blob)
+    // changes only the next read. In a child, for its peak memory.
+    #[test]
+    fn a_canonical_head_uses_the_tips_it_pinned() {
+        const NAME: &str = "seams::tests::a_canonical_head_uses_the_tips_it_pinned";
+        if std::env::var("LIBRADICLE_CHILD").as_deref() != Ok(NAME) {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+                .env("LIBRADICLE_CHILD", NAME)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "the child died: {:?}\n{stdout}",
+                out.status
+            );
+            assert!(
+                stdout.contains("pinned: the charged tip, moved 1 time"),
+                "{stdout}"
+            );
+            assert!(stdout.contains("next: TooLarge"), "{stdout}");
+            if cfg!(target_os = "linux") {
+                let read = |prefix: &str| -> u64 {
+                    stdout
+                        .lines()
+                        .find_map(|l| l.strip_prefix(prefix))
+                        .unwrap_or_else(|| panic!("no {prefix:?} in {stdout}"))
+                        .parse()
+                        .unwrap()
+                };
+                let (grew, control) = (read("peak growth: "), read("control growth: "));
+                assert!(
+                    grew < 8 * 1024 * 1024,
+                    "the read grew the peak by {grew} bytes"
+                );
+                assert!(
+                    control >= 24 * 1024 * 1024,
+                    "the measure missed a load: {control}"
+                );
+            }
+            return;
+        }
+        let f = fixture("rstips", 1);
+        let (rid, commit) = f.repos[0].clone();
+        let nid = f.node.identity().nid;
+        let tip_ref = format!("refs/namespaces/{nid}/refs/heads/main");
+        let stored =
+            radicle::storage::ReadStorage::repository(&f.node.profile.storage, rid).unwrap();
+        let git = &stored.backend;
+        git.set_head("refs/heads/does-not-exist").unwrap();
+        let huge = git.blob(&vec![b'x'; 32 * 1024 * 1024]).unwrap();
+        let moved = std::rc::Rc::new(Cell::new(0));
+        let path = git.path().to_owned();
+        let name = tip_ref.clone();
+        let counter = moved.clone();
+        TIP_PINNED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if counter.get() == 0 {
+                    let repo = git2::Repository::open_bare(&path).unwrap();
+                    repo.reference(&name, huge, true, "a fetch").unwrap();
+                }
+                counter.set(counter.get() + 1);
+            }));
+        });
+        let mut result = None;
+        let grew = peak_growth(|| {
+            result = Some(f.node.repo_info_bounded(rid, &Bounds::for_binding()));
+        });
+        TIP_PINNED.with(|hook| *hook.borrow_mut() = None);
+        match result.unwrap() {
+            Ok(info) if info.head == commit => {
+                println!("\npinned: the charged tip, moved {} time", moved.get())
+            }
+            other => println!("\npinned: unexpected {other:?}"),
+        }
+        // The next read looks the moved ref up, and refuses its target from
+        // the header.
+        match f.node.repo_info_bounded(rid, &Bounds::for_binding()) {
+            Err(e @ Error::TooLarge { .. }) => println!("next: {e:?}"),
+            other => println!("next: unexpected {other:?}"),
+        }
+        let control = peak_growth(|| {
+            assert!(git.find_blob(huge).unwrap().content().len() >= 32 * 1024 * 1024);
         });
         if let (Some(grew), Some(control)) = (grew, control) {
             println!("peak growth: {grew}");

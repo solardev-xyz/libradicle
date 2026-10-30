@@ -1632,3 +1632,200 @@ fn a_dangling_head_with_a_huge_identity_is_refused_before_it_is_loaded() {
     });
     print_growth(grew, control);
 }
+
+/// LR15 round 5, 2: a dangling HEAD, an identity of three delegates at a
+/// threshold of two, the third's branch absent, and the other two on
+/// separate 10,000-commit histories. heartwood would walk them for a merge
+/// base, unbounded and uncancellable; a bounded read refuses at once with
+/// NoCanonicalHead. In a child, for its time and peak memory, against
+/// heartwood's own resolution as the control.
+#[test]
+fn divergent_delegates_are_refused_without_a_merge_base_walk() {
+    const NAME: &str = "divergent_delegates_are_refused_without_a_merge_base_walk";
+    if !is_child(NAME) {
+        let out = in_child(NAME);
+        assert!(out.contains("bounded: NoCanonicalHead"), "{out}");
+        let millis: u128 = out
+            .lines()
+            .find_map(|l| l.strip_prefix("bounded took ms: "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(millis < 2_000, "the refusal took {millis} ms");
+        if cfg!(target_os = "linux") {
+            let (grew, control) = growths(&out);
+            assert!(grew < 4 * MIB, "the refusal grew the peak by {grew} bytes");
+            assert!(
+                control >= 8 * MIB,
+                "the measure missed the walk: {control} bytes"
+            );
+        }
+        return;
+    }
+    let f = fixture("raddiverged");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let nid = f.node.identity().nid;
+    let others = [1u8, 2u8].map(|seed| radicle::crypto::PublicKey::from_bytes([seed; 32]));
+
+    // The identity: the node and two more delegates, two of three needed.
+    let id = git.refname_to_id("refs/rad/id").unwrap();
+    let commit = git.find_commit(id).unwrap();
+    let doc_entry = commit
+        .tree()
+        .unwrap()
+        .get_path(std::path::Path::new("embeds/radicle.json"))
+        .unwrap();
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(git.find_blob(doc_entry.id()).unwrap().content()).unwrap();
+    let mut delegates = vec![format!("did:key:{nid}")];
+    delegates.extend(
+        others
+            .iter()
+            .map(|key| radicle::identity::Did::from(*key).to_string()),
+    );
+    doc["delegates"] = serde_json::json!(delegates);
+    doc["threshold"] = serde_json::json!(2);
+    let blob = git.blob(&serde_json::to_vec(&doc).unwrap()).unwrap();
+    let mut embeds = git.treebuilder(None).unwrap();
+    embeds.insert("radicle.json", blob, 0o100644).unwrap();
+    let embeds = embeds.write().unwrap();
+    let mut root = git.treebuilder(None).unwrap();
+    root.insert("embeds", embeds, 0o040000).unwrap();
+    let root = git.find_tree(root.write().unwrap()).unwrap();
+    let signature =
+        git2::Signature::new("Test", "test@example.com", &git2::Time::new(1, 0)).unwrap();
+    let id = git
+        .commit(
+            None,
+            &signature,
+            &signature,
+            "three delegates",
+            &root,
+            &[&commit],
+        )
+        .unwrap();
+    git.reference("refs/rad/id", id, true, "test").unwrap();
+    drop((root, commit));
+
+    // Two divergent histories of the default branch, 10,000 commits each.
+    let base = git
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let tree = base.tree().unwrap();
+    let message = "d".repeat(1024);
+    for (i, key) in [
+        nid.parse::<radicle::crypto::PublicKey>().unwrap(),
+        others[0],
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut tip = base.clone();
+        for n in 0..10_000 {
+            let message = format!("{i} {n} {message}");
+            let oid = git
+                .commit(None, &signature, &signature, &message, &tree, &[&tip])
+                .unwrap();
+            tip = git.find_commit(oid).unwrap();
+        }
+        git.reference(
+            &format!("refs/namespaces/{key}/refs/heads/main"),
+            tip.id(),
+            true,
+            "test",
+        )
+        .unwrap();
+    }
+    git.set_head("refs/heads/does-not-exist").unwrap();
+
+    let (node, rid) = (&f.node, f.rid);
+    let mut result = None;
+    let started = std::time::Instant::now();
+    let grew = peak_growth(|| {
+        result = Some(
+            node.repo_info_bounded(rid, &Bounds::for_binding())
+                .map(|_| ()),
+        );
+    });
+    // On its own line: the harness prints the test's name before it.
+    println!("\nbounded took ms: {}", started.elapsed().as_millis());
+    match result.unwrap() {
+        Err(e @ Error::NoCanonicalHead(_)) => println!("bounded: {e:?}"),
+        other => println!("bounded: unexpected {other:?}"),
+    }
+    // The control: heartwood's own resolution walks both histories.
+    let control = peak_growth(|| {
+        let _ = node.repo_info(rid);
+    });
+    print_growth(grew, control);
+}
+
+/// LR15 round 5: delegates that agree still give the canonical head with no
+/// local HEAD: two of three at a threshold of two, on the same tip, the
+/// third's branch absent. The bounded read answers what heartwood answers.
+#[test]
+fn agreeing_delegates_give_heartwoods_canonical_head() {
+    let f = fixture("radagreeing");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let nid = f.node.identity().nid;
+    let others = [1u8, 2u8].map(|seed| radicle::crypto::PublicKey::from_bytes([seed; 32]));
+    let id = git.refname_to_id("refs/rad/id").unwrap();
+    let commit = git.find_commit(id).unwrap();
+    let doc_entry = commit
+        .tree()
+        .unwrap()
+        .get_path(std::path::Path::new("embeds/radicle.json"))
+        .unwrap();
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(git.find_blob(doc_entry.id()).unwrap().content()).unwrap();
+    let mut delegates = vec![format!("did:key:{nid}")];
+    delegates.extend(
+        others
+            .iter()
+            .map(|key| radicle::identity::Did::from(*key).to_string()),
+    );
+    doc["delegates"] = serde_json::json!(delegates);
+    doc["threshold"] = serde_json::json!(2);
+    let blob = git.blob(&serde_json::to_vec(&doc).unwrap()).unwrap();
+    let mut embeds = git.treebuilder(None).unwrap();
+    embeds.insert("radicle.json", blob, 0o100644).unwrap();
+    let embeds = embeds.write().unwrap();
+    let mut root = git.treebuilder(None).unwrap();
+    root.insert("embeds", embeds, 0o040000).unwrap();
+    let root = git.find_tree(root.write().unwrap()).unwrap();
+    let signature =
+        git2::Signature::new("Test", "test@example.com", &git2::Time::new(1, 0)).unwrap();
+    let id = git
+        .commit(
+            None,
+            &signature,
+            &signature,
+            "three delegates",
+            &root,
+            &[&commit],
+        )
+        .unwrap();
+    git.reference("refs/rad/id", id, true, "test").unwrap();
+    let tip = git
+        .refname_to_id(&format!("refs/namespaces/{nid}/refs/heads/main"))
+        .unwrap();
+    git.reference(
+        &format!("refs/namespaces/{}/refs/heads/main", others[0]),
+        tip,
+        true,
+        "test",
+    )
+    .unwrap();
+    git.set_head("refs/heads/does-not-exist").unwrap();
+
+    let bounded = f
+        .node
+        .repo_info_bounded(f.rid, &Bounds::for_binding())
+        .unwrap();
+    assert_eq!(bounded.head, tip.to_string());
+    assert_eq!(bounded.head, f.node.repo_info(f.rid).unwrap().head);
+}

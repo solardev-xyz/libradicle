@@ -125,7 +125,7 @@ impl<'a> Meter<'a> {
     }
 
     /// The bounds it charges against.
-    pub(crate) fn bounds(&self) -> &Bounds {
+    pub(crate) fn bounds(&self) -> &'a Bounds {
         self.bounds
     }
 }
