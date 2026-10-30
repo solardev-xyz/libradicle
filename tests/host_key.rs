@@ -27,6 +27,7 @@ fn opts(home: &str) -> Options {
         control_socket: true,
         routing: None,
         isolated: false,
+        repositories: None,
     }
 }
 

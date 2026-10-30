@@ -117,6 +117,7 @@ mod tests {
                 control_socket: false,
                 routing: None,
                 isolated: false,
+                repositories: None,
             },
             key,
         )

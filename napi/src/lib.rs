@@ -113,6 +113,7 @@ pub fn start(home: String, alias: String) -> AsyncTask<BlockingJson> {
             control_socket: true,
             routing: None,
             isolated: false,
+            repositories: None,
         }) {
             Ok(node) => {
                 let did = node.did();

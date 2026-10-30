@@ -28,6 +28,7 @@ fn main() -> anyhow::Result<()> {
         control_socket: true,
         routing: None,
         isolated: false,
+        repositories: None,
     })?;
     println!("node started, DID: {}", node.did());
 

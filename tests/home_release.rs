@@ -89,6 +89,7 @@ fn start(home: &Path, gate: Option<Arc<Held>>) -> Result<Embedded, Error> {
                 gate: gate as Arc<dyn radicle::node::dial::Gate>,
             }),
             isolated: false,
+            repositories: None,
         },
         key(),
     )
