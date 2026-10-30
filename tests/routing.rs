@@ -152,7 +152,7 @@ fn routing_through_a_proxy_replaces_config_jsons_proxy() {
         &home,
         Some(Routing {
             proxy: Some(proxy),
-            onion: onion.clone(),
+            onion,
             gate: gate.clone(),
         }),
     );

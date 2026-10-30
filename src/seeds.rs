@@ -112,7 +112,7 @@ fn shipped() -> Result<Vec<Candidate>, Error> {
 
 fn successful_history(profile: &Profile) -> BTreeMap<NodeId, u64> {
     let mut history = BTreeMap::new();
-    let database = profile.config.node.database.clone();
+    let database = profile.config.node.database;
     let Ok(store) = profile.home.addresses(database) else {
         return history;
     };
@@ -196,7 +196,7 @@ pub(crate) fn effective(profile: &Profile) -> Result<Vec<Candidate>, Error> {
 /// after `Runtime::init` has created the database but before `Runtime::run`
 /// starts, so the insert cannot race the node thread.
 pub(crate) fn install(profile: &Profile) -> Result<(), Error> {
-    let database = profile.config.node.database.clone();
+    let database = profile.config.node.database;
     let mut store = profile
         .home
         .addresses(database)
