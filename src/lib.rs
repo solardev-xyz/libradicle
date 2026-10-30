@@ -9,7 +9,7 @@
 //! and iOS (UniFFI) bindings.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
@@ -820,6 +820,9 @@ pub struct Embedded {
     stop: Box<dyn Fn() + Send + Sync>,
     /// Keeps the node's signal channel open for the runtime's lifetime.
     _signals: mpsc::Sender<radicle_signals::Signal>,
+    /// Whether the node's home has been seen let go of since its thread
+    /// ended ([`Embedded::shutdown`]).
+    released: bool,
 }
 
 impl Embedded {
@@ -897,7 +900,6 @@ impl Embedded {
 
         let socket = if opts.control_socket {
             let socket = profile.home.socket_from_env();
-            prepare_control_socket(&socket)?;
             Some(socket)
         } else {
             None
@@ -932,7 +934,7 @@ impl Embedded {
             seeds::install(&profile)?;
         }
         let handle = runtime.handle.clone();
-        let controller = runtime.reactor.controller();
+        let controller = runtime.controller();
         let stop = Box::new(move || {
             // An error means the reactor has stopped already.
             controller.clone().shutdown().ok();
@@ -949,6 +951,7 @@ impl Embedded {
             node_thread: Some(node_thread),
             stop,
             _signals: sig_tx,
+            released: false,
         })
     }
 
@@ -1876,13 +1879,50 @@ impl Embedded {
         Ok(stats)
     }
 
-    /// Gracefully shut the node down and join its thread.
+    /// Gracefully shut the node down, join its thread, and wait for it to
+    /// let go of its home, so that a node can start on it again at once.
+    ///
+    /// heartwood's runtime holds the home until every name lookup of the
+    /// node has returned (Security R-16), and its stop doesn't wait for one
+    /// past a second. So the home may be held a while after the thread ends:
+    /// this waits for it up to [`HOME_RELEASE_LIMIT`], and is
+    /// [`Error::ShutdownTimeout`] past that.
     pub fn shutdown(mut self) -> Result<(), Error> {
         self.handle.clone().shutdown()?;
         if let Some(t) = self.node_thread.take() {
             t.join()
                 .map_err(|_| Error::NodeThread("node thread panicked".into()))?
                 .map_err(|e| Error::NodeThread(e.to_string()))?;
+        }
+        self.await_release(
+            std::time::Instant::now().checked_add(HOME_RELEASE_LIMIT),
+            HOME_RELEASE_LIMIT,
+        )
+    }
+
+    /// Waits, until `deadline` if any, for the node, whose thread has ended,
+    /// to let go of its home: [`Error::ShutdownTimeout`] of `timeout` past
+    /// it. Once the home has been seen let go of, it returns at once: another
+    /// node may have taken it since.
+    fn await_release(
+        &mut self,
+        deadline: Option<std::time::Instant>,
+        timeout: std::time::Duration,
+    ) -> Result<(), Error> {
+        while !self.released {
+            match self.profile.home.lock_node() {
+                Ok(lock) => {
+                    drop(lock);
+                    self.released = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                        return Err(Error::ShutdownTimeout(timeout));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(())
     }
@@ -1906,14 +1946,19 @@ impl Embedded {
     /// - **Past the deadline:** [`Error::ShutdownTimeout`]. The node stays in
     ///   `self`, asked to stop: [`Embedded::node_alive`] tells when it has,
     ///   and another call waits again and joins it.
-    /// - **Once joined,** a further call returns `Ok` at once.
+    /// - **The home:** once the thread has ended, it waits, within the same
+    ///   deadline, for the node to let go of its home, as
+    ///   [`Embedded::shutdown`] does. Past it, [`Error::ShutdownTimeout`], and
+    ///   another call waits again.
+    /// - **Once joined, and the home let go of,** a further call returns
+    ///   `Ok` at once.
     ///
     /// The stop goes to the node's reactor directly, never through its
     /// control socket, so asking can't wait on anything.
     pub fn shutdown_within(&mut self, timeout: std::time::Duration) -> Result<(), Error> {
         let deadline = std::time::Instant::now().checked_add(timeout);
         let Some(thread) = self.node_thread.as_ref() else {
-            return Ok(());
+            return self.await_release(deadline, timeout);
         };
         if !thread.is_finished() {
             (self.stop)();
@@ -1932,15 +1977,22 @@ impl Embedded {
                 std::thread::sleep(left.min(std::time::Duration::from_millis(10)));
             }
         }
-        let Some(thread) = self.node_thread.take() else {
-            return Ok(());
+        let joined = match self.node_thread.take() {
+            Some(thread) => thread
+                .join()
+                .map_err(|_| Error::NodeThread("node thread panicked".into()))?
+                .map_err(|e| Error::NodeThread(e.to_string())),
+            None => Ok(()),
         };
-        thread
-            .join()
-            .map_err(|_| Error::NodeThread("node thread panicked".into()))?
-            .map_err(|e| Error::NodeThread(e.to_string()))
+        self.await_release(deadline, timeout)?;
+        joined
     }
 }
+
+/// How long [`Embedded::shutdown`] waits, at most, for a stopped node to let
+/// go of its home: a name lookup the stop didn't wait for holds it until it
+/// returns, as the system's resolver does within its own timeouts.
+pub const HOME_RELEASE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long dropping an [`Embedded`] waits for a node that still runs.
 pub const DROP_SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1994,43 +2046,6 @@ fn repositories() -> radicle::node::gate::RepoGate {
     radicle::node::gate::RepoGate::new()
 }
 
-/// Remove a Unix control socket left behind by an unclean process exit.
-///
-/// A successful connection means another node really is listening, so the
-/// path is preserved and `Runtime::init` reports `AlreadyRunning`. We only
-/// remove an existing socket after the kernel confirms that nobody accepts
-/// connections on it; regular files and other path types are never touched.
-#[cfg(unix)]
-fn prepare_control_socket(path: &Path) -> Result<(), Error> {
-    use std::io::ErrorKind;
-    use std::os::unix::fs::FileTypeExt as _;
-    use std::os::unix::net::UnixStream;
-
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.into()),
-    };
-    if !metadata.file_type().is_socket() {
-        return Ok(());
-    }
-
-    match UnixStream::connect(path) {
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == ErrorKind::ConnectionRefused => {
-            std::fs::remove_file(path)?;
-            Ok(())
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-        Err(_) => Ok(()),
-    }
-}
-
-#[cfg(not(unix))]
-fn prepare_control_socket(_path: &Path) -> Result<(), Error> {
-    Ok(())
-}
-
 fn validate_cob_id(id: &str) -> Result<(), Error> {
     if (6..=40).contains(&id.len())
         && id
@@ -2052,14 +2067,7 @@ fn parse_revision(revision: &str) -> Result<git2::Oid, Error> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::fs;
-    #[cfg(unix)]
-    use std::path::PathBuf;
-    #[cfg(unix)]
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use super::{parse_revision, prepare_control_socket, repositories, validate_cob_id};
+    use super::{parse_revision, repositories, validate_cob_id};
     use super::{CancelToken, FetchPolicy, Progress, FILE_JSON, HUNK_JSON, LINE_JSON};
     use std::time::{Duration, Instant};
 
@@ -2194,57 +2202,6 @@ mod tests {
             start.elapsed() < Duration::from_secs(1),
             "must not sleep the full duration"
         );
-    }
-
-    #[cfg(unix)]
-    fn socket_test_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is before Unix epoch")
-            .as_nanos();
-        let path =
-            PathBuf::from("/tmp").join(format!("libradicle-{name}-{}-{nonce}", std::process::id()));
-        fs::create_dir(&path).expect("create socket test directory");
-        path
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn startup_removes_only_stale_control_sockets() {
-        use std::os::unix::net::UnixListener;
-
-        let dir = socket_test_dir("stale-socket");
-        let socket = dir.join("control.sock");
-        let listener = UnixListener::bind(&socket).expect("bind stale socket");
-        drop(listener);
-
-        prepare_control_socket(&socket).expect("remove stale socket");
-
-        assert!(!socket.exists());
-        fs::remove_dir(dir).expect("remove socket test directory");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn startup_preserves_live_control_sockets_and_regular_files() {
-        use std::os::unix::net::UnixListener;
-
-        let dir = socket_test_dir("live-socket");
-        let socket = dir.join("control.sock");
-        let listener = UnixListener::bind(&socket).expect("bind live socket");
-
-        prepare_control_socket(&socket).expect("probe live socket");
-        assert!(socket.exists());
-
-        let regular_file = dir.join("not-a-socket");
-        fs::write(&regular_file, b"keep").expect("create regular file");
-        prepare_control_socket(&regular_file).expect("inspect regular file");
-        assert_eq!(fs::read(&regular_file).expect("read regular file"), b"keep");
-
-        drop(listener);
-        fs::remove_file(socket).expect("remove live socket");
-        fs::remove_file(regular_file).expect("remove regular file");
-        fs::remove_dir(dir).expect("remove socket test directory");
     }
 
     #[test]
