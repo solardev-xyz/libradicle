@@ -3,11 +3,13 @@
 //! until every lookup has returned (heartwood #16, Security R-16), so
 //! `shutdown` waits for it, and a node can start on the home again at once.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use libradicle::{Embedded, Error, HostKey, Options, Routing};
+use libradicle::{Embedded, Error, HostKey, Options};
 
 fn key() -> HostKey {
     let mut bytes = vec![13u8; 32];
@@ -76,6 +78,20 @@ impl radicle::node::dial::Gate for Held {
     }
 }
 
+/// A gate that resolves every name to nothing, without DNS.
+#[derive(Debug)]
+struct Unresolved;
+
+impl radicle::node::dial::Gate for Unresolved {
+    fn allows(&self, _: &radicle::node::Address, _: &std::net::SocketAddr) -> bool {
+        true
+    }
+
+    fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        Ok(vec![])
+    }
+}
+
 fn start(home: &Path, gate: Option<Arc<Held>>) -> Result<Embedded, Error> {
     Embedded::start_with_key(
         Options {
@@ -83,11 +99,12 @@ fn start(home: &Path, gate: Option<Arc<Held>>) -> Result<Embedded, Error> {
             alias: "release".into(),
             listen: vec![],
             control_socket: true,
-            routing: gate.map(|gate| Routing {
-                proxy: None,
-                onion: radicle::node::config::AddressConfig::Drop,
-                gate: gate as Arc<dyn radicle::node::dial::Gate>,
-            }),
+            // Without a held gate, its `connect` peer's name is answered
+            // without DNS, and resolves to nothing.
+            routing: Some(common::routing_with(Some(match gate {
+                Some(gate) => gate as Arc<dyn radicle::node::dial::Gate>,
+                None => Arc::new(Unresolved),
+            }))),
             isolated: false,
             repositories: None,
         },

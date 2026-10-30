@@ -9,6 +9,8 @@
 //!   touches anything, then removes the repository, its seeding policy and
 //!   its record.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
@@ -61,7 +63,7 @@ fn start(
             alias: "gate".into(),
             listen,
             control_socket: true,
-            routing: None,
+            routing: Some(common::routing()),
             isolated: false,
             repositories,
         },

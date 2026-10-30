@@ -625,6 +625,14 @@ pub fn shutdown(timeout_ms: Option<u32>) -> String {
     }
 }
 
+/// The dial gate every test node gets: loopback only, and loudly. The tests
+/// that start through `start` itself can't take a gate: their homes'
+/// `config.json` has a static peer set, no preferred seeds and no `connect`
+/// peers, so they dial no one.
+#[cfg(test)]
+#[path = "../../tests/common/hermetic.rs"]
+mod hermetic;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,7 +850,7 @@ mod tests {
             routing: Some(libradicle::Routing {
                 proxy: None,
                 onion: radicle::node::config::AddressConfig::Drop,
-                gate: gate.clone(),
+                gate: hermetic::wrapping(gate.clone()),
             }),
             isolated: false,
             repositories: None,

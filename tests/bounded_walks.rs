@@ -3,6 +3,8 @@
 //! module writes it, would be over its budget. A result whose JSON is
 //! exactly the budget fits.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use libradicle::{json, Bounds, CancelToken, Embedded, Error, HostKey, Options};
@@ -91,7 +93,7 @@ fn fixture(name: &str) -> Fixture {
             alias: "walks".into(),
             listen: vec![],
             control_socket: true,
-            routing: None,
+            routing: Some(common::routing()),
             isolated: false,
             repositories: None,
         },

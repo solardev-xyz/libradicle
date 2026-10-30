@@ -2,6 +2,8 @@
 //! writes nothing secret, and leaves the profile's own key alone, so a
 //! plain `Embedded::start` afterwards is the device identity again.
 
+mod common;
+
 use libradicle::{Embedded, HostKey, Options};
 
 /// Freedom's Radicle key for `abandon ×11 about` (SLIP-0010 Ed25519 at
@@ -19,14 +21,17 @@ fn key() -> HostKey {
     key
 }
 
+/// A node that reaches no one: its home is a fresh profile's, whose default
+/// configuration (the main network, a dynamic peer set, the default seeds)
+/// would dial Radicle's bootstrap nodes.
 fn opts(home: &str) -> Options {
     Options {
         home: home.into(),
         alias: "host-key-test".into(),
         listen: vec![],
         control_socket: true,
-        routing: None,
-        isolated: false,
+        routing: Some(common::routing()),
+        isolated: true,
         repositories: None,
     }
 }
