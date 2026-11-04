@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
 
 use radicle::node::address::{KnownAddress, Source, Store as _};
-use radicle::node::config::ConnectAddress;
+use radicle::node::config::{ConnectAddress, Network};
 use radicle::node::{Address, Alias, Features, NodeId, UserAgent};
 use radicle::profile::Profile;
 
@@ -138,10 +138,19 @@ fn successful_history(profile: &Profile) -> BTreeMap<NodeId, u64> {
     history
 }
 
+/// Whether `profile`'s node takes the shipped seeds: they are seeds of the
+/// main network, and a node on any other reaches none of them.
+fn ships(profile: &Profile) -> bool {
+    profile.config.node.network == Network::Main
+}
+
 /// Merge explicit user preferences with the device's successful seed history
 /// and finally the shipped cold-start prior. The historical Iris/Rosa defaults
 /// are recognized by node ID and therefore do not jump to the front merely
 /// because Heartwood wrote them into a new profile.
+///
+/// The shipped prior is the main network's: a profile on another network
+/// gets its preferred seeds alone.
 pub(crate) fn effective(profile: &Profile) -> Result<Vec<Candidate>, Error> {
     // An explicitly empty preferred-seed list is the established way for a
     // host to request an isolated node. Do not silently defeat that intent
@@ -149,7 +158,11 @@ pub(crate) fn effective(profile: &Profile) -> Result<Vec<Candidate>, Error> {
     if profile.config.preferred_seeds.is_empty() {
         return Ok(Vec::new());
     }
-    let mut shipped = shipped()?;
+    let mut shipped = if ships(profile) {
+        shipped()?
+    } else {
+        Vec::new()
+    };
     let history = successful_history(profile);
     shipped.sort_by(|left, right| {
         history
@@ -196,6 +209,10 @@ pub(crate) fn effective(profile: &Profile) -> Result<Vec<Candidate>, Error> {
 /// after `Runtime::init` has created the database but before `Runtime::run`
 /// starts, so the insert cannot race the node thread.
 pub(crate) fn install(profile: &Profile) -> Result<(), Error> {
+    // The main network's seeds, for a node on the main network alone.
+    if !ships(profile) {
+        return Ok(());
+    }
     let database = profile.config.node.database;
     let mut store = profile
         .home
