@@ -2983,10 +2983,16 @@ pub unsafe fn remove_git_config_env() {
 /// - **macOS and iOS:** `task_threads` on the process's own task, whose thread
 ///   ports and array it then releases;
 /// - **Windows:** a Toolhelp32 snapshot of the system's threads, filtered by
-///   the process's ID.
+///   the process's ID, less the threads that start in ntdll's image: the
+///   system thread pool's workers (`TppWorkerThread`). The loader starts
+///   some in every process, to map DLLs in parallel, and they wait 30 s for
+///   more work before they exit, so a fresh process has them at `main`.
+///   Each of the process's threads is opened and its Win32 start address
+///   read (`NtQueryInformationThread`, `ThreadQuerySetWin32StartAddress`).
 ///
-/// Where the count fails (no `/proc`, say, or a failed call), and on any
-/// other platform, it refuses.
+/// Where the count fails (no `/proc`, say, a failed call, or on Windows a
+/// thread that can't be opened or queried), and on any other platform, it
+/// refuses.
 ///
 /// **Why that is sound.** [`isolate_git_config`]'s contract is that no other
 /// thread can use libgit2 while it runs. A single-threaded process has no
@@ -2994,6 +3000,11 @@ pub unsafe fn remove_git_config_env() {
 /// could spawn one, and the caller is running this function, which spawns
 /// none. A thread that has ended is no longer counted, and its use of libgit2
 /// is over, which the contract allows.
+///
+/// On Windows, a thread-pool worker isn't counted. It runs only work queued
+/// to a pool: the loader's, and callbacks the process has queued. libgit2,
+/// libradicle and Rust's std queue none. A host that has queued a callback
+/// that uses libgit2 to a Windows thread pool must not rely on this check.
 ///
 /// A later call counts again: in a process that has spawned a thread since,
 /// it refuses, though its first call's isolation stands.

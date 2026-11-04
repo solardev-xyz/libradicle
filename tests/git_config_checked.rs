@@ -6,7 +6,9 @@
 //! A test binary without libtest's harness (Cargo.toml), so that `main` is the
 //! process's one thread. It checks the refusals with a second thread of its
 //! own, then runs itself again, as a child that starts no thread, for the
-//! successes: a thread can still be counted for a moment after its join.
+//! successes: a thread can still be counted for a moment after its join. On
+//! Windows the child also has the loader's worker threads, which start in
+//! ntdll and which the count leaves out: a strict count found 4 threads there.
 
 use std::process::Command;
 use std::sync::mpsc;

@@ -31,15 +31,19 @@ zeroize = "1"
 ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
 
 # The thread counts behind `isolate_git_config_single_threaded`
-# (src/threads.rs): `task_threads` on Apple platforms, a Toolhelp32 snapshot
-# on Windows. Both are already in the graph; Linux reads /proc.
+# (src/threads.rs): `task_threads` on Apple platforms; on Windows a Toolhelp32
+# snapshot, with each thread's start address against ntdll's image. Both are
+# already in the graph; Linux reads /proc.
 [target.'cfg(target_vendor = "apple")'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
+    "Wdk_System_Threading",
     "Win32_Foundation",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
 
