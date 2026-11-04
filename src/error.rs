@@ -89,6 +89,17 @@ pub enum Error {
     Policy(#[from] radicle::node::policy::store::Error),
     #[error(transparent)]
     Sqlite(#[from] sqlite::Error),
+    /// The repository is being repaired or is quarantined: it isn't seeded,
+    /// cloned or imported until its host opens it.
+    #[error("{rid} is {state}: it can't be seeded until it opens")]
+    Gated {
+        rid: RepoId,
+        state: radicle::node::gate::RepoState,
+    },
+    /// A quarantined repository's removal asked while it is open at the
+    /// gate: it runs only while the repository is shut.
+    #[error("{0} is open at the repository gate: shut it before it is removed")]
+    Open(RepoId),
     /// A unit of an online repair failed outside its repository (heartwood's
     /// reconciliation driver): the progress state or the quarantine record.
     ///

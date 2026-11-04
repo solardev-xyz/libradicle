@@ -302,3 +302,123 @@ fn a_removal_checks_its_qid_then_removes_the_repository_and_its_record() {
     node.shutdown().expect("clean shutdown");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+// Review of #22, round 1: seeds and clones racing a removal. Neither the
+// node's own seed command (the control socket's) nor this crate's clone may
+// seed a repository its host has shut, so the removal's unseed stands.
+fn a_removal_outlasts_seeds_and_clones_racing_it() {
+    use radicle::node::policy::Scope;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let gate = RepoGate::new();
+    let home = home("gate-race");
+    let mut node = start(&home, 25, vec![], Some(gate.clone()));
+    let rid = import(&mut node, "raced");
+    let mut quarantine = Quarantine::open(home.join("node").join(QUARANTINE_DB_FILE)).unwrap();
+    let record = quarantine
+        .quarantine(
+            rid,
+            Kind::Namespace,
+            "test",
+            None,
+            "a test",
+            Default::default(),
+        )
+        .unwrap();
+    gate.close(
+        rid,
+        RepoState::Quarantined(Shut::Namespace),
+        Duration::from_secs(5),
+    )
+    .expect("the gate closes");
+
+    // Widen the removal's window: its tree deletion has 10,000 more entries.
+    let junk = storage_of(&home, rid).join("junk");
+    std::fs::create_dir_all(&junk).unwrap();
+    for i in 0..10_000 {
+        std::fs::write(junk.join(i.to_string()), b"junk").unwrap();
+    }
+
+    let racing = AtomicBool::new(true);
+    let (seeds, clones) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let removal = std::thread::scope(|scope| {
+        // Seeds through the node's control socket, as `rad seed` sends them.
+        scope.spawn(|| {
+            let mut control = control(&home);
+            while racing.load(Ordering::Acquire) {
+                let seeded = control.seed(rid, Scope::All);
+                assert!(
+                    !matches!(seeded, Ok(true)),
+                    "a seed of a shut repository was accepted"
+                );
+                seeds.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        // Clones through this crate, which seed before they fetch.
+        let network = node.network();
+        let (racing, clones) = (&racing, &clones);
+        scope.spawn(move || {
+            let mut network = network;
+            while racing.load(Ordering::Acquire) {
+                let cloned = network.clone_repo(rid, Duration::from_millis(100));
+                assert!(
+                    matches!(cloned, Err(libradicle::Error::Gated { .. })),
+                    "{cloned:?}"
+                );
+                clones.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        // Both under way before the removal starts.
+        while seeds.load(Ordering::Relaxed) == 0 || clones.load(Ordering::Relaxed) == 0 {
+            std::thread::yield_now();
+        }
+        let removal = node.remove_quarantined(rid, record.qid, &mut quarantine);
+        racing.store(false, Ordering::Release);
+        removal
+    });
+    assert_eq!(removal.unwrap(), Removal::Removed);
+    assert!(seeds.load(Ordering::Relaxed) > 0 && clones.load(Ordering::Relaxed) > 0);
+    assert!(!storage_of(&home, rid).exists());
+    assert!(quarantine.get(&rid).unwrap().is_none());
+    assert!(
+        !node
+            .list_seeded_repos()
+            .unwrap()
+            .iter()
+            .any(|repo| repo.rid == rid),
+        "a seed accepted while the gate was shut survived the removal"
+    );
+
+    node.shutdown().expect("clean shutdown");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_removal_of_an_open_repository_is_refused() {
+    let gate = RepoGate::new();
+    let home = home("gate-open");
+    let mut node = start(&home, 26, vec![], Some(gate.clone()));
+    let rid = import(&mut node, "open-removal");
+    let mut quarantine = Quarantine::open(home.join("node").join(QUARANTINE_DB_FILE)).unwrap();
+    let record = quarantine
+        .quarantine(
+            rid,
+            Kind::Namespace,
+            "test",
+            None,
+            "a test",
+            Default::default(),
+        )
+        .unwrap();
+    // Recorded, but not shut at the gate: nothing is touched.
+    assert!(matches!(
+        node.remove_quarantined(rid, record.qid, &mut quarantine),
+        Err(libradicle::Error::Open(found)) if found == rid
+    ));
+    assert!(storage_of(&home, rid).is_dir());
+    assert!(quarantine.get(&rid).unwrap().is_some());
+
+    node.shutdown().expect("clean shutdown");
+    let _ = std::fs::remove_dir_all(&home);
+}

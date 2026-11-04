@@ -283,6 +283,8 @@ pub struct Network {
     profile: Profile,
     handle: NodeHandle,
     seed_book: Arc<Vec<seeds::Candidate>>,
+    /// The node's repository gate ([`Options::repositories`]).
+    repositories: radicle::node::gate::RepoGate,
 }
 
 /// One failed seed dial observed before bootstrap reached its readiness target
@@ -737,7 +739,7 @@ impl Network {
         cancel: &CancelToken,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<(), Error> {
-        self.handle.seed(rid, Scope::All)?;
+        seed(&self.repositories, &mut self.handle, rid)?;
 
         // Try nodes that are known to seed this repo, preferring connected ones.
         let seeds = self.handle.seeds_for(rid, [*self.profile.did()])?;
@@ -958,6 +960,9 @@ pub struct Embedded {
     /// How the node's thread ended, if with an error: kept until the home
     /// is let go of, and then returned, once ([`Embedded::shutdown_within`]).
     ended: Option<Error>,
+    /// The node's repository gate ([`Options::repositories`]): the host's,
+    /// or one that admits everything.
+    repositories: radicle::node::gate::RepoGate,
 }
 
 impl Embedded {
@@ -1055,6 +1060,7 @@ impl Embedded {
             gate = Arc::new(Isolated);
             listen.clear();
         }
+        let repositories = opts.repositories.clone().unwrap_or_else(repositories);
         let runtime = Runtime::init(
             profile.home.clone(),
             config,
@@ -1063,7 +1069,7 @@ impl Embedded {
             sig_rx,
             signer,
             gate,
-            opts.repositories.clone().unwrap_or_else(repositories),
+            repositories.clone(),
         )?;
         if !opts.isolated && !seed_book.is_empty() {
             seeds::install(&profile)?;
@@ -1088,6 +1094,7 @@ impl Embedded {
             _signals: sig_tx,
             released: false,
             ended: None,
+            repositories,
         })
     }
 
@@ -1111,6 +1118,7 @@ impl Embedded {
             profile: self.profile.clone(),
             handle: self.handle.clone(),
             seed_book: Arc::clone(&self.seed_book),
+            repositories: self.repositories.clone(),
         }
     }
 
@@ -1456,7 +1464,7 @@ impl Embedded {
             &signer,
             &self.profile.storage,
         )?;
-        self.handle.seed(rid, Scope::All)?;
+        seed(&self.repositories, &mut self.handle, rid)?;
         self.handle.add_inventory(rid)?;
         self.announce_refs(rid)?;
         Ok(rid)
@@ -2809,6 +2817,14 @@ impl Embedded {
         qid: reconcile::quarantine::Qid,
         quarantine: &mut reconcile::quarantine::Quarantine,
     ) -> Result<reconcile::quarantine::Removal, Error> {
+        // Shut, nothing seeds it while it is removed: neither this crate's
+        // clone and import ([`seed`]) nor the node's own seed command, which
+        // the gate refuses too. So no policy written after the removal's
+        // unseed outlives it.
+        let state = self.repositories.state(&rid);
+        if state.is_open() {
+            return Err(Error::Open(rid));
+        }
         if quarantine.get(&rid)?.is_none_or(|record| record.qid != qid) {
             return Ok(reconcile::quarantine::Removal::NotQuarantined);
         }
@@ -2983,6 +2999,26 @@ fn stored_repository(entry: &std::fs::DirEntry) -> Result<Option<RepoId>, Error>
         Ok(rid) => Ok(Some(rid)),
         Err(_) => Err(radicle::storage::Error::InvalidId(name).into()),
     }
+}
+
+/// Seeds `rid` through the node, holding the repository gate's pass for a
+/// mutation across the policy write: a repository being repaired or
+/// quarantined isn't seeded (`Error::Gated`), and a close of it that has
+/// returned has this seed written already, or refuses it. The node's own
+/// seed command takes the same pass.
+fn seed(
+    repositories: &radicle::node::gate::RepoGate,
+    handle: &mut NodeHandle,
+    rid: RepoId,
+) -> Result<(), Error> {
+    let Some(_pass) = repositories.admit(rid, radicle::node::gate::Purpose::Mutate) else {
+        return Err(Error::Gated {
+            rid,
+            state: repositories.state(&rid),
+        });
+    };
+    handle.seed(rid, Scope::All)?;
+    Ok(())
 }
 
 /// The node's repository gate when the host passes none
