@@ -2076,6 +2076,7 @@ dependencies = [
  "env_logger",
  "getrandom 0.4.3",
  "git2",
+ "libc",
  "log",
  "radicle",
  "radicle-node",
@@ -2085,6 +2086,7 @@ dependencies = [
  "serde_json",
  "sqlite",
  "thiserror 2.0.20",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

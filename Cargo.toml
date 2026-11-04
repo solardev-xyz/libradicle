@@ -30,6 +30,19 @@ thiserror = "2"
 zeroize = "1"
 ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
 
+# The thread counts behind `isolate_git_config_single_threaded`
+# (src/threads.rs): `task_threads` on Apple platforms, a Toolhelp32 snapshot
+# on Windows. Both are already in the graph; Linux reads /proc.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+] }
+
 [features]
 ## No child processes anywhere: serve fetches in-process (libgit2 + a
 ## hand-written packfile, no `git upload-pack`) and skip `git gc`. Required
@@ -41,6 +54,12 @@ no-spawn = ["radicle-node/serve-in-process", "radicle-node/no-gc"]
 [dev-dependencies]
 anyhow = "1"
 env_logger = "0.11"
+
+# Without libtest's harness, which runs each test on a thread of its own:
+# the checked initializers need a process whose one thread is `main`.
+[[test]]
+name = "git_config_checked"
+harness = false
 
 [profile.release]
 lto = "thin"

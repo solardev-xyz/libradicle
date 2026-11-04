@@ -41,6 +41,7 @@ mod objects;
 #[cfg(test)]
 mod seams;
 mod seeds;
+mod threads;
 
 use meter::Meter;
 use objects::{Objects, Walk};
@@ -978,8 +979,8 @@ impl Embedded {
     /// host's concern (OS keychain on iOS/desktop) and layered on later.
     ///
     /// libgit2's configuration search paths stay as the process has them. A
-    /// host that wants them empty calls [`isolate_git_config`] first, under
-    /// its `# Safety` contract.
+    /// host that wants them empty calls [`isolate_git_config_single_threaded`]
+    /// first, or [`isolate_git_config`] under its `# Safety` contract.
     pub fn start(opts: Options) -> Result<Self, Error> {
         let home = Home::new(opts.home.clone())?;
         let profile = if home.keys().join("radicle").exists() {
@@ -2861,7 +2862,8 @@ pub enum Slot {
 }
 
 /// Proof that [`isolate_git_config`] has run, and succeeded, in this process:
-/// only it makes one. A function that must run after it can take one as a
+/// only it makes one, directly or through
+/// [`isolate_git_config_single_threaded`]. A function that must run after it can take one as a
 /// parameter, as freedom-radicled's reconciliation can.
 #[derive(Debug, Clone, Copy)]
 pub struct GitConfigIsolated(());
@@ -2910,7 +2912,8 @@ pub const GIT_CONFIG_ENV: [&str; 3] = [
 /// A later call returns the first one's result and leaves libgit2's options
 /// alone. [`Embedded::start`] and [`Embedded::start_with_key`] don't call it:
 /// the N-API and UniFFI bindings run in a host's process, where libradicle
-/// can't know that the contract below holds.
+/// can't know that the contract below holds. A host's `main` can call
+/// [`isolate_git_config_single_threaded`] instead, which checks it.
 ///
 /// # Safety
 ///
@@ -2965,6 +2968,61 @@ pub unsafe fn remove_git_config_env() {
         // SAFETY: no other thread reads the environment (the `# Safety`
         // above).
         std::env::remove_var(name);
+    }
+}
+
+/// [`isolate_git_config`], checked: it runs only in a process with one
+/// thread, the caller. In any other it changes nothing and returns
+/// [`Error::NotSingleThreaded`]. It is for a host's `main`, before the host
+/// spawns any thread: freedom-radicled calls it there, and keeps `unsafe`
+/// code out of its own crate.
+///
+/// It counts the process's threads:
+///
+/// - **Linux and Android:** `Threads:` in `/proc/self/status`;
+/// - **macOS and iOS:** `task_threads` on the process's own task, whose thread
+///   ports and array it then releases;
+/// - **Windows:** a Toolhelp32 snapshot of the system's threads, filtered by
+///   the process's ID.
+///
+/// Where the count fails (no `/proc`, say, or a failed call), and on any
+/// other platform, it refuses.
+///
+/// **Why that is sound.** [`isolate_git_config`]'s contract is that no other
+/// thread can use libgit2 while it runs. A single-threaded process has no
+/// other thread to use it. Between the count and the call, only the caller
+/// could spawn one, and the caller is running this function, which spawns
+/// none. A thread that has ended is no longer counted, and its use of libgit2
+/// is over, which the contract allows.
+///
+/// A later call counts again: in a process that has spawned a thread since,
+/// it refuses, though its first call's isolation stands.
+pub fn isolate_git_config_single_threaded() -> Result<GitConfigIsolated, Error> {
+    single_threaded()?;
+    // SAFETY: the process has one thread, this one (`single_threaded`), so no
+    // other can use libgit2, and nothing between the count and here spawns one.
+    unsafe { isolate_git_config() }
+}
+
+/// [`remove_git_config_env`], checked as
+/// [`isolate_git_config_single_threaded`] is: it removes [`GIT_CONFIG_ENV`]
+/// only in a process with one thread, the caller, and otherwise changes
+/// nothing and returns [`Error::NotSingleThreaded`]. A single-threaded process
+/// has no other thread to read the environment while it changes.
+pub fn remove_git_config_env_single_threaded() -> Result<(), Error> {
+    single_threaded()?;
+    // SAFETY: as in `isolate_git_config_single_threaded`: no other thread
+    // exists to read the environment.
+    unsafe { remove_git_config_env() };
+    Ok(())
+}
+
+/// `Ok` only if the process has exactly one thread, the caller
+/// ([`threads::count`]).
+fn single_threaded() -> Result<(), Error> {
+    match threads::count() {
+        Some(1) => Ok(()),
+        threads => Err(Error::NotSingleThreaded { threads }),
     }
 }
 

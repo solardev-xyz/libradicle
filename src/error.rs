@@ -93,4 +93,17 @@ pub enum Error {
     /// ([`crate::isolate_git_config`]).
     #[error("libgit2's configuration search paths: {0}")]
     GitConfig(String),
+    /// A checked initializer ([`crate::isolate_git_config_single_threaded`],
+    /// [`crate::remove_git_config_env_single_threaded`]) ran in a process
+    /// with more than one thread, or whose threads couldn't be counted
+    /// (`threads` is `None`), and changed nothing.
+    #[error("{}", not_single_threaded(*.threads))]
+    NotSingleThreaded { threads: Option<usize> },
+}
+
+fn not_single_threaded(threads: Option<usize>) -> String {
+    match threads {
+        Some(n) => format!("not a single-threaded process: it has {n} threads"),
+        None => "not a single-threaded process: its threads couldn't be counted".to_owned(),
+    }
 }
