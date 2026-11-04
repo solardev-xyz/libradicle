@@ -68,6 +68,15 @@ pub struct Options {
     /// `None` leaves the profile's as it is. freedom-core design 0008's
     /// service passes `Block`, so that its node seeds only what it is told
     /// to ("Seeding and serving").
+    ///
+    /// The override reaches this node and this `Embedded`'s own reads
+    /// ([`Embedded::list_repos`] and the others), and nothing else. Since it
+    /// isn't on disk, another reader of the same home still sees
+    /// `config.json`'s default: the `rad` CLI, git's remote helper, or a
+    /// fresh `Profile::load`. A host that needs every reader of the home to
+    /// agree must either write `config.json` itself or keep the home to
+    /// itself. Design 0008's service does the latter: its home is its own,
+    /// and no CLI or remote helper runs on it.
     pub seeding_policy: Option<radicle::node::config::DefaultSeedingPolicy>,
     /// Whether the node reaches no one, whatever `config.json` and `routing`
     /// say (freedom-core design 0008, R-12 part 3):
