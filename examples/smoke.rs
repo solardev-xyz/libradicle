@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
         listen: vec![],
         control_socket: true,
         routing: None,
-        seeding: None,
+        seeding_policy: None,
         isolated: false,
     })?;
     println!("node started, DID: {}", node.did());

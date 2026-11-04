@@ -37,7 +37,7 @@ fn start(home: &str) -> Embedded {
             listen: vec![],
             control_socket: true,
             routing: None,
-            seeding: None,
+            seeding_policy: None,
             isolated: false,
         },
         key(),

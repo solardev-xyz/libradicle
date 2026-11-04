@@ -90,7 +90,7 @@ fn fixture(name: &str) -> Fixture {
             listen: vec![],
             control_socket: true,
             routing: None,
-            seeding: None,
+            seeding_policy: None,
             isolated: false,
         },
         key(),

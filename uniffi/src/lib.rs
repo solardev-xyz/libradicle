@@ -87,7 +87,7 @@ pub fn start(home: String, alias: String) -> String {
         listen: vec![],
         control_socket: true,
         routing: None,
-        seeding: None,
+        seeding_policy: None,
         isolated: false,
     }) {
         Ok(node) => {
@@ -129,7 +129,7 @@ pub fn start_with_key(home: String, alias: String, secret_key: Vec<u8>) -> Strin
             listen: vec![],
             control_socket: true,
             routing: None,
-            seeding: None,
+            seeding_policy: None,
             isolated: false,
         },
         key,
@@ -844,7 +844,7 @@ mod tests {
                 onion: radicle::node::config::AddressConfig::Drop,
                 gate: gate.clone(),
             }),
-            seeding: None,
+            seeding_policy: None,
             isolated: false,
         })
         .unwrap();

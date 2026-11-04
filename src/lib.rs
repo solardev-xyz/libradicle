@@ -62,11 +62,13 @@ pub struct Options {
     /// leaves `config.json`'s routing as it is.
     pub routing: Option<Routing>,
     /// The node's default seeding policy, for a repository with no policy of
-    /// its own, set in memory over `config.json`'s `seedingPolicy`. `None`
-    /// leaves `config.json`'s. freedom-core design 0008's service passes
-    /// `Block`, since its node seeds only what is explicitly seeded, cloned or
-    /// synced ("Seeding and serving").
-    pub seeding: Option<radicle::node::config::DefaultSeedingPolicy>,
+    /// its own, set in memory over the profile's: `config.json`'s
+    /// `node.seedingPolicy`, or the deprecated `node.policy` and `node.scope`
+    /// that heartwood lets override it. `config.json` is never written.
+    /// `None` leaves the profile's as it is. freedom-core design 0008's
+    /// service passes `Block`, so that its node seeds only what it is told
+    /// to ("Seeding and serving").
+    pub seeding_policy: Option<radicle::node::config::DefaultSeedingPolicy>,
     /// Whether the node reaches no one, whatever `config.json` and `routing`
     /// say (freedom-core design 0008, R-12 part 3):
     /// - its peer set is static, with no `connect` peers, so it takes no
@@ -1030,11 +1032,6 @@ impl Embedded {
         host_signer: Option<radicle::crypto::SigningKey>,
         opts: Options,
     ) -> Result<Self, Error> {
-        // In memory: `config.json` isn't written. Set on the profile, so that
-        // the node and this crate's own policy reads agree.
-        if let Some(seeding) = opts.seeding {
-            profile.config.node.seeding_policy = seeding;
-        }
         let seed_book = Arc::new(seeds::effective(&profile)?);
 
         let socket = if opts.control_socket {
@@ -1065,6 +1062,13 @@ impl Embedded {
             config.external_addresses = vec![];
             gate = Arc::new(Isolated);
             listen.clear();
+        }
+        // Last, over whatever the profile loaded, the legacy fields' override
+        // included. On the profile too, so that this crate's own policy reads
+        // (`list_repos`, among others) agree with the node's.
+        if let Some(policy) = opts.seeding_policy {
+            config.seeding_policy = policy;
+            profile.config.node.seeding_policy = policy;
         }
         let runtime = Runtime::init(
             profile.home.clone(),
@@ -3221,7 +3225,7 @@ mod tests {
                 onion: radicle::node::config::AddressConfig::Drop,
                 gate: gate.clone(),
             }),
-            seeding: None,
+            seeding_policy: None,
             isolated: false,
         })
         .unwrap();

@@ -32,7 +32,7 @@ fn start(home: &Path) -> Result<Embedded, Error> {
         listen: vec![],
         control_socket: true,
         routing: None,
-        seeding: None,
+        seeding_policy: None,
         isolated: false,
     })
 }

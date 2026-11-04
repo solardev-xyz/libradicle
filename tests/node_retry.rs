@@ -52,7 +52,7 @@ fn start_with(home: &str, control_socket: bool) -> Embedded {
             listen: vec![],
             control_socket,
             routing: None,
-            seeding: None,
+            seeding_policy: None,
             isolated: false,
         },
         key(),
