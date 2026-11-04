@@ -61,6 +61,12 @@ pub struct Options {
     /// How the node reaches peers, set in memory over `config.json`. `None`
     /// leaves `config.json`'s routing as it is.
     pub routing: Option<Routing>,
+    /// The node's default seeding policy, for a repository with no policy of
+    /// its own, set in memory over `config.json`'s `seedingPolicy`. `None`
+    /// leaves `config.json`'s. freedom-core design 0008's service passes
+    /// `Block`, since its node seeds only what is explicitly seeded, cloned or
+    /// synced ("Seeding and serving").
+    pub seeding: Option<radicle::node::config::DefaultSeedingPolicy>,
     /// Whether the node reaches no one, whatever `config.json` and `routing`
     /// say (freedom-core design 0008, R-12 part 3):
     /// - its peer set is static, with no `connect` peers, so it takes no
@@ -1016,11 +1022,16 @@ impl Embedded {
     }
 
     fn run(
-        profile: Profile,
+        mut profile: Profile,
         signer: radicle::crypto::SigningKey,
         host_signer: Option<radicle::crypto::SigningKey>,
         opts: Options,
     ) -> Result<Self, Error> {
+        // In memory: `config.json` isn't written. Set on the profile, so that
+        // the node and this crate's own policy reads agree.
+        if let Some(seeding) = opts.seeding {
+            profile.config.node.seeding_policy = seeding;
+        }
         let seed_book = Arc::new(seeds::effective(&profile)?);
 
         let socket = if opts.control_socket {
@@ -3200,6 +3211,7 @@ mod tests {
                 onion: radicle::node::config::AddressConfig::Drop,
                 gate: gate.clone(),
             }),
+            seeding: None,
             isolated: false,
         })
         .unwrap();

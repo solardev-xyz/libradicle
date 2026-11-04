@@ -59,6 +59,7 @@ fn start(home: &Path, isolated: bool, listen: Vec<SocketAddr>) -> Embedded {
             listen,
             control_socket: true,
             routing: None,
+            seeding: None,
             isolated,
         },
         key(),

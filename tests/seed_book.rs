@@ -59,6 +59,7 @@ fn start(home: &Path) -> Embedded {
                 onion: AddressConfig::Drop,
                 gate: Arc::new(Refusing),
             }),
+            seeding: None,
             isolated: false,
         },
         HostKey::from_bytes(&mut bytes).expect("32 bytes"),
