@@ -86,6 +86,27 @@ fn child() {
             vec![([0, 0, 0, 0], 0).into()],
             Some(common::routing()),
         ),
+        "isolated-onion" => Options {
+            isolated: true,
+            ..options(
+                home,
+                vec![],
+                Some(Routing {
+                    onion: AddressConfig::Proxy { address: off_host },
+                    ..common::routing()
+                }),
+            )
+        },
+        "isolated-config-onion" => {
+            configured(
+                home,
+                r#","onion":{"mode":"proxy","address":"198.51.100.7:9050"}"#,
+            );
+            Options {
+                isolated: true,
+                ..options(home, vec![], None)
+            }
+        }
         "config-proxy" => {
             configured(home, r#","proxy":"198.51.100.7:9050""#);
             options(home, vec![], None)
@@ -144,6 +165,22 @@ fn an_off_host_proxy_is_refused_before_the_node_starts() {
 #[test]
 fn an_off_host_onion_proxy_is_refused_before_the_node_starts() {
     let stderr = ends_loudly("onion");
+    assert!(
+        stderr.contains("the onion proxy 198.51.100.7:9050"),
+        "{stderr}"
+    );
+}
+
+#[test]
+// Review of #23, round 2: isolation doesn't make a proxy safe. heartwood
+// reaches an onion proxy without asking any gate, isolated or not.
+fn an_isolated_node_s_off_host_onion_proxy_is_refused_before_it_starts() {
+    let stderr = ends_loudly("isolated-onion");
+    assert!(
+        stderr.contains("the onion proxy 198.51.100.7:9050"),
+        "{stderr}"
+    );
+    let stderr = ends_loudly("isolated-config-onion");
     assert!(
         stderr.contains("the onion proxy 198.51.100.7:9050"),
         "{stderr}"

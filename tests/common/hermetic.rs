@@ -21,7 +21,9 @@
 //!   proxy.
 //!
 //! An isolated node's own gate refuses every target, whatever this one says,
-//! and it listens nowhere.
+//! and it listens nowhere, so its peers, names and listeners aren't checked.
+//! Its proxies are: heartwood reaches a SOCKS, onion or I2P proxy without
+//! asking any gate.
 //!
 //! Shared by the integration tests (`tests/common`), whose `start` and
 //! `start_with_key` check every node, and, through `#[path]`, by the crate's
@@ -124,12 +126,15 @@ pub fn check(
     listen: &[SocketAddr],
     routing: Option<(Option<SocketAddr>, &AddressConfig)>,
 ) {
-    if isolated {
-        // It dials no one and listens nowhere, whatever it is given.
-        return;
-    }
-    if let Some(addr) = listen.iter().find(|addr| !loopback(addr)) {
-        off_host(format_args!("a listener on {addr}"));
+    // Isolation (`Options::isolated`) clears the listeners, makes the peer
+    // set static with no `connect` peers, and refuses every target at its
+    // gate, names included: those are neutralized. The routes that open a
+    // socket without asking the gate, a SOCKS proxy and an onion or I2P
+    // proxy, are checked for every node, isolated or not.
+    if !isolated {
+        if let Some(addr) = listen.iter().find(|addr| !loopback(addr)) {
+            off_host(format_args!("a listener on {addr}"));
+        }
     }
     match routing {
         Some((proxy, onion)) => {
@@ -142,15 +147,20 @@ pub fn check(
                 }
             }
         }
-        None => check_config(home),
+        None => check_config(home, isolated),
     }
 }
 
 /// `routing: None`: the node routes as `home`'s `config.json` says, through
-/// heartwood's own gate.
-fn check_config(home: &Path) {
+/// heartwood's own gate, or the isolated one.
+fn check_config(home: &Path, isolated: bool) {
     let path = home.join("config.json");
     let Ok(text) = std::fs::read_to_string(&path) else {
+        // A fresh profile's defaults have no proxy, which leaves an isolated
+        // node nothing to reach.
+        if isolated {
+            return;
+        }
         off_host(format_args!(
             "the network through a fresh profile's default configuration (no {})",
             path.display()
@@ -159,6 +169,10 @@ fn check_config(home: &Path) {
     let config: serde_json::Value =
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let node = &config["node"];
+    check_proxies(node);
+    if isolated {
+        return;
+    }
     if config["preferredSeeds"]
         .as_array()
         .is_none_or(|seeds| !seeds.is_empty())
@@ -174,25 +188,9 @@ fn check_config(home: &Path) {
             path.display()
         ));
     }
-    let proxy = node["proxy"].as_str().map(|proxy| {
-        proxy
-            .parse::<SocketAddr>()
-            .unwrap_or_else(|_| off_host(format_args!("the proxy {proxy}")))
-    });
-    if let Some(proxy) = proxy.filter(|proxy| !loopback(proxy)) {
-        off_host(format_args!("the proxy {proxy}"));
-    }
+    let proxy = global_proxy(node);
     for route in ["onion", "i2p"] {
-        let mode = &node[route]["mode"];
-        if mode == "proxy" {
-            let address = node[route]["address"].as_str().unwrap_or_default();
-            if address
-                .parse::<SocketAddr>()
-                .map_or(true, |address| !loopback(&address))
-            {
-                off_host(format_args!("the {route} proxy {address}"));
-            }
-        } else if mode == "forward" && proxy.is_none() {
+        if node[route]["mode"] == "forward" && proxy.is_none() {
             off_host(format_args!(
                 "{route} names, forwarded with no proxy: through DNS"
             ));
@@ -209,6 +207,36 @@ fn check_config(home: &Path) {
             // A name goes to the proxy to resolve, or else to DNS.
             Err(_) if proxy.is_some() => {}
             Err(_) => off_host(format_args!("the name in {peer}, through DNS")),
+        }
+    }
+}
+
+/// `config.json`'s global proxy, which must be at loopback.
+fn global_proxy(node: &serde_json::Value) -> Option<SocketAddr> {
+    let proxy = node["proxy"].as_str().map(|proxy| {
+        proxy
+            .parse::<SocketAddr>()
+            .unwrap_or_else(|_| off_host(format_args!("the proxy {proxy}")))
+    });
+    if let Some(proxy) = proxy.filter(|proxy| !loopback(proxy)) {
+        off_host(format_args!("the proxy {proxy}"));
+    }
+    proxy
+}
+
+/// `config.json`'s routes that open a socket without asking the gate: the
+/// global proxy, and the onion and I2P proxies.
+fn check_proxies(node: &serde_json::Value) {
+    global_proxy(node);
+    for route in ["onion", "i2p"] {
+        if node[route]["mode"] == "proxy" {
+            let address = node[route]["address"].as_str().unwrap_or_default();
+            if address
+                .parse::<SocketAddr>()
+                .map_or(true, |address| !loopback(&address))
+            {
+                off_host(format_args!("the {route} proxy {address}"));
+            }
         }
     }
 }
