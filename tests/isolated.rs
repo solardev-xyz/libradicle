@@ -54,7 +54,7 @@ fn home(name: &str, network: &str, connect: Option<String>, seed: Option<String>
 }
 
 fn start(home: &Path, isolated: bool, listen: Vec<SocketAddr>) -> Embedded {
-    Embedded::start_with_key(
+    common::start_with_key(
         Options {
             home: home.to_str().expect("utf-8 temp dir").into(),
             alias: "isolated".into(),

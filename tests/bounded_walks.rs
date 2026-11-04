@@ -87,7 +87,7 @@ fn fixture(name: &str) -> Fixture {
     std::fs::write(work.join("blob.bin"), vec![0u8; 5000]).unwrap();
     let third = commit(&repo, "third");
 
-    let mut node = Embedded::start_with_key(
+    let mut node = common::start_with_key(
         Options {
             home: home.to_str().expect("utf-8 temp dir").into(),
             alias: "walks".into(),

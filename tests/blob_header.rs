@@ -85,7 +85,7 @@ fn fixture(name: &str) -> Fixture {
         .unwrap();
     repo.set_head("refs/heads/main").unwrap();
 
-    let mut node = Embedded::start_with_key(
+    let mut node = common::start_with_key(
         Options {
             home: home.to_str().expect("utf-8 temp dir").into(),
             alias: "blobs".into(),

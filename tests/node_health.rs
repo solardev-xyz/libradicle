@@ -32,7 +32,7 @@ fn home(name: &str) -> String {
 }
 
 fn start(home: &str) -> Embedded {
-    Embedded::start_with_key(
+    common::start_with_key(
         Options {
             home: home.into(),
             alias: "health".into(),

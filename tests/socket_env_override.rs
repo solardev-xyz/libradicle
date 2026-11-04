@@ -5,7 +5,7 @@
 
 mod common;
 
-use libradicle::{Embedded, Options};
+use libradicle::Options;
 
 #[test]
 fn rad_socket_env_redirects_control_socket_away_from_long_home() {
@@ -15,7 +15,7 @@ fn rad_socket_env_redirects_control_socket_away_from_long_home() {
     let socket = format!("/tmp/radsock-{}.sock", std::process::id());
     std::env::set_var("RAD_SOCKET", &socket);
 
-    let node = Embedded::start(Options {
+    let node = common::start(Options {
         home: home.clone().into(),
         alias: "sock-test".into(),
         listen: vec![],

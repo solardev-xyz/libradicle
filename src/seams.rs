@@ -109,23 +109,26 @@ mod tests {
         .unwrap();
         let mut bytes = vec![7u8; 32];
         let key = HostKey::from_bytes(&mut bytes).expect("32 bytes");
-        let mut node = Embedded::start_with_key(
-            Options {
-                home: home.clone(),
-                alias: "seams".into(),
-                listen: vec![],
-                control_socket: false,
-                routing: Some(crate::Routing {
-                    proxy: None,
-                    onion: radicle::node::config::AddressConfig::Drop,
-                    gate: crate::hermetic::gate(),
-                }),
-                isolated: false,
-                repositories: None,
-            },
-            key,
-        )
-        .expect("start");
+        let opts = Options {
+            home: home.clone(),
+            alias: "seams".into(),
+            listen: vec![],
+            control_socket: false,
+            routing: Some(crate::Routing {
+                proxy: None,
+                onion: radicle::node::config::AddressConfig::Drop,
+                gate: crate::hermetic::gate(),
+            }),
+            isolated: false,
+            repositories: None,
+        };
+        crate::hermetic::check(
+            &opts.home,
+            opts.isolated,
+            &opts.listen,
+            Some((None, &radicle::node::config::AddressConfig::Drop)),
+        );
+        let mut node = Embedded::start_with_key(opts, key).expect("start");
         let repos = (0..repos)
             .map(|i| {
                 let work = dir.join(format!("work{i}"));

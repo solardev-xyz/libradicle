@@ -28,7 +28,7 @@ fn home(name: &str) -> PathBuf {
 }
 
 fn start(home: &Path) -> Result<Embedded, Error> {
-    Embedded::start(Options {
+    common::start(Options {
         home: home.to_str().expect("utf-8 temp dir").into(),
         alias: "control".into(),
         listen: vec![],

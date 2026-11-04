@@ -4,7 +4,7 @@
 
 mod common;
 
-use libradicle::{Embedded, HostKey, Options};
+use libradicle::{HostKey, Options};
 
 /// Freedom's Radicle key for `abandon ×11 about` (SLIP-0010 Ed25519 at
 /// m/44'/73404'/0'/0'/0'), and its DID, as desktop's `derivation.js` /
@@ -52,7 +52,7 @@ fn host_key_runs_as_that_key_and_keeps_the_profiles_own() {
     let config_file = std::path::Path::new(&home).join("config.json");
 
     // A fresh home: the profile is created, but no key file is written.
-    let node = Embedded::start_with_key(opts(&home), key()).expect("start with a host key");
+    let node = common::start_with_key(opts(&home), key()).expect("start with a host key");
     assert_eq!(node.did(), DID);
     node.shutdown().expect("clean shutdown");
     assert!(!secret_file.exists(), "no secret key file");
@@ -73,7 +73,7 @@ fn host_key_runs_as_that_key_and_keeps_the_profiles_own() {
 
     // Without a host key the node makes (and keeps) its own, and leaves the
     // existing config alone.
-    let node = Embedded::start(opts(&home)).expect("start with the profile's key");
+    let node = common::start(opts(&home)).expect("start with the profile's key");
     let device = node.did();
     assert_ne!(device, DID);
     node.shutdown().expect("clean shutdown");
@@ -89,13 +89,13 @@ fn host_key_runs_as_that_key_and_keeps_the_profiles_own() {
     let device_key = std::fs::read(&secret_file).expect("device key written");
 
     // The host key again: its identity, the device key file untouched.
-    let node = Embedded::start_with_key(opts(&home), key()).expect("start with a host key again");
+    let node = common::start_with_key(opts(&home), key()).expect("start with a host key again");
     assert_eq!(node.did(), DID);
     node.shutdown().expect("clean shutdown");
     assert_eq!(std::fs::read(&secret_file).unwrap(), device_key);
 
     // And back to the device's own.
-    let node = Embedded::start(opts(&home)).expect("start with the profile's key again");
+    let node = common::start(opts(&home)).expect("start with the profile's key again");
     assert_eq!(node.did(), device);
     node.shutdown().expect("clean shutdown");
 

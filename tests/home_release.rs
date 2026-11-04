@@ -93,7 +93,7 @@ impl radicle::node::dial::Gate for Unresolved {
 }
 
 fn start(home: &Path, gate: Option<Arc<Held>>) -> Result<Embedded, Error> {
-    Embedded::start_with_key(
+    common::start_with_key(
         Options {
             home: home.to_str().expect("utf-8 temp dir").into(),
             alias: "release".into(),

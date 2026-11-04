@@ -56,7 +56,7 @@ fn start(home: &Path, routing: Option<Routing>) -> Embedded {
         gate: common::hermetic::wrapping(routing.gate),
         ..routing
     });
-    Embedded::start_with_key(
+    common::start_with_key(
         Options {
             home: home.to_str().expect("utf-8 temp dir").into(),
             alias: "routing".into(),

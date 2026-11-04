@@ -47,7 +47,7 @@ fn start(home: &str) -> Embedded {
 }
 
 fn start_with(home: &str, control_socket: bool) -> Embedded {
-    Embedded::start_with_key(
+    common::start_with_key(
         Options {
             home: home.into(),
             alias: "health".into(),

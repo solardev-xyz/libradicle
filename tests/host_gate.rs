@@ -57,7 +57,7 @@ fn start(
     listen: Vec<SocketAddr>,
     repositories: Option<RepoGate>,
 ) -> Embedded {
-    Embedded::start_with_key(
+    common::start_with_key(
         Options {
             home: home.to_path_buf(),
             alias: "gate".into(),
