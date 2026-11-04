@@ -69,7 +69,10 @@ pub struct Options {
     ///   explicit connect, to the seed book among others, fails before any
     ///   socket, and no address a peer announces enters its address book;
     /// - it listens on no address, `listen` notwithstanding, and the shipped
-    ///   seeds aren't added to its address book.
+    ///   seeds aren't added to its address book;
+    /// - it has no proxy, and drops onion and I2P addresses, whatever
+    ///   `routing` and `config.json` say: heartwood reaches a proxy without
+    ///   asking the gate.
     ///
     /// It still serves the host from local storage.
     pub isolated: bool,
@@ -1042,6 +1045,13 @@ impl Embedded {
         if opts.isolated {
             config.peers = radicle::node::config::PeerConfig::Static;
             config.connect = Default::default();
+            // No route that opens a socket without asking the gate: heartwood
+            // connects to an onion or I2P proxy, and to the global proxy for a
+            // forwarded name, without asking it.
+            config.proxy = None;
+            config.onion = radicle::node::config::AddressConfig::Drop;
+            config.i2p = radicle::node::config::AddressConfig::Drop;
+            config.external_addresses = vec![];
             gate = Arc::new(Isolated);
             listen.clear();
         }
