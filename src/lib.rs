@@ -957,6 +957,7 @@ impl Embedded {
     /// The identity key is stored without a passphrase; key custody is the
     /// host's concern (OS keychain on iOS/desktop) and layered on later.
     pub fn start(opts: Options) -> Result<Self, Error> {
+        isolate_git_config()?;
         let home = Home::new(opts.home.clone())?;
         let profile = if home.keys().join("radicle").exists() {
             Profile::load_from(home.clone())?
@@ -1003,6 +1004,7 @@ impl Embedded {
     /// shared by both identities: a repository seeded under one stays
     /// seeded under the other.
     pub fn start_with_key(opts: Options, key: HostKey) -> Result<Self, Error> {
+        isolate_git_config()?;
         let home = Home::new(opts.home.clone())?;
         // Expand the seed by reference: `Seed::new` takes the array by value,
         // which would leave a bare copy of it on the stack. dalek's key
@@ -2820,6 +2822,43 @@ pub enum Slot {
     Stopped,
     /// The slot was empty: no node was started.
     Empty,
+}
+
+/// Empties libgit2's configuration search paths: the system, XDG, global and
+/// ProgramData levels (freedom-core design 0008, libradicle item 9). From then
+/// on no git configuration outside a repository's own applies to anything
+/// libgit2 does in this process: not `/etc/gitconfig`, not `~/.gitconfig`.
+/// Nothing a confined process can't read is opened either: libgit2 fails to
+/// open a repository whose system configuration exists but can't be read.
+///
+/// It runs once per process; a later call returns the first's result.
+/// [`Embedded::start`] and [`Embedded::start_with_key`] call it first. A host
+/// that uses libgit2 before them, reconciliation for one, or confines itself,
+/// calls it earlier, before any other thread uses libgit2: libgit2's options
+/// are process-wide, and setting them isn't synchronized with other libgit2
+/// calls.
+pub fn isolate_git_config() -> Result<(), Error> {
+    static ISOLATED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    ISOLATED
+        .get_or_init(|| {
+            for level in [
+                git2::ConfigLevel::System,
+                git2::ConfigLevel::XDG,
+                git2::ConfigLevel::Global,
+                git2::ConfigLevel::ProgramData,
+            ] {
+                // SAFETY: `set_search_path` writes libgit2's process-wide
+                // options (`git_libgit2_opts(GIT_OPT_SET_SEARCH_PATH, …)`),
+                // which other libgit2 calls read unsynchronized. It runs once,
+                // and this function's contract has its caller call it before
+                // any other thread uses libgit2.
+                unsafe { git2::opts::set_search_path(level, "") }
+                    .map_err(|e| e.message().to_owned())?;
+            }
+            Ok(())
+        })
+        .clone()
+        .map_err(Error::GitConfig)
 }
 
 /// Shuts down the node a binding keeps in `slot`, within `timeout` for all

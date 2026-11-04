@@ -89,4 +89,8 @@ pub enum Error {
     Policy(#[from] radicle::node::policy::store::Error),
     #[error(transparent)]
     Sqlite(#[from] sqlite::Error),
+    /// libgit2's configuration search paths couldn't be emptied
+    /// ([`crate::isolate_git_config`]).
+    #[error("libgit2's configuration search paths: {0}")]
+    GitConfig(String),
 }
