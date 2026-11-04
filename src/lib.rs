@@ -976,6 +976,10 @@ impl Embedded {
     ///
     /// The identity key is stored without a passphrase; key custody is the
     /// host's concern (OS keychain on iOS/desktop) and layered on later.
+    ///
+    /// libgit2's configuration search paths stay as the process has them. A
+    /// host that wants them empty calls [`isolate_git_config`] first, under
+    /// its `# Safety` contract.
     pub fn start(opts: Options) -> Result<Self, Error> {
         let home = Home::new(opts.home.clone())?;
         let profile = if home.keys().join("radicle").exists() {
@@ -2854,6 +2858,114 @@ pub enum Slot {
     Stopped,
     /// The slot was empty: no node was started.
     Empty,
+}
+
+/// Proof that [`isolate_git_config`] has run, and succeeded, in this process:
+/// only it makes one. A function that must run after it can take one as a
+/// parameter, as freedom-radicled's reconciliation can.
+#[derive(Debug, Clone, Copy)]
+pub struct GitConfigIsolated(());
+
+/// The environment variables an environment-driven libgit2 open reads for its
+/// configuration, around the search paths [`isolate_git_config`] empties.
+/// libgit2 1.9 reads no others: it has no `GIT_CONFIG_COUNT` or
+/// `GIT_CONFIG_PARAMETERS`.
+pub const GIT_CONFIG_ENV: [&str; 3] = [
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+];
+
+/// Empties libgit2's default configuration search paths, the System, XDG,
+/// Global and ProgramData levels (freedom-core design 0008, libradicle item
+/// 9). From then on, a repository libgit2 opens by its path reads no
+/// `/etc/gitconfig`, no `~/.gitconfig` and no `$XDG_CONFIG_HOME/git/config`,
+/// and [`git2::Config::open_default`] finds none either. A confined process
+/// then opens its repositories: libgit2 fails an open whose system
+/// configuration exists but can't be read.
+///
+/// That is all it does. It leaves two things:
+///
+/// - **The environment.** An environment-driven open
+///   (`Repository::open_from_env`, or `open_ext` with `FROM_ENV`) also reads
+///   [`GIT_CONFIG_ENV`], whatever the search paths are. libradicle never opens
+///   a repository that way, and nor does any heartwood code it runs: heartwood's
+///   storage opens by path with `BARE | NO_DOTGIT | NO_SEARCH`, and its one
+///   `FROM_ENV` open, `rad::repo`, is the `rad` CLI's. A host that might
+///   clears the variables first ([`remove_git_config_env`]), or refuses to run
+///   with them set, as freedom-radicled refuses every `GIT_*` variable.
+/// - **A repository's own configuration,** includes and all: an
+///   `include.path` or `includeIf.*.path` in it applies wherever it points,
+///   and one a confined process can't read fails that repository's open. Only
+///   the local owner writes that configuration, not a peer. A storage
+///   repository's `config` is written when it is created, and by `set_user`,
+///   with the local profile's `user.name` and `user.email` (heartwood's
+///   `storage::git::Repository::create`). A fetch writes a peer's objects
+///   into `objects/pack` and its refs under its namespace, and nothing else.
+///   A working repository [`Embedded::import_repo`] reads is the host's own.
+///
+/// It doesn't reach a `git` process the node spawns either, in a build
+/// without the `no-spawn` feature: git reads its own configuration.
+///
+/// A later call returns the first one's result and leaves libgit2's options
+/// alone. [`Embedded::start`] and [`Embedded::start_with_key`] don't call it:
+/// the N-API and UniFFI bindings run in a host's process, where libradicle
+/// can't know that the contract below holds.
+///
+/// # Safety
+///
+/// Call it before any thread in the process can use libgit2: first thing in
+/// `main`, before any other thread is spawned. freedom-radicled does. It
+/// writes libgit2's process-wide options
+/// (`git_libgit2_opts(GIT_OPT_SET_SEARCH_PATH, …)`), which every
+/// configuration open reads without synchronization, so a libgit2 call on
+/// another thread at the same time is a data race. A use that has ended
+/// before it is harmless; a concurrent one isn't, and libradicle can neither
+/// see nor lock another caller's use of libgit2.
+pub unsafe fn isolate_git_config() -> Result<GitConfigIsolated, Error> {
+    static ISOLATED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    ISOLATED
+        .get_or_init(|| {
+            for level in [
+                git2::ConfigLevel::System,
+                git2::ConfigLevel::XDG,
+                git2::ConfigLevel::Global,
+                git2::ConfigLevel::ProgramData,
+            ] {
+                // SAFETY: `set_search_path` writes libgit2's process-wide
+                // options, which other libgit2 calls read unsynchronized.
+                // This function's caller has no other thread able to use
+                // libgit2 (its `# Safety`), and the `OnceLock` runs it once.
+                unsafe { git2::opts::set_search_path(level, "") }
+                    .map_err(|e| e.message().to_owned())?;
+            }
+            Ok(())
+        })
+        .clone()
+        .map(|()| GitConfigIsolated(()))
+        .map_err(Error::GitConfig)
+}
+
+/// Removes [`GIT_CONFIG_ENV`] from the process's environment: what an
+/// environment-driven libgit2 open would read around
+/// [`isolate_git_config`]'s empty search paths. For a host that might open a
+/// repository from the environment, or links code that does; libradicle
+/// doesn't. A host can instead refuse to run with them set, as
+/// freedom-radicled does.
+///
+/// # Safety
+///
+/// [`isolate_git_config`]'s: call it before any thread in the process can use
+/// libgit2, or read the environment at all; first thing in `main`, before
+/// any other thread is spawned. Changing the environment races with a
+/// `getenv` on another thread, libgit2's among them; edition 2024 makes
+/// `std::env::remove_var` `unsafe` for that reason.
+pub unsafe fn remove_git_config_env() {
+    for name in GIT_CONFIG_ENV {
+        // SAFETY: no other thread reads the environment (the `# Safety`
+        // above).
+        std::env::remove_var(name);
+    }
 }
 
 /// Shuts down the node a binding keeps in `slot`, within `timeout` for all

@@ -51,9 +51,11 @@ jobs:
         shell: bash
         run: cargo test --locked -p libradicle --features no-spawn
 
-  # Every crate's source, across the whole workspace (the bindings' graphs
-  # included): crates.io, or heartwood's canonical repository, and nothing
-  # else (deny.toml's [sources]). Then the library's full policy.
+  # The whole policy, across the whole workspace (the bindings' graphs
+  # included): advisories, bans, licences, and every crate's source,
+  # crates.io or heartwood's canonical repository and nothing else
+  # (deny.toml). Without --workspace, cargo deny checks the root package's
+  # graph alone.
   deny:
     name: cargo deny
     runs-on: ubuntu-22.04
@@ -71,7 +73,5 @@ jobs:
           curl -fsSL -o "$tarball" "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${tarball}"
           echo "${CARGO_DENY_SHA256}  ${tarball}" | sha256sum --check
           tar -xzf "$tarball" --strip-components=1 -C "$HOME/.cargo/bin" "cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny"
-      - name: sources, the whole workspace
-        run: cargo deny --workspace --locked check sources
-      - name: the library's policy
-        run: cargo deny --locked check
+      - name: cargo deny, the whole workspace
+        run: cargo deny --workspace --locked check
