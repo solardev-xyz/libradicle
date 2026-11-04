@@ -52,12 +52,12 @@ ignore = [
     # rsa, the Marvin attack: its private-key operations aren't constant
     # time. No release fixes it.
     { id = "RUSTSEC-2023-0071", reason = "no RSA private-key operation in libradicle or heartwood; no fixed release" },
-    # basic-toml is unmaintained. It is reached only through askama_derive, a
-    # proc macro that UniFFI's bindings generator (uniffi_bindgen) uses at
-    # compile time to read askama's configuration from crates' own sources;
-    # no network or user input reaches it. Workspace-wide only: the library
-    # doesn't link it.
-    { id = "RUSTSEC-2026-0374", reason = "unmaintained basic-toml, reached only by askama's derive macro at compile time on crates' own configuration (UniFFI's bindings generator); no network or user input" },
+    # basic-toml is unmaintained. It is reached only through askama_derive,
+    # linked only into the askama_macros proc macro, which UniFFI's bindings
+    # generator (uniffi_bindgen) uses at compile time to read askama's
+    # configuration from crates' own sources; no network or user input
+    # reaches it. Workspace-wide only: the library doesn't link it.
+    { id = "RUSTSEC-2026-0374", reason = "unmaintained basic-toml, reached through askama_derive, linked only into the askama_macros proc macro, at compile time on crates' own configuration (UniFFI's bindings generator); no network or user input" },
     # crypto-bigint, timing variability: fixed from 0.7.6 only, which
     # elliptic-curve 0.13 can't use.
     { id = "RUSTSEC-2026-0387", reason = "no ECDSA private-key operation in libradicle or heartwood; crypto-bigint 0.5 has no fix" },
