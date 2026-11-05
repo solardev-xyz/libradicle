@@ -54,6 +54,7 @@ fn start_with(home: &str, control_socket: bool) -> Embedded {
             listen: vec![],
             control_socket,
             routing: Some(common::routing()),
+            seeding_policy: None,
             isolated: false,
             repositories: None,
         },

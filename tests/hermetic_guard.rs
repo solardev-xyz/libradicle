@@ -36,6 +36,7 @@ fn options(home: &Path, listen: Vec<SocketAddr>, routing: Option<Routing>) -> Op
         listen,
         control_socket: false,
         routing,
+        seeding_policy: None,
         isolated: false,
         repositories: None,
     }

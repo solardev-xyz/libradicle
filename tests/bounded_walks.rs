@@ -94,6 +94,7 @@ fn fixture(name: &str) -> Fixture {
             listen: vec![],
             control_socket: true,
             routing: Some(common::routing()),
+            seeding_policy: None,
             isolated: false,
             repositories: None,
         },

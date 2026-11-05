@@ -112,6 +112,7 @@ pub fn start(home: String, alias: String) -> AsyncTask<BlockingJson> {
             listen: vec![],
             control_socket: true,
             routing: None,
+            seeding_policy: None,
             isolated: false,
             repositories: None,
         }) {

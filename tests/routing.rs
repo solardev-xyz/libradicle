@@ -63,6 +63,7 @@ fn start(home: &Path, routing: Option<Routing>) -> Embedded {
             listen: vec![],
             control_socket: true,
             routing,
+            seeding_policy: None,
             isolated: false,
             repositories: None,
         },

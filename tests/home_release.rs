@@ -105,6 +105,7 @@ fn start(home: &Path, gate: Option<Arc<Held>>) -> Result<Embedded, Error> {
                 Some(gate) => gate as Arc<dyn radicle::node::dial::Gate>,
                 None => Arc::new(Unresolved),
             }))),
+            seeding_policy: None,
             isolated: false,
             repositories: None,
         },

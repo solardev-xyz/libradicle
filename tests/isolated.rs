@@ -61,6 +61,7 @@ fn start(home: &Path, isolated: bool, listen: Vec<SocketAddr>) -> Embedded {
             listen,
             control_socket: true,
             routing: Some(common::routing()),
+            seeding_policy: None,
             isolated,
             repositories: None,
         },
@@ -201,4 +202,101 @@ fn an_isolated_node_takes_no_bootstrap_nodes_and_listens_nowhere() {
 
     node.shutdown().expect("clean shutdown");
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A node on `home`, isolated, with `routing`, its options checked
+/// (`common::start_with_key`). Its gate stays as given, outside the hermetic
+/// one: isolation replaces it with a gate that refuses every target and
+/// resolves no name, and the hermetic one would stop handing names to the
+/// proxy, the route this file's proxy test checks. Every route that test
+/// gives leads to its loopback proxy.
+fn start_routed(home: &Path, routing: Option<libradicle::Routing>) -> Embedded {
+    common::start_with_key(
+        Options {
+            home: home.to_str().expect("utf-8 temp dir").into(),
+            alias: "isolated".into(),
+            listen: vec![],
+            control_socket: true,
+            routing,
+            seeding_policy: None,
+            isolated: true,
+            repositories: None,
+        },
+        key(),
+    )
+    .expect("start")
+}
+
+#[test]
+// R-12 part 3, follow-up (review of libradicle #23, round 2): heartwood
+// connects to an onion or I2P proxy, and to the global proxy for a forwarded
+// name, without asking its gate. An isolated node has no proxy and drops
+// onion and I2P addresses, whatever its routing or config.json say, so an
+// explicit connect to an onion, an I2P or a named peer opens no socket to the
+// proxy.
+fn an_isolated_node_reaches_no_proxy() {
+    use radicle::node::config::AddressConfig;
+
+    let onion = "xmrhfasfg5suueegrnc4gsgyi2tyclcy5oz7f5drnrodmdtob6t2ioyd.onion:8776";
+    let i2p = "f2atcc7udeub5kh4nkljtjwyk7ikjviorufzgwnfwhkphljl3vhq.b32.i2p:8776";
+    for routed in [true, false] {
+        let proxy = Peer::new();
+        let home = home(
+            if routed {
+                "radisolatedrouted"
+            } else {
+                "radisolatedconfig"
+            },
+            "test",
+            None,
+            None,
+        );
+        // Without routing of its own, config.json's routes apply.
+        let config = std::fs::read_to_string(home.join("config.json")).unwrap();
+        let routes = format!(
+            r#""proxy":"{0}","onion":{{"mode":"proxy","address":"{0}"}},"i2p":{{"mode":"proxy","address":"{0}"}},"alias":"#,
+            proxy.addr()
+        );
+        std::fs::write(
+            home.join("config.json"),
+            config.replace(r#""alias":"#, &routes),
+        )
+        .unwrap();
+        let routing = routed.then(|| libradicle::Routing {
+            proxy: Some(proxy.addr()),
+            onion: AddressConfig::Proxy {
+                address: proxy.addr(),
+            },
+            gate: std::sync::Arc::new(radicle::node::dial::Open),
+        });
+        let node = start_routed(&home, routing);
+
+        let config = control(&home).config().expect("config");
+        assert_eq!(config.proxy, None, "routed: {routed}");
+        assert_eq!(config.onion, AddressConfig::Drop, "routed: {routed}");
+        assert_eq!(config.i2p, AddressConfig::Drop, "routed: {routed}");
+        for target in [onion, i2p, "seed.test:8776"] {
+            // An answer that isn't `Connected`, or none in time: either way,
+            // what matters is whether a socket reached the proxy.
+            let result = control(&home).connect(
+                peer(),
+                target.parse().unwrap(),
+                radicle::node::ConnectOptions {
+                    persistent: false,
+                    timeout: Duration::from_secs(2),
+                },
+            );
+            assert!(
+                !matches!(result, Ok(radicle::node::ConnectResult::Connected)),
+                "{target}: {result:?}"
+            );
+        }
+        assert!(
+            !proxy.dialled(Duration::from_millis(500)),
+            "an isolated node reached its proxy (routed: {routed})"
+        );
+
+        node.shutdown().expect("clean shutdown");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

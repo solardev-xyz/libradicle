@@ -31,6 +31,7 @@ fn opts(home: &str) -> Options {
         listen: vec![],
         control_socket: true,
         routing: Some(common::routing()),
+        seeding_policy: None,
         isolated: true,
         repositories: None,
     }

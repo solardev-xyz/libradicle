@@ -119,6 +119,7 @@ mod tests {
                 onion: radicle::node::config::AddressConfig::Drop,
                 gate: crate::hermetic::gate(),
             }),
+            seeding_policy: None,
             isolated: false,
             repositories: None,
         };

@@ -52,6 +52,12 @@ ignore = [
     # rsa, the Marvin attack: its private-key operations aren't constant
     # time. No release fixes it.
     { id = "RUSTSEC-2023-0071", reason = "no RSA private-key operation in libradicle or heartwood; no fixed release" },
+    # basic-toml is unmaintained. It is reached only through askama_derive,
+    # linked only into the askama_macros proc macro, which UniFFI's bindings
+    # generator (uniffi_bindgen) uses at compile time to read askama's
+    # configuration from crates' own sources; no network or user input
+    # reaches it. Workspace-wide only: the library doesn't link it.
+    { id = "RUSTSEC-2026-0374", reason = "unmaintained basic-toml, reached through askama_derive, linked only into the askama_macros proc macro, at compile time on crates' own configuration (UniFFI's bindings generator); no network or user input" },
     # crypto-bigint, timing variability: fixed from 0.7.6 only, which
     # elliptic-curve 0.13 can't use.
     { id = "RUSTSEC-2026-0387", reason = "no ECDSA private-key operation in libradicle or heartwood; crypto-bigint 0.5 has no fix" },
@@ -76,7 +82,11 @@ allow = [
 confidence-threshold = 0.8
 # Allow 1 or more licenses on a per-crate basis, so that particular licenses
 # aren't accepted for every possible crate as with the normal allow list
-exceptions = []
+exceptions = [
+    # ISC, a permissive licence of the MIT and BSD kind: libloading, which
+    # N-API's napi-sys loads Node's symbols with.
+    { allow = ["ISC"], crate = "libloading" },
+]
 
 [licenses.private]
 # If true, ignores workspace crates that aren't published, or are only
@@ -119,20 +129,20 @@ skip-tree = []
 
 # This section is considered when running `cargo deny check sources`.
 [sources]
-# Lint level for what to happen when a crate from a crate registry that is not
-# in the allow list is encountered
-unknown-registry = "warn"
-# Lint level for what to happen when a crate from a git repository that is not
-# in the allow list is encountered
-unknown-git = "warn"
+# A crate from any registry but crates.io, or from any git repository but
+# heartwood's, is refused, however its manifest spells it: the graph takes
+# heartwood from one place (tests/heartwood_pin.rs checks it is one commit).
+unknown-registry = "deny"
+unknown-git = "deny"
 # List of URLs for allowed crate registries. Defaults to the crates.io index
 # if not specified. If it is specified but empty, no registries are allowed.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# List of URLs for allowed Git repositories
-allow-git = []
+# List of URLs for allowed Git repositories: heartwood's canonical one alone.
+allow-git = ["https://github.com/solardev-xyz/heartwood"]
 
 [sources.allow-org]
-# 1 or more github.com organizations to allow git sources for
+# 1 or more github.com organizations to allow git sources for: none, so that
+# no other repository of an organization, a fork's included, passes.
 github = []
 # 1 or more gitlab.com organizations to allow git sources for
 gitlab = []

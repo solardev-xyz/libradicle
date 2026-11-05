@@ -82,6 +82,7 @@ fn node_options(home: String, alias: String) -> Options {
         listen: vec![],
         control_socket: true,
         routing: None,
+        seeding_policy: None,
         isolated: false,
         repositories: None,
     };
@@ -920,6 +921,7 @@ mod tests {
                 onion: radicle::node::config::AddressConfig::Drop,
                 gate: hermetic::wrapping(gate.clone()),
             }),
+            seeding_policy: None,
             isolated: false,
             repositories: None,
         };

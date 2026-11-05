@@ -21,6 +21,7 @@ fn rad_socket_env_redirects_control_socket_away_from_long_home() {
         listen: vec![],
         control_socket: true,
         routing: Some(common::routing()),
+        seeding_policy: None,
         // A fresh profile's default configuration would dial Radicle's
         // bootstrap nodes: this node reaches no one.
         isolated: true,

@@ -66,6 +66,23 @@ pub struct Options {
     /// How the node reaches peers, set in memory over `config.json`. `None`
     /// leaves `config.json`'s routing as it is.
     pub routing: Option<Routing>,
+    /// The node's default seeding policy, for a repository with no policy of
+    /// its own, set in memory over the profile's: `config.json`'s
+    /// `node.seedingPolicy`, or the deprecated `node.policy` and `node.scope`
+    /// that heartwood lets override it. `config.json` is never written.
+    /// `None` leaves the profile's as it is. freedom-core design 0008's
+    /// service passes `Block`, so that its node seeds only what it is told
+    /// to ("Seeding and serving").
+    ///
+    /// The override reaches this node and this `Embedded`'s own reads
+    /// ([`Embedded::list_repos`] and the others), and nothing else. Since it
+    /// isn't on disk, another reader of the same home still sees
+    /// `config.json`'s default: the `rad` CLI, git's remote helper, or a
+    /// fresh `Profile::load`. A host that needs every reader of the home to
+    /// agree must either write `config.json` itself or keep the home to
+    /// itself. Design 0008's service does the latter: its home is its own,
+    /// and no CLI or remote helper runs on it.
+    pub seeding_policy: Option<radicle::node::config::DefaultSeedingPolicy>,
     /// Whether the node reaches no one, whatever `config.json` and `routing`
     /// say (freedom-core design 0008, R-12 part 3):
     /// - its peer set is static, with no `connect` peers, so it takes no
@@ -74,7 +91,10 @@ pub struct Options {
     ///   explicit connect, to the seed book among others, fails before any
     ///   socket, and no address a peer announces enters its address book;
     /// - it listens on no address, `listen` notwithstanding, and the shipped
-    ///   seeds aren't added to its address book.
+    ///   seeds aren't added to its address book;
+    /// - it has no proxy, and drops onion and I2P addresses, whatever
+    ///   `routing` and `config.json` say: heartwood reaches a proxy without
+    ///   asking the gate.
     ///
     /// It still serves the host from local storage.
     pub isolated: bool,
@@ -287,6 +307,8 @@ pub struct Network {
     profile: Profile,
     handle: NodeHandle,
     seed_book: Arc<Vec<seeds::Candidate>>,
+    /// The node's repository gate ([`Options::repositories`]).
+    repositories: radicle::node::gate::RepoGate,
 }
 
 /// One failed seed dial observed before bootstrap reached its readiness target
@@ -741,7 +763,7 @@ impl Network {
         cancel: &CancelToken,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<(), Error> {
-        self.handle.seed(rid, Scope::All)?;
+        seed(&self.repositories, &mut self.handle, rid)?;
 
         // Try nodes that are known to seed this repo, preferring connected ones.
         let seeds = self.handle.seeds_for(rid, [*self.profile.did()])?;
@@ -962,6 +984,9 @@ pub struct Embedded {
     /// How the node's thread ended, if with an error: kept until the home
     /// is let go of, and then returned, once ([`Embedded::shutdown_within`]).
     ended: Option<Error>,
+    /// The node's repository gate ([`Options::repositories`]): the host's,
+    /// or one that admits everything.
+    repositories: radicle::node::gate::RepoGate,
 }
 
 impl Embedded {
@@ -970,6 +995,10 @@ impl Embedded {
     ///
     /// The identity key is stored without a passphrase; key custody is the
     /// host's concern (OS keychain on iOS/desktop) and layered on later.
+    ///
+    /// libgit2's configuration search paths stay as the process has them. A
+    /// host that wants them empty calls [`isolate_git_config`] first, under
+    /// its `# Safety` contract.
     pub fn start(opts: Options) -> Result<Self, Error> {
         let home = Home::new(opts.home.clone())?;
         let profile = if home.keys().join("radicle").exists() {
@@ -1030,7 +1059,7 @@ impl Embedded {
     }
 
     fn run(
-        profile: Profile,
+        mut profile: Profile,
         signer: radicle::crypto::SigningKey,
         host_signer: Option<radicle::crypto::SigningKey>,
         opts: Options,
@@ -1056,8 +1085,23 @@ impl Embedded {
         if opts.isolated {
             config.peers = radicle::node::config::PeerConfig::Static;
             config.connect = Default::default();
+            // No route that opens a socket without asking the gate: heartwood
+            // connects to an onion or I2P proxy, and to the global proxy for a
+            // forwarded name, without asking it.
+            config.proxy = None;
+            config.onion = radicle::node::config::AddressConfig::Drop;
+            config.i2p = radicle::node::config::AddressConfig::Drop;
+            config.external_addresses = vec![];
             gate = Arc::new(Isolated);
             listen.clear();
+        }
+        let repositories = opts.repositories.clone().unwrap_or_else(repositories);
+        // Last, over whatever the profile loaded, the legacy fields' override
+        // included. On the profile too, so that this crate's own policy reads
+        // (`list_repos`, among others) agree with the node's.
+        if let Some(policy) = opts.seeding_policy {
+            config.seeding_policy = policy;
+            profile.config.node.seeding_policy = policy;
         }
         let runtime = Runtime::init(
             profile.home.clone(),
@@ -1067,7 +1111,7 @@ impl Embedded {
             sig_rx,
             signer,
             gate,
-            opts.repositories.clone().unwrap_or_else(repositories),
+            repositories.clone(),
         )?;
         if !opts.isolated && !seed_book.is_empty() {
             seeds::install(&profile)?;
@@ -1092,6 +1136,7 @@ impl Embedded {
             _signals: sig_tx,
             released: false,
             ended: None,
+            repositories,
         })
     }
 
@@ -1115,6 +1160,7 @@ impl Embedded {
             profile: self.profile.clone(),
             handle: self.handle.clone(),
             seed_book: Arc::clone(&self.seed_book),
+            repositories: self.repositories.clone(),
         }
     }
 
@@ -1460,7 +1506,7 @@ impl Embedded {
             &signer,
             &self.profile.storage,
         )?;
-        self.handle.seed(rid, Scope::All)?;
+        seed(&self.repositories, &mut self.handle, rid)?;
         self.handle.add_inventory(rid)?;
         self.announce_refs(rid)?;
         Ok(rid)
@@ -2774,6 +2820,13 @@ impl Embedded {
     /// and passes the progress state and the quarantine record it keeps. Its
     /// watchdog is told of each unit through `watch`, and `stop` stops the
     /// repair between units. Only the node's own namespace is ever signed.
+    ///
+    /// A failure outside the repository is [`Error::Reconcile`], and
+    /// quarantines nothing; the host's environment among them, which would
+    /// fail every repository alike: libgit2's configuration outside any
+    /// repository doesn't load, or the repository isn't the process's to
+    /// open. The host keeps the repository shut, and runs the repair again
+    /// once that is fixed.
     pub fn repair_step(
         &self,
         repair: &mut reconcile::driver::Repair,
@@ -2801,23 +2854,45 @@ impl Embedded {
     ///
     /// Otherwise the node unseeds it first, so that it stops asking for it.
     /// Then heartwood's `remove_repo` runs its steps, each durable before
-    /// the next: the seeding policy, `storage/<rid>`, the repository's COB
-    /// cache rows, and last the record. Cut off at any point, the record
-    /// stays, and the removal completes when run again with the same `qid`.
+    /// the next: it stops seeding the repository, whatever the node's
+    /// default seeding policy; it deletes `storage/<rid>`, then the
+    /// repository's COB cache rows, and last the record. Cut off at any
+    /// point, the record stays, and the removal completes when run again
+    /// with the same `qid`.
     ///
-    /// Run it with the repository shut at the node's gate, as a quarantined
-    /// repository is.
+    /// Under a blocking default, the repository's policy goes, and a seed or
+    /// clone after the removal seeds it anew. Under a permissive one, which
+    /// would seed it with no policy of its own, it is blocked instead: only
+    /// an unblock lets the default seed it again, and a seed or clone of it
+    /// doesn't lift that block.
+    ///
+    /// It runs only with the repository shut at the node's gate, as a
+    /// quarantined repository is, and refuses with [`Error::Open`]
+    /// otherwise.
     pub fn remove_quarantined(
         &self,
         rid: RepoId,
         qid: reconcile::quarantine::Qid,
         quarantine: &mut reconcile::quarantine::Quarantine,
     ) -> Result<reconcile::quarantine::Removal, Error> {
+        // Shut, nothing seeds it while it is removed: neither this crate's
+        // clone and import ([`seed`]) nor the node's own seed and unblock
+        // commands, which the gate refuses too. So no policy written after
+        // the removal's unseed outlives it.
+        let state = self.repositories.state(&rid);
+        if state.is_open() {
+            return Err(Error::Open(rid));
+        }
         if quarantine.get(&rid)?.is_none_or(|record| record.qid != qid) {
             return Ok(reconcile::quarantine::Removal::NotQuarantined);
         }
         self.handle.clone().unseed(rid)?;
-        let mut policies = self.profile.home.policies_mut()?;
+        // The node's default, the one it seeds by: `Options::seeding_policy`
+        // is set on this profile too.
+        let mut policies = radicle::node::policy::config::Config::new(
+            self.profile.config.node.seeding_policy.into(),
+            self.profile.home.policies_mut()?,
+        );
         let mut cache = self.profile.home.cobs_db_mut()?;
         Ok(reconcile::quarantine::remove_repo(
             quarantine,
@@ -2910,6 +2985,114 @@ pub enum Slot {
     Empty,
 }
 
+/// Proof that [`isolate_git_config`] has run, and succeeded, in this process:
+/// only it makes one. A function that must run after it can take one as a
+/// parameter, as freedom-radicled's reconciliation can.
+#[derive(Debug, Clone, Copy)]
+pub struct GitConfigIsolated(());
+
+/// The environment variables an environment-driven libgit2 open reads for its
+/// configuration, around the search paths [`isolate_git_config`] empties.
+/// libgit2 1.9 reads no others: it has no `GIT_CONFIG_COUNT` or
+/// `GIT_CONFIG_PARAMETERS`.
+pub const GIT_CONFIG_ENV: [&str; 3] = [
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+];
+
+/// Empties libgit2's default configuration search paths, the System, XDG,
+/// Global and ProgramData levels (freedom-core design 0008, libradicle item
+/// 9). From then on, a repository libgit2 opens by its path reads no
+/// `/etc/gitconfig`, no `~/.gitconfig` and no `$XDG_CONFIG_HOME/git/config`,
+/// and [`git2::Config::open_default`] finds none either. A confined process
+/// then opens its repositories: libgit2 fails an open whose system
+/// configuration exists but can't be read.
+///
+/// That is all it does. It leaves two things:
+///
+/// - **The environment.** An environment-driven open
+///   (`Repository::open_from_env`, or `open_ext` with `FROM_ENV`) also reads
+///   [`GIT_CONFIG_ENV`], whatever the search paths are. libradicle never opens
+///   a repository that way, and nor does any heartwood code it runs: heartwood's
+///   storage opens by path with `BARE | NO_DOTGIT | NO_SEARCH`, and its one
+///   `FROM_ENV` open, `rad::repo`, is the `rad` CLI's. A host that might
+///   clears the variables first ([`remove_git_config_env`]), or refuses to run
+///   with them set, as freedom-radicled refuses every `GIT_*` variable.
+/// - **A repository's own configuration,** includes and all: an
+///   `include.path` or `includeIf.*.path` in it applies wherever it points,
+///   and one a confined process can't read fails that repository's open. Only
+///   the local owner writes that configuration, not a peer. A storage
+///   repository's `config` is written when it is created, and by `set_user`,
+///   with the local profile's `user.name` and `user.email` (heartwood's
+///   `storage::git::Repository::create`). A fetch writes a peer's objects
+///   into `objects/pack` and its refs under its namespace, and nothing else.
+///   A working repository [`Embedded::import_repo`] reads is the host's own.
+///
+/// It doesn't reach a `git` process the node spawns either, in a build
+/// without the `no-spawn` feature: git reads its own configuration.
+///
+/// A later call returns the first one's result and leaves libgit2's options
+/// alone. [`Embedded::start`] and [`Embedded::start_with_key`] don't call it:
+/// the N-API and UniFFI bindings run in a host's process, where libradicle
+/// can't know that the contract below holds.
+///
+/// # Safety
+///
+/// Call it before any thread in the process can use libgit2: first thing in
+/// `main`, before any other thread is spawned. freedom-radicled does. It
+/// writes libgit2's process-wide options
+/// (`git_libgit2_opts(GIT_OPT_SET_SEARCH_PATH, …)`), which every
+/// configuration open reads without synchronization, so a libgit2 call on
+/// another thread at the same time is a data race. A use that has ended
+/// before it is harmless; a concurrent one isn't, and libradicle can neither
+/// see nor lock another caller's use of libgit2.
+pub unsafe fn isolate_git_config() -> Result<GitConfigIsolated, Error> {
+    static ISOLATED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    ISOLATED
+        .get_or_init(|| {
+            for level in [
+                git2::ConfigLevel::System,
+                git2::ConfigLevel::XDG,
+                git2::ConfigLevel::Global,
+                git2::ConfigLevel::ProgramData,
+            ] {
+                // SAFETY: `set_search_path` writes libgit2's process-wide
+                // options, which other libgit2 calls read unsynchronized.
+                // This function's caller has no other thread able to use
+                // libgit2 (its `# Safety`), and the `OnceLock` runs it once.
+                unsafe { git2::opts::set_search_path(level, "") }
+                    .map_err(|e| e.message().to_owned())?;
+            }
+            Ok(())
+        })
+        .clone()
+        .map(|()| GitConfigIsolated(()))
+        .map_err(Error::GitConfig)
+}
+
+/// Removes [`GIT_CONFIG_ENV`] from the process's environment: what an
+/// environment-driven libgit2 open would read around
+/// [`isolate_git_config`]'s empty search paths. For a host that might open a
+/// repository from the environment, or links code that does; libradicle
+/// doesn't. A host can instead refuse to run with them set, as
+/// freedom-radicled does.
+///
+/// # Safety
+///
+/// [`isolate_git_config`]'s: call it before any thread in the process can use
+/// libgit2, or read the environment at all; first thing in `main`, before
+/// any other thread is spawned. Changing the environment races with a
+/// `getenv` on another thread, libgit2's among them; edition 2024 makes
+/// `std::env::remove_var` `unsafe` for that reason.
+pub unsafe fn remove_git_config_env() {
+    for name in GIT_CONFIG_ENV {
+        // SAFETY: no other thread reads the environment (the `# Safety`
+        // above).
+        std::env::remove_var(name);
+    }
+}
+
 /// Shuts down the node a binding keeps in `slot`, within `timeout` for all
 /// of it: its stop, its thread's join and its home's release
 /// ([`Embedded::shutdown_within`]).
@@ -2987,6 +3170,26 @@ fn stored_repository(entry: &std::fs::DirEntry) -> Result<Option<RepoId>, Error>
         Ok(rid) => Ok(Some(rid)),
         Err(_) => Err(radicle::storage::Error::InvalidId(name).into()),
     }
+}
+
+/// Seeds `rid` through the node, holding the repository gate's pass for a
+/// mutation across the policy write: a repository being repaired or
+/// quarantined isn't seeded (`Error::Gated`), and a close of it that has
+/// returned has this seed written already, or refuses it. The node's own
+/// seed command takes the same pass.
+fn seed(
+    repositories: &radicle::node::gate::RepoGate,
+    handle: &mut NodeHandle,
+    rid: RepoId,
+) -> Result<(), Error> {
+    let Some(_pass) = repositories.admit(rid, radicle::node::gate::Purpose::Mutate) else {
+        return Err(Error::Gated {
+            rid,
+            state: repositories.state(&rid),
+        });
+    };
+    handle.seed(rid, Scope::All)?;
+    Ok(())
 }
 
 /// The node's repository gate when the host passes none
@@ -3287,6 +3490,7 @@ mod tests {
                 onion: radicle::node::config::AddressConfig::Drop,
                 gate: super::hermetic::wrapping(gate.clone()),
             }),
+            seeding_policy: None,
             isolated: false,
             repositories: None,
         };

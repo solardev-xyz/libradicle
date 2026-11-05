@@ -89,8 +89,24 @@ pub enum Error {
     Policy(#[from] radicle::node::policy::store::Error),
     #[error(transparent)]
     Sqlite(#[from] sqlite::Error),
+    /// The repository is being repaired or is quarantined: it isn't seeded,
+    /// cloned or imported until its host opens it.
+    #[error("{rid} is {state}: it can't be seeded until it opens")]
+    Gated {
+        rid: RepoId,
+        state: radicle::node::gate::RepoState,
+    },
+    /// A quarantined repository's removal asked while it is open at the
+    /// gate: it runs only while the repository is shut.
+    #[error("{0} is open at the repository gate: shut it before it is removed")]
+    Open(RepoId),
     /// A unit of an online repair failed outside its repository (heartwood's
-    /// reconciliation driver): the progress state or the quarantine record.
+    /// reconciliation driver): the progress state, the quarantine record, or
+    /// the host's environment (`driver::Error::Host`: libgit2's configuration
+    /// outside any repository doesn't load, or the repository isn't the
+    /// process's to open), which would fail every repository alike. None of
+    /// these quarantines the repository: the repair's progress stays, and
+    /// the next run continues it.
     ///
     /// Boxed, as the next two are, so that every `Result` of this crate
     /// stays small.
@@ -102,6 +118,10 @@ pub enum Error {
     /// and the removal completes when run again with the same `qid`.
     #[error(transparent)]
     Remove(Box<radicle::storage::git::reconcile::quarantine::RemoveError>),
+    /// libgit2's configuration search paths couldn't be emptied
+    /// ([`crate::isolate_git_config`]).
+    #[error("libgit2's configuration search paths: {0}")]
+    GitConfig(String),
 }
 
 impl From<radicle::storage::git::reconcile::driver::Error> for Error {
