@@ -113,6 +113,10 @@ pub enum Error {
     /// and the removal completes when run again with the same `qid`.
     #[error(transparent)]
     Remove(Box<radicle::storage::git::reconcile::quarantine::RemoveError>),
+    /// libgit2's configuration search paths couldn't be emptied
+    /// ([`crate::isolate_git_config`]).
+    #[error("libgit2's configuration search paths: {0}")]
+    GitConfig(String),
 }
 
 impl From<radicle::storage::git::reconcile::driver::Error> for Error {
