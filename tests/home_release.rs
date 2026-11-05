@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use libradicle::{Embedded, Error, HostKey, Options};
+use libradicle::{Asked, Embedded, Error, HomeLock, HostKey, Options, ThreadEnd};
 
 fn key() -> HostKey {
     let mut bytes = vec![13u8; 32];
@@ -147,8 +147,14 @@ fn shutdown_within_waits_for_the_home_within_its_deadline() {
     let mut node = start(&home, Some(gate.clone())).expect("start");
     gate.wait_for_a_lookup();
 
-    // The node's thread ends, but the held lookup keeps the home.
-    let result = node.shutdown_within(Duration::from_millis(2_000));
+    // The node's thread ends cleanly, as this call asked, but the held
+    // lookup keeps the home past the deadline.
+    let stopped = node.shutdown_within(Duration::from_millis(2_000));
+    assert_eq!(stopped.asked, Asked::ThisCall, "{stopped:?}");
+    assert_eq!(stopped.thread, ThreadEnd::Stopped, "{stopped:?}");
+    assert!(matches!(stopped.home, HomeLock::Held), "{stopped:?}");
+    assert!(stopped.stopped_by_this_call() && !stopped.is_done());
+    let result = stopped.result();
     assert!(
         matches!(result, Err(Error::ShutdownTimeout(_))),
         "{result:?}"
@@ -161,12 +167,15 @@ fn shutdown_within_waits_for_the_home_within_its_deadline() {
 
     // Once the lookup ends, another call finds the home let go of.
     gate.release();
-    node.shutdown_within(Duration::from_secs(10))
-        .expect("the home is let go of");
+    let stopped = node.shutdown_within(Duration::from_secs(10));
+    assert_eq!(stopped.asked, Asked::Earlier, "{stopped:?}");
+    assert_eq!(stopped.thread, ThreadEnd::Stopped, "{stopped:?}");
+    assert!(stopped.is_done(), "{stopped:?}");
     // A node starts on the home again, and the stopped one stays done,
     // though the home is held once more, by the new node.
     let next = start(&home, None).expect("a node starts on the home again");
     node.shutdown_within(Duration::ZERO)
+        .result()
         .expect("the stopped node stays done");
     drop(node);
     next.shutdown().expect("clean shutdown");
@@ -184,12 +193,14 @@ fn a_passed_deadline_bounds_the_whole_shutdown() {
     gate.wait_for_a_lookup();
 
     let started = Instant::now();
-    let result = node.shutdown_within(Duration::from_millis(400));
+    let stopped = node.shutdown_within(Duration::from_millis(400));
     let took = started.elapsed();
+    assert_eq!(stopped.asked, Asked::ThisCall, "{stopped:?}");
     assert!(
-        matches!(result, Err(Error::ShutdownTimeout(_))),
-        "{result:?}"
+        !stopped.is_done() && matches!(stopped.home, HomeLock::Held),
+        "{stopped:?}"
     );
+    assert_eq!(stopped.within, Duration::from_millis(400));
     assert!(
         took < Duration::from_millis(900),
         "the shutdown took {took:?}"
@@ -197,6 +208,7 @@ fn a_passed_deadline_bounds_the_whole_shutdown() {
 
     gate.release();
     node.shutdown_within(Duration::from_secs(10))
+        .result()
         .expect("the home is let go of");
     let _ = std::fs::remove_dir_all(&home);
 }
