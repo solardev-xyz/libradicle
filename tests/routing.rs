@@ -55,6 +55,7 @@ fn start(home: &Path, routing: Option<Routing>) -> Embedded {
             routing,
             seeding_policy: None,
             isolated: false,
+            repositories: None,
         },
         key(),
     )

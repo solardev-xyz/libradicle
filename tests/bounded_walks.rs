@@ -94,6 +94,7 @@ fn fixture(name: &str) -> Fixture {
             routing: None,
             seeding_policy: None,
             isolated: false,
+            repositories: None,
         },
         key(),
     )

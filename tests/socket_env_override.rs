@@ -21,6 +21,7 @@ fn rad_socket_env_redirects_control_socket_away_from_long_home() {
         routing: None,
         seeding_policy: None,
         isolated: false,
+        repositories: None,
     })
     .expect("start must bind the control socket at RAD_SOCKET, not under home");
     node.shutdown().expect("clean shutdown");

@@ -90,6 +90,7 @@ fn start(home: &Path, gate: Option<Arc<Held>>) -> Result<Embedded, Error> {
             }),
             seeding_policy: None,
             isolated: false,
+            repositories: None,
         },
         key(),
     )

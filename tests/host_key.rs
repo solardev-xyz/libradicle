@@ -28,6 +28,7 @@ fn opts(home: &str) -> Options {
         routing: None,
         seeding_policy: None,
         isolated: false,
+        repositories: None,
     }
 }
 

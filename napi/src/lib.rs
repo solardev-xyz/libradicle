@@ -114,6 +114,7 @@ pub fn start(home: String, alias: String) -> AsyncTask<BlockingJson> {
             routing: None,
             seeding_policy: None,
             isolated: false,
+            repositories: None,
         }) {
             Ok(node) => {
                 let did = node.did();

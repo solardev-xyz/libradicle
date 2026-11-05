@@ -39,6 +39,7 @@ fn start(home: &str) -> Embedded {
             routing: None,
             seeding_policy: None,
             isolated: false,
+            repositories: None,
         },
         key(),
     )

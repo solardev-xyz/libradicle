@@ -61,6 +61,7 @@ fn start(home: &Path, isolated: bool, listen: Vec<SocketAddr>) -> Embedded {
             routing: None,
             seeding_policy: None,
             isolated,
+            repositories: None,
         },
         key(),
     )
@@ -212,6 +213,7 @@ fn start_routed(home: &Path, routing: Option<libradicle::Routing>) -> Embedded {
             routing,
             seeding_policy: None,
             isolated: true,
+            repositories: None,
         },
         key(),
     )

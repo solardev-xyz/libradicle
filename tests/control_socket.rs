@@ -34,6 +34,7 @@ fn start(home: &Path) -> Result<Embedded, Error> {
         routing: None,
         seeding_policy: None,
         isolated: false,
+        repositories: None,
     })
 }
 

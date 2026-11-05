@@ -29,6 +29,7 @@ fn main() -> anyhow::Result<()> {
         routing: None,
         seeding_policy: None,
         isolated: false,
+        repositories: None,
     })?;
     println!("node started, DID: {}", node.did());
 

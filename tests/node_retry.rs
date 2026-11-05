@@ -54,6 +54,7 @@ fn start_with(home: &str, control_socket: bool) -> Embedded {
             routing: None,
             seeding_policy: None,
             isolated: false,
+            repositories: None,
         },
         key(),
     )
