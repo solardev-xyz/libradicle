@@ -213,6 +213,7 @@ fn start_routed(home: &Path, routing: Option<libradicle::Routing>) -> Embedded {
             routing,
             seeding_policy: None,
             isolated: true,
+            repositories: None,
         },
         key(),
     )

@@ -101,7 +101,12 @@ pub enum Error {
     #[error("{0} is open at the repository gate: shut it before it is removed")]
     Open(RepoId),
     /// A unit of an online repair failed outside its repository (heartwood's
-    /// reconciliation driver): the progress state or the quarantine record.
+    /// reconciliation driver): the progress state, the quarantine record, or
+    /// the host's environment (`driver::Error::Host`: libgit2's configuration
+    /// outside any repository doesn't load, or the repository isn't the
+    /// process's to open), which would fail every repository alike. None of
+    /// these quarantines the repository: the repair's progress stays, and
+    /// the next run continues it.
     ///
     /// Boxed, as the next two are, so that every `Result` of this crate
     /// stays small.

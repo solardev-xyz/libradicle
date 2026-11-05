@@ -7,7 +7,10 @@
 //!   the node runs as, and writes no key file;
 //! - `Embedded::remove_quarantined` checks the record's `qid` before it
 //!   touches anything, then removes the repository, its seeding policy and
-//!   its record.
+//!   its record; under a permissive default it blocks the repository
+//!   instead of dropping its policy;
+//! - it runs only with the repository shut, and no seed or clone racing it,
+//!   through the node or this crate, outlives it.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -16,6 +19,7 @@ use std::time::Duration;
 
 use libradicle::{Embedded, HostKey, Options};
 use radicle::git::raw as git2;
+use radicle::node::config::DefaultSeedingPolicy;
 use radicle::node::gate::{Quarantine as Shut, RepoGate, RepoState};
 use radicle::node::Handle as _;
 use radicle::prelude::{NodeId, RepoId};
@@ -55,6 +59,17 @@ fn start(
     listen: Vec<SocketAddr>,
     repositories: Option<RepoGate>,
 ) -> Embedded {
+    start_seeding(home, byte, listen, repositories, None)
+}
+
+/// [`start`], with the node's default seeding policy.
+fn start_seeding(
+    home: &Path,
+    byte: u8,
+    listen: Vec<SocketAddr>,
+    repositories: Option<RepoGate>,
+    seeding_policy: Option<DefaultSeedingPolicy>,
+) -> Embedded {
     Embedded::start_with_key(
         Options {
             home: home.to_path_buf(),
@@ -62,6 +77,7 @@ fn start(
             listen,
             control_socket: true,
             routing: None,
+            seeding_policy,
             isolated: false,
             repositories,
         },
@@ -298,6 +314,64 @@ fn a_removal_checks_its_qid_then_removes_the_repository_and_its_record() {
             .unwrap(),
         Removal::NotQuarantined
     );
+
+    node.shutdown().expect("clean shutdown");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+// A removal stops seeding the repository whatever the node's default
+// (heartwood #26). Under a permissive default, which would seed it with no
+// policy of its own, it is blocked, so that the default doesn't seed it
+// again once its record is cleared. The removal reads the default the node
+// runs with: here `Options::seeding_policy`'s, over config.json's block.
+fn a_removal_under_a_permissive_default_blocks_the_repository() {
+    let allow = DefaultSeedingPolicy::Allow {
+        scope: Default::default(),
+    };
+    let gate = RepoGate::new();
+    let home = home("gate-permissive");
+    let mut node = start_seeding(&home, 27, vec![], Some(gate.clone()), Some(allow));
+    let rid = import(&mut node, "permissive");
+    let mut quarantine = Quarantine::open(home.join("node").join(QUARANTINE_DB_FILE)).unwrap();
+    let record = quarantine
+        .quarantine(
+            rid,
+            Kind::Namespace,
+            "test",
+            None,
+            "a test",
+            Default::default(),
+        )
+        .unwrap();
+    gate.close(
+        rid,
+        RepoState::Quarantined(Shut::Namespace),
+        Duration::from_secs(5),
+    )
+    .expect("the gate closes");
+
+    assert_eq!(
+        node.remove_quarantined(rid, record.qid, &mut quarantine)
+            .unwrap(),
+        Removal::Removed
+    );
+    assert!(!storage_of(&home, rid).exists());
+    assert!(quarantine.get(&rid).unwrap().is_none());
+    // The node's own policies, read under its default.
+    let policies = radicle::node::policy::config::Config::new(
+        allow.into(),
+        radicle::node::policy::store::Store::reader(
+            home.join("node").join(radicle::node::POLICIES_DB_FILE),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        policies.seed_policy(&rid).unwrap().policy,
+        radicle::node::policy::SeedingPolicy::Block,
+        "the permissive default seeds the removed repository again"
+    );
+    assert!(!policies.is_seeding(&rid).unwrap());
 
     node.shutdown().expect("clean shutdown");
     let _ = std::fs::remove_dir_all(&home);

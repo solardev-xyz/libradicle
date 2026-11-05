@@ -2816,6 +2816,13 @@ impl Embedded {
     /// and passes the progress state and the quarantine record it keeps. Its
     /// watchdog is told of each unit through `watch`, and `stop` stops the
     /// repair between units. Only the node's own namespace is ever signed.
+    ///
+    /// A failure outside the repository is [`Error::Reconcile`], and
+    /// quarantines nothing; the host's environment among them, which would
+    /// fail every repository alike: libgit2's configuration outside any
+    /// repository doesn't load, or the repository isn't the process's to
+    /// open. The host keeps the repository shut, and runs the repair again
+    /// once that is fixed.
     pub fn repair_step(
         &self,
         repair: &mut reconcile::driver::Repair,
@@ -2843,12 +2850,21 @@ impl Embedded {
     ///
     /// Otherwise the node unseeds it first, so that it stops asking for it.
     /// Then heartwood's `remove_repo` runs its steps, each durable before
-    /// the next: the seeding policy, `storage/<rid>`, the repository's COB
-    /// cache rows, and last the record. Cut off at any point, the record
-    /// stays, and the removal completes when run again with the same `qid`.
+    /// the next: it stops seeding the repository, whatever the node's
+    /// default seeding policy; it deletes `storage/<rid>`, then the
+    /// repository's COB cache rows, and last the record. Cut off at any
+    /// point, the record stays, and the removal completes when run again
+    /// with the same `qid`.
     ///
-    /// Run it with the repository shut at the node's gate, as a quarantined
-    /// repository is.
+    /// Under a blocking default, the repository's policy goes, and a seed or
+    /// clone after the removal seeds it anew. Under a permissive one, which
+    /// would seed it with no policy of its own, it is blocked instead: only
+    /// an unblock lets the default seed it again, and a seed or clone of it
+    /// doesn't lift that block.
+    ///
+    /// It runs only with the repository shut at the node's gate, as a
+    /// quarantined repository is, and refuses with [`Error::Open`]
+    /// otherwise.
     pub fn remove_quarantined(
         &self,
         rid: RepoId,
@@ -2856,9 +2872,9 @@ impl Embedded {
         quarantine: &mut reconcile::quarantine::Quarantine,
     ) -> Result<reconcile::quarantine::Removal, Error> {
         // Shut, nothing seeds it while it is removed: neither this crate's
-        // clone and import ([`seed`]) nor the node's own seed command, which
-        // the gate refuses too. So no policy written after the removal's
-        // unseed outlives it.
+        // clone and import ([`seed`]) nor the node's own seed and unblock
+        // commands, which the gate refuses too. So no policy written after
+        // the removal's unseed outlives it.
         let state = self.repositories.state(&rid);
         if state.is_open() {
             return Err(Error::Open(rid));
@@ -2867,7 +2883,12 @@ impl Embedded {
             return Ok(reconcile::quarantine::Removal::NotQuarantined);
         }
         self.handle.clone().unseed(rid)?;
-        let mut policies = self.profile.home.policies_mut()?;
+        // The node's default, the one it seeds by: `Options::seeding_policy`
+        // is set on this profile too.
+        let mut policies = radicle::node::policy::config::Config::new(
+            self.profile.config.node.seeding_policy.into(),
+            self.profile.home.policies_mut()?,
+        );
         let mut cache = self.profile.home.cobs_db_mut()?;
         Ok(reconcile::quarantine::remove_repo(
             quarantine,

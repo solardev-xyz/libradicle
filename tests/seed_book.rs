@@ -61,6 +61,7 @@ fn start(home: &Path) -> Embedded {
             }),
             seeding_policy: None,
             isolated: false,
+            repositories: None,
         },
         HostKey::from_bytes(&mut bytes).expect("32 bytes"),
     )
