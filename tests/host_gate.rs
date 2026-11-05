@@ -421,12 +421,19 @@ fn a_removal_outlasts_seeds_and_clones_racing_it() {
         scope.spawn(|| {
             let mut control = control(&home);
             while racing.load(Ordering::Acquire) {
+                // Refused with the gate's state, the answer reaching the
+                // client (heartwood #26), not read as a seed that changed
+                // nothing.
                 let seeded = control.seed(rid, Scope::All);
-                assert!(
-                    !matches!(seeded, Ok(true)),
-                    "a seed of a shut repository was accepted"
-                );
                 seeds.fetch_add(1, Ordering::Relaxed);
+                assert!(
+                    matches!(
+                        &seeded,
+                        Err(radicle::node::Error::Command { reason })
+                            if reason.ends_with("is quarantined (namespace)")
+                    ),
+                    "a seed of a shut repository was accepted: {seeded:?}"
+                );
             }
         });
         // Clones through this crate, which seed before they fetch.
@@ -436,14 +443,16 @@ fn a_removal_outlasts_seeds_and_clones_racing_it() {
             let mut network = network;
             while racing.load(Ordering::Acquire) {
                 let cloned = network.clone_repo(rid, Duration::from_millis(100));
+                clones.fetch_add(1, Ordering::Relaxed);
                 assert!(
                     matches!(cloned, Err(libradicle::Error::Gated { .. })),
-                    "{cloned:?}"
+                    "a clone of a shut repository wasn't refused as gated: {cloned:?}"
                 );
-                clones.fetch_add(1, Ordering::Relaxed);
             }
         });
-        // Both under way before the removal starts.
+        // Both under way before the removal starts. Each counts an attempt
+        // before it checks it, so that one that fails doesn't leave the
+        // removal waiting: the scope's join then fails the test with it.
         while seeds.load(Ordering::Relaxed) == 0 || clones.load(Ordering::Relaxed) == 0 {
             std::thread::yield_now();
         }
