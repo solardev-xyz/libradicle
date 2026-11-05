@@ -5,11 +5,13 @@
 //! and a static peer set, and it dials through a gate that refuses every
 //! target and resolves no name: it reaches no one, loopback included.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use libradicle::{Embedded, HostKey, Options, Routing};
-use radicle::node::config::{AddressConfig, DefaultSeedingPolicy};
+use libradicle::{Embedded, HostKey, Options};
+use radicle::node::config::DefaultSeedingPolicy;
 use radicle::node::routing::Store as _;
 use radicle::node::Handle as _;
 use radicle::prelude::{NodeId, RepoId};
@@ -80,17 +82,13 @@ fn work(dir: &Path) -> PathBuf {
 
 fn start(home: &Path, seeding_policy: Option<DefaultSeedingPolicy>) -> Embedded {
     let mut bytes = vec![43u8; 32];
-    Embedded::start_with_key(
+    common::start_with_key(
         Options {
             home: home.to_path_buf(),
             alias: "seeding".into(),
             listen: vec![],
             control_socket: true,
-            routing: Some(Routing {
-                proxy: None,
-                onion: AddressConfig::Drop,
-                gate: Arc::new(Refusing),
-            }),
+            routing: Some(common::routing_with(Some(Arc::new(Refusing)))),
             seeding_policy,
             isolated: false,
             repositories: None,

@@ -1,6 +1,8 @@
 //! `Embedded::node_alive` and `Embedded::shutdown_within`: a host can tell a
 //! running node from a stopped one, and bound how long a shutdown waits.
 
+mod common;
+
 use std::time::{Duration, Instant};
 
 use libradicle::{Embedded, HostKey, Options};
@@ -30,13 +32,13 @@ fn home(name: &str) -> String {
 }
 
 fn start(home: &str) -> Embedded {
-    Embedded::start_with_key(
+    common::start_with_key(
         Options {
             home: home.into(),
             alias: "health".into(),
             listen: vec![],
             control_socket: true,
-            routing: None,
+            routing: Some(common::routing()),
             seeding_policy: None,
             isolated: false,
             repositories: None,

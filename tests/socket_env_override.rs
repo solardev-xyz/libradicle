@@ -3,7 +3,9 @@
 //! control socket somewhere short. A home long enough to blow SUN_LEN
 //! on its own proves the override is actually what gets bound.
 
-use libradicle::{Embedded, Options};
+mod common;
+
+use libradicle::Options;
 
 #[test]
 fn rad_socket_env_redirects_control_socket_away_from_long_home() {
@@ -13,14 +15,16 @@ fn rad_socket_env_redirects_control_socket_away_from_long_home() {
     let socket = format!("/tmp/radsock-{}.sock", std::process::id());
     std::env::set_var("RAD_SOCKET", &socket);
 
-    let node = Embedded::start(Options {
+    let node = common::start(Options {
         home: home.clone().into(),
         alias: "sock-test".into(),
         listen: vec![],
         control_socket: true,
-        routing: None,
+        routing: Some(common::routing()),
         seeding_policy: None,
-        isolated: false,
+        // A fresh profile's default configuration would dial Radicle's
+        // bootstrap nodes: this node reaches no one.
+        isolated: true,
         repositories: None,
     })
     .expect("start must bind the control socket at RAD_SOCKET, not under home");

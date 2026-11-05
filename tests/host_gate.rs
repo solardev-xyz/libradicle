@@ -12,6 +12,8 @@
 //! - it runs only with the repository shut, and no seed or clone racing it,
 //!   through the node or this crate, outlives it.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
@@ -70,13 +72,13 @@ fn start_seeding(
     repositories: Option<RepoGate>,
     seeding_policy: Option<DefaultSeedingPolicy>,
 ) -> Embedded {
-    Embedded::start_with_key(
+    common::start_with_key(
         Options {
             home: home.to_path_buf(),
             alias: "gate".into(),
             listen,
             control_socket: true,
-            routing: None,
+            routing: Some(common::routing()),
             seeding_policy,
             isolated: false,
             repositories,

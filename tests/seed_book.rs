@@ -5,14 +5,15 @@
 //! Every node here dials through a gate that refuses every target and
 //! resolves no name, so a dial fails before any socket or DNS query.
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use libradicle::{Embedded, HostKey, Options, Routing};
+use libradicle::{Embedded, HostKey, Options};
 use radicle::node::address::Store as _;
-use radicle::node::config::AddressConfig;
 
 /// A gate that refuses every target and resolves no name.
 #[derive(Debug)]
@@ -48,17 +49,13 @@ fn home(name: &str, network: &str) -> PathBuf {
 
 fn start(home: &Path) -> Embedded {
     let mut bytes = vec![41u8; 32];
-    Embedded::start_with_key(
+    common::start_with_key(
         Options {
             home: home.to_path_buf(),
             alias: "seeds".into(),
             listen: vec![],
             control_socket: false,
-            routing: Some(Routing {
-                proxy: None,
-                onion: AddressConfig::Drop,
-                gate: Arc::new(Refusing),
-            }),
+            routing: Some(common::routing_with(Some(Arc::new(Refusing)))),
             seeding_policy: None,
             isolated: false,
             repositories: None,

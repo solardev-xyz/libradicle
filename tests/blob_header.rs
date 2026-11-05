@@ -2,6 +2,8 @@
 //! size comes from its object header, so a read can refuse a file that is
 //! too large before loading any of it.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use libradicle::{BlobHeader, Embedded, Error, HostKey, Options};
@@ -83,13 +85,13 @@ fn fixture(name: &str) -> Fixture {
         .unwrap();
     repo.set_head("refs/heads/main").unwrap();
 
-    let mut node = Embedded::start_with_key(
+    let mut node = common::start_with_key(
         Options {
             home: home.to_str().expect("utf-8 temp dir").into(),
             alias: "blobs".into(),
             listen: vec![],
             control_socket: true,
-            routing: None,
+            routing: Some(common::routing()),
             seeding_policy: None,
             isolated: false,
             repositories: None,

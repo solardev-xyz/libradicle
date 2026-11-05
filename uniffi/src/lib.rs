@@ -71,6 +71,42 @@ fn parse_rid(rid: &str) -> std::result::Result<radicle::identity::RepoId, String
     rid.parse().map_err(|e| format!("invalid RID {rid:?}: {e}"))
 }
 
+/// The options `start` and `start_with_key` give the node: `config.json`'s
+/// routing. In this crate's tests, the hermetic guard's instead, checked
+/// before the node starts, so that a test through the exported starts never
+/// reaches the network (`tests/common/hermetic.rs`).
+fn node_options(home: String, alias: String) -> Options {
+    let opts = Options {
+        home: home.into(),
+        alias,
+        listen: vec![],
+        control_socket: true,
+        routing: None,
+        seeding_policy: None,
+        isolated: false,
+        repositories: None,
+    };
+    #[cfg(test)]
+    let opts = {
+        let opts = Options {
+            routing: Some(libradicle::Routing {
+                proxy: None,
+                onion: radicle::node::config::AddressConfig::Drop,
+                gate: hermetic::gate(),
+            }),
+            ..opts
+        };
+        hermetic::check(
+            &opts.home,
+            opts.isolated,
+            &opts.listen,
+            Some((None, &radicle::node::config::AddressConfig::Drop)),
+        );
+        opts
+    };
+    opts
+}
+
 /// Start the embedded node with a profile at `home`. `{"did": "..."}` on success.
 #[uniffi::export]
 pub fn start(home: String, alias: String) -> String {
@@ -81,16 +117,7 @@ pub fn start(home: String, alias: String) -> String {
     if guard.is_some() {
         return err_json("node already started");
     }
-    match Embedded::start(Options {
-        home: home.into(),
-        alias,
-        listen: vec![],
-        control_socket: true,
-        routing: None,
-        seeding_policy: None,
-        isolated: false,
-        repositories: None,
-    }) {
+    match Embedded::start(node_options(home, alias)) {
         Ok(node) => {
             let did = node.did();
             *guard = Some(node);
@@ -123,19 +150,7 @@ pub fn start_with_key(home: String, alias: String, secret_key: Vec<u8>) -> Strin
     if guard.is_some() {
         return err_json("node already started");
     }
-    match Embedded::start_with_key(
-        Options {
-            home: home.into(),
-            alias,
-            listen: vec![],
-            control_socket: true,
-            routing: None,
-            seeding_policy: None,
-            isolated: false,
-            repositories: None,
-        },
-        key,
-    ) {
+    match Embedded::start_with_key(node_options(home, alias), key) {
         Ok(node) => {
             let did = node.did();
             *guard = Some(node);
@@ -627,6 +642,12 @@ pub fn shutdown(timeout_ms: Option<u32>) -> String {
     }
 }
 
+/// The guard every test node gets: loopback only, and loudly. The exported
+/// starts take it too, in this crate's tests ([`node_options`]).
+#[cfg(test)]
+#[path = "../../tests/common/hermetic.rs"]
+mod hermetic;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,6 +833,60 @@ mod tests {
         }
     }
 
+    const CHILD: &str = "LIBRADICLE_UNIFFI_HERMETIC_CHILD";
+
+    /// In the child: the exported `start` on a home whose `connect` peer is
+    /// named. Its node resolves the name through the hermetic gate, which
+    /// ends the process before any DNS query.
+    #[test]
+    fn exported_start_child() {
+        let Ok(home) = std::env::var(CHILD) else {
+            return;
+        };
+        let peer = {
+            use radicle::crypto::Signer as _;
+            *radicle::crypto::SigningKey::from_seed(radicle::crypto::Seed::new([8; 32]))
+                .public_key()
+        };
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            std::path::Path::new(&home).join("config.json"),
+            format!(
+                r#"{{"preferredSeeds":[],"node":{{"alias":"child","network":"test","peers":{{"type":"static"}},"connect":["{peer}@named.test:8776"]}}}}"#
+            ),
+        )
+        .unwrap();
+        assert!(start(home, "child".into()).contains("did"));
+        // The gate ends the process long before this.
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[test]
+    // Review of libradicle #23, round 1: the exported starts take the hermetic
+    // guard in tests, so a name their node would look up ends the test before
+    // it reaches a resolver.
+    fn the_exported_starts_resolve_no_name() {
+        let home = std::env::temp_dir().join(format!("lr-uniffi-child-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::exported_start_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, &home)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(101), "{stderr}");
+        assert!(
+            stderr.contains("the name named.test, through DNS, off this host"),
+            "{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     // Review of libradicle #19, round 1: a shutdown past its deadline, while
     // a name lookup keeps the node's home, keeps the node, says it is
@@ -836,7 +911,7 @@ mod tests {
         )
         .unwrap();
         let gate = std::sync::Arc::new(Held::default());
-        let node = Embedded::start(Options {
+        let opts = Options {
             home: home.to_str().unwrap().into(),
             alias: "uniffi".into(),
             listen: vec![],
@@ -844,13 +919,19 @@ mod tests {
             routing: Some(libradicle::Routing {
                 proxy: None,
                 onion: radicle::node::config::AddressConfig::Drop,
-                gate: gate.clone(),
+                gate: hermetic::wrapping(gate.clone()),
             }),
             seeding_policy: None,
             isolated: false,
             repositories: None,
-        })
-        .unwrap();
+        };
+        hermetic::check(
+            &opts.home,
+            opts.isolated,
+            &opts.listen,
+            Some((None, &radicle::node::config::AddressConfig::Drop)),
+        );
+        let node = Embedded::start(opts).unwrap();
         *NODE.lock().unwrap() = Some(node);
         {
             let mut state = gate.state.lock().unwrap();
@@ -873,6 +954,14 @@ mod tests {
         }
         assert_eq!(shutdown(Some(10_000)), r#"{"ok":true}"#);
         assert!(NODE.lock().unwrap().is_none());
+        // The restart is about the home being let go of, not about dialing:
+        // without its `connect` peer, whose name only the held gate answered
+        // without DNS.
+        std::fs::write(
+            home.join("config.json"),
+            r#"{"preferredSeeds":[],"node":{"alias":"uniffi","network":"test","peers":{"type":"static"},"connect":[]}}"#,
+        )
+        .unwrap();
         assert!(start(home_str, "uniffi".into()).contains("did"));
         assert_eq!(shutdown(None), r#"{"ok":true}"#);
         let _ = std::fs::remove_dir_all(&home);

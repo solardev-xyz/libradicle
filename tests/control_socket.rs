@@ -5,6 +5,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
@@ -26,12 +28,12 @@ fn home(name: &str) -> PathBuf {
 }
 
 fn start(home: &Path) -> Result<Embedded, Error> {
-    Embedded::start(Options {
+    common::start(Options {
         home: home.to_str().expect("utf-8 temp dir").into(),
         alias: "control".into(),
         listen: vec![],
         control_socket: true,
-        routing: None,
+        routing: Some(common::routing()),
         seeding_policy: None,
         isolated: false,
         repositories: None,

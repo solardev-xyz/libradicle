@@ -2,6 +2,8 @@
 //! R-12 part 3). It dials no one, explicitly or not, takes no bootstrap node
 //! or shipped seed into its address book, and listens on no address.
 
+mod common;
+
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -52,13 +54,13 @@ fn home(name: &str, network: &str, connect: Option<String>, seed: Option<String>
 }
 
 fn start(home: &Path, isolated: bool, listen: Vec<SocketAddr>) -> Embedded {
-    Embedded::start_with_key(
+    common::start_with_key(
         Options {
             home: home.to_str().expect("utf-8 temp dir").into(),
             alias: "isolated".into(),
             listen,
             control_socket: true,
-            routing: None,
+            routing: Some(common::routing()),
             seeding_policy: None,
             isolated,
             repositories: None,
@@ -202,9 +204,14 @@ fn an_isolated_node_takes_no_bootstrap_nodes_and_listens_nowhere() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A node on `home`, isolated, with `routing`.
+/// A node on `home`, isolated, with `routing`, its options checked
+/// (`common::start_with_key`). Its gate stays as given, outside the hermetic
+/// one: isolation replaces it with a gate that refuses every target and
+/// resolves no name, and the hermetic one would stop handing names to the
+/// proxy, the route this file's proxy test checks. Every route that test
+/// gives leads to its loopback proxy.
 fn start_routed(home: &Path, routing: Option<libradicle::Routing>) -> Embedded {
-    Embedded::start_with_key(
+    common::start_with_key(
         Options {
             home: home.to_str().expect("utf-8 temp dir").into(),
             alias: "isolated".into(),

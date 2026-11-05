@@ -3,6 +3,8 @@
 //! module writes it, would be over its budget. A result whose JSON is
 //! exactly the budget fits.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use libradicle::{json, Bounds, CancelToken, Embedded, Error, HostKey, Options};
@@ -85,13 +87,13 @@ fn fixture(name: &str) -> Fixture {
     std::fs::write(work.join("blob.bin"), vec![0u8; 5000]).unwrap();
     let third = commit(&repo, "third");
 
-    let mut node = Embedded::start_with_key(
+    let mut node = common::start_with_key(
         Options {
             home: home.to_str().expect("utf-8 temp dir").into(),
             alias: "walks".into(),
             listen: vec![],
             control_socket: true,
-            routing: None,
+            routing: Some(common::routing()),
             seeding_policy: None,
             isolated: false,
             repositories: None,
