@@ -978,12 +978,16 @@ pub struct Embedded {
     stop: Box<dyn Fn() + Send + Sync>,
     /// Keeps the node's signal channel open for the runtime's lifetime.
     _signals: mpsc::Sender<radicle_signals::Signal>,
+    /// Whether a stop call of this `Embedded` has asked the node to stop
+    /// ([`Shutdown::asked`]).
+    asked: bool,
     /// Whether the node's home has been seen let go of since its thread
     /// ended ([`Embedded::shutdown`]).
     released: bool,
-    /// How the node's thread ended, if with an error: kept until the home
-    /// is let go of, and then returned, once ([`Embedded::shutdown_within`]).
-    ended: Option<Error>,
+    /// How the node's thread ended: [`ThreadEnd::Running`] until it is joined,
+    /// and kept from then on, for every stop call to report
+    /// ([`Embedded::shutdown_within`]).
+    end: ThreadEnd,
     /// The node's repository gate ([`Options::repositories`]): the host's,
     /// or one that admits everything.
     repositories: radicle::node::gate::RepoGate,
@@ -1134,8 +1138,9 @@ impl Embedded {
             node_thread: Some(node_thread),
             stop,
             _signals: sig_tx,
+            asked: false,
             released: false,
-            ended: None,
+            end: ThreadEnd::Running,
             repositories,
         })
     }
@@ -2727,53 +2732,72 @@ impl Embedded {
     /// [`Error::NodeThread`], whether this call joins it or an earlier
     /// [`Embedded::shutdown_within`] did, and whether or not the home is let
     /// go of in time: this call is the last.
+    ///
+    /// A host that must tell whether its own call asked the node, or how the
+    /// thread ended apart from the home, stops it with
+    /// [`Embedded::shutdown_within`] instead, whose [`Shutdown`] says.
     pub fn shutdown(mut self) -> Result<(), Error> {
-        if self
-            .node_thread
-            .as_ref()
-            .is_some_and(|thread| !thread.is_finished())
-            && self.handle.clone().shutdown().is_err()
-        {
-            // The node's control is gone, though its thread runs: its
-            // reactor is asked directly, which can't fail.
-            (self.stop)();
+        if self.running() {
+            self.asked = true;
+            if self.handle.clone().shutdown().is_err() {
+                // The node's control is gone, though its thread runs: its
+                // reactor is asked directly, which can't fail.
+                (self.stop)();
+            }
         }
-        self.join_ended();
+        self.join_within(None);
         // A thread that ended with an error still holds the home a while.
-        let released = self.await_release(
-            std::time::Instant::now().checked_add(HOME_RELEASE_LIMIT),
-            HOME_RELEASE_LIMIT,
-        );
+        let home = self.await_release(std::time::Instant::now().checked_add(HOME_RELEASE_LIMIT));
         // How the thread ended, if with an error, before the release's wait:
         // this call is the last.
-        match self.ended.take() {
-            Some(e) => Err(e),
-            None => released,
+        match (&self.end, home) {
+            (ThreadEnd::Failed(why), _) => Err(Error::NodeThread(why.clone())),
+            (_, HomeLock::Released) => Ok(()),
+            (_, HomeLock::Held) => Err(Error::ShutdownTimeout(HOME_RELEASE_LIMIT)),
+            (_, HomeLock::Unknown(e)) => Err(e.into()),
         }
     }
 
-    /// Joins the node's thread, if one remains, keeping how it ended, if
-    /// with an error or a panic, in `self.ended`: for whichever stop finds
-    /// the home let go of to return.
-    fn join_ended(&mut self) {
+    /// Whether the node's thread is still running, and not yet joined.
+    fn running(&self) -> bool {
+        self.node_thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+    }
+
+    /// Waits, until `deadline` if any, for the node's thread to end, and
+    /// joins it, keeping how it ended in `self.end` for every later stop
+    /// call: `false` if it still runs at the deadline. A thread that has
+    /// ended is joined at once, even with no time left.
+    fn join_within(&mut self, deadline: Option<std::time::Instant>) -> bool {
+        let Some(thread) = self.node_thread.as_ref() else {
+            return true;
+        };
+        // With no deadline, the join waits.
+        if let Some(deadline) = deadline {
+            while !thread.is_finished() {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                std::thread::sleep(left.min(std::time::Duration::from_millis(10)));
+            }
+        }
         if let Some(thread) = self.node_thread.take() {
-            self.ended = match thread.join() {
-                Err(_) => Some(Error::NodeThread("node thread panicked".into())),
-                Ok(Err(e)) => Some(Error::NodeThread(e.to_string())),
-                Ok(Ok(())) => None,
+            self.end = match thread.join() {
+                Err(_) => ThreadEnd::Failed("node thread panicked".into()),
+                Ok(Err(e)) => ThreadEnd::Failed(e.to_string()),
+                Ok(Ok(())) => ThreadEnd::Stopped,
             };
         }
+        true
     }
 
     /// Waits, until `deadline` if any, for the node, whose thread has ended,
-    /// to let go of its home: [`Error::ShutdownTimeout`] of `timeout` past
-    /// it. Once the home has been seen let go of, it returns at once: another
+    /// to let go of its home: [`HomeLock::Held`] past it. Once the home has
+    /// been seen let go of, it is [`HomeLock::Released`] at once: another
     /// node may have taken it since.
-    fn await_release(
-        &mut self,
-        deadline: Option<std::time::Instant>,
-        timeout: std::time::Duration,
-    ) -> Result<(), Error> {
+    fn await_release(&mut self, deadline: Option<std::time::Instant>) -> HomeLock {
         while !self.released {
             match self.profile.home.lock_node() {
                 Ok(lock) => {
@@ -2787,7 +2811,7 @@ impl Embedded {
                             let left =
                                 deadline.saturating_duration_since(std::time::Instant::now());
                             if left.is_zero() {
-                                return Err(Error::ShutdownTimeout(timeout));
+                                return HomeLock::Held;
                             }
                             left.min(poll)
                         }
@@ -2795,10 +2819,10 @@ impl Embedded {
                     };
                     std::thread::sleep(pause);
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return HomeLock::Unknown(e),
             }
         }
-        Ok(())
+        HomeLock::Released
     }
 
     /// The online repair of `rid` after an uncertain write by this node: its
@@ -2907,63 +2931,76 @@ impl Embedded {
     /// Whether the node's thread is still running. `false` once the node has
     /// stopped, whether it was asked to or ended by itself (an error in its
     /// runtime): a host can then restart it, or report why.
+    ///
+    /// A host deciding how a stop left the node takes it from the stop's
+    /// [`Shutdown`] instead: the node can end between this call and the
+    /// stop.
     pub fn node_alive(&self) -> bool {
-        self.node_thread
-            .as_ref()
-            .is_some_and(|thread| !thread.is_finished())
+        self.running()
     }
 
     /// Asks the node to stop, and waits at most `timeout` for its thread to
-    /// end. A `timeout` too large to add to the current time waits for as
-    /// long as the node takes.
+    /// end and for it to let go of its home. A `timeout` too large to add to
+    /// the current time waits for as long as the node takes.
     ///
-    /// - **Stopped in time:** the node's thread is joined for its result,
-    ///   its runtime's error if it ended with one. A node that had already
-    ///   stopped by itself is joined at once, even with no time to wait.
-    /// - **Past the deadline:** [`Error::ShutdownTimeout`]. The node stays in
-    ///   `self`, asked to stop: [`Embedded::node_alive`] tells when it has,
-    ///   and another call waits again and joins it.
-    /// - **The home:** once the thread has ended, it waits, within the same
-    ///   deadline, for the node to let go of its home, as
-    ///   [`Embedded::shutdown`] does. Past it, [`Error::ShutdownTimeout`], and
-    ///   another call waits again.
-    /// - **A thread that ended with an error,** or panicked, is
-    ///   [`Error::NodeThread`]: returned once the home is let go of, by
-    ///   whichever call finds it so.
-    /// - **Once joined, and the home let go of,** a further call returns
-    ///   `Ok` at once.
+    /// The [`Shutdown`] it returns says, each apart, from what this one call
+    /// saw:
+    /// - **[`Shutdown::asked`]:** [`Asked::ThisCall`] if its thread still ran
+    ///   when this call asked it to stop, and no stop call of this
+    ///   `Embedded` had asked before; [`Asked::Earlier`] if one had;
+    ///   [`Asked::Never`] if its thread had ended before any asked.
+    /// - **[`Shutdown::thread`]:** how its thread ended,
+    ///   [`ThreadEnd::Stopped`] or [`ThreadEnd::Failed`], once it has, and
+    ///   [`ThreadEnd::Running`] if it still ran at the deadline. The node is
+    ///   joined as soon as its thread has ended, even with no time to wait.
+    ///   How it ended is kept, and every later call reports it again,
+    ///   whatever the home.
+    /// - **[`Shutdown::home`]:** once the thread has ended, it waits, within
+    ///   the same deadline, for the node to let go of its home, as
+    ///   [`Embedded::shutdown`] does: [`HomeLock::Released`], or
+    ///   [`HomeLock::Held`] past the deadline. A name lookup the node started
+    ///   holds the home until it returns, however its thread ended.
+    ///
+    /// Past the deadline the node stays in `self`, asked to stop, and
+    /// another call waits again. A host decides from the one `Shutdown`,
+    /// with no [`Embedded::node_alive`] check before it: the node can end
+    /// between the two.
     ///
     /// The stop goes to the node's reactor directly, never through its
     /// control socket, so asking can't wait on anything.
-    pub fn shutdown_within(&mut self, timeout: std::time::Duration) -> Result<(), Error> {
+    pub fn shutdown_within(&mut self, timeout: std::time::Duration) -> Shutdown {
         let deadline = std::time::Instant::now().checked_add(timeout);
-        let Some(thread) = self.node_thread.as_ref() else {
-            self.await_release(deadline, timeout)?;
-            return self.ended.take().map_or(Ok(()), Err);
+        let asked = self.ask();
+        let (thread, home) = if self.join_within(deadline) {
+            let home = self.await_release(deadline);
+            (self.end.clone(), home)
+        } else {
+            // Its thread runs, so the node holds its home.
+            (ThreadEnd::Running, HomeLock::Held)
         };
-        if !thread.is_finished() {
-            (self.stop)();
-            loop {
-                let now = std::time::Instant::now();
-                let left = match deadline {
-                    Some(deadline) if now >= deadline => {
-                        return Err(Error::ShutdownTimeout(timeout));
-                    }
-                    Some(deadline) => deadline - now,
-                    None => std::time::Duration::MAX,
-                };
-                if thread.is_finished() {
-                    break;
-                }
-                std::thread::sleep(left.min(std::time::Duration::from_millis(10)));
-            }
+        Shutdown {
+            asked,
+            thread,
+            home,
+            within: timeout,
         }
-        // How the thread ended is kept, so that a call past the deadline for
-        // the home's release loses none of it: the call that finds the home
-        // let go of returns it.
-        self.join_ended();
-        self.await_release(deadline, timeout)?;
-        self.ended.take().map_or(Ok(()), Err)
+    }
+
+    /// Asks the node to stop, through its reactor, if its thread still
+    /// runs, and records that a stop call has: who asked it first, as this
+    /// call finds it ([`Shutdown::asked`]).
+    fn ask(&mut self) -> Asked {
+        let earlier = self.asked;
+        let running = self.running();
+        if running {
+            self.asked = true;
+            (self.stop)();
+        }
+        match (earlier, running) {
+            (true, _) => Asked::Earlier,
+            (false, true) => Asked::ThisCall,
+            (false, false) => Asked::Never,
+        }
     }
 }
 
@@ -2975,6 +3012,118 @@ pub const HOME_RELEASE_LIMIT: std::time::Duration = std::time::Duration::from_se
 /// The deadline of [`shutdown_slot`] for a host that passes none: its
 /// stop, its thread's join and its home's release, all together.
 pub const SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What a stop of the node found ([`Embedded::shutdown_within`]), from one
+/// call: who asked the node to stop, how its thread ended, and whether it
+/// let go of its home, each apart. A host decides from it alone.
+///
+/// - **The node stopped because this call asked it** when it is
+///   [`Asked::ThisCall`] and [`ThreadEnd::Stopped`]
+///   ([`Shutdown::stopped_by_this_call`]). heartwood's run returns `Ok` only
+///   once the node was asked to stop, so a node that ends by itself is
+///   [`ThreadEnd::Failed`], before this call's request or after it. For a node
+///   with no control socket, nothing but this crate's stop calls can ask
+///   it.
+/// - **A failed thread is reported whatever the home:** a name lookup that
+///   still holds the home past the deadline makes it [`HomeLock::Held`], not
+///   the thread's end unknown.
+/// - **Nothing is left to wait for** once the thread has ended and the home
+///   is let go of ([`Shutdown::is_done`]). Until then, the node stays the
+///   caller's, asked to stop, and another call waits again.
+#[derive(Debug)]
+#[must_use]
+pub struct Shutdown {
+    /// Who asked the node to stop.
+    pub asked: Asked,
+    /// How the node's thread ended, or that it still ran at the deadline.
+    pub thread: ThreadEnd,
+    /// Whether the node let go of its home within the deadline.
+    pub home: HomeLock,
+    /// The call's `timeout`, as it was passed.
+    pub within: std::time::Duration,
+}
+
+/// Who asked the node to stop, as a stop call found it ([`Shutdown::asked`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    /// This call: the node's thread still ran when it asked, and no stop
+    /// call of this [`Embedded`] had asked before.
+    ThisCall,
+    /// An earlier stop call of this [`Embedded`] had asked, one that
+    /// returned past its deadline or before this one: this call waited
+    /// again, or found the node stopped.
+    Earlier,
+    /// No stop call of this [`Embedded`]: its thread had ended before any
+    /// asked. It ended by itself, or was stopped through the node's control
+    /// socket (`rad node stop`), which this crate doesn't see.
+    Never,
+}
+
+/// How the node's thread ended ([`Shutdown::thread`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadEnd {
+    /// It still ran at the deadline. It has been asked to stop, and another
+    /// call waits for it again.
+    Running,
+    /// Its run returned `Ok`. heartwood's run returns `Ok` only once the
+    /// node was asked to stop: by this crate's stop calls, or through its
+    /// control socket.
+    Stopped,
+    /// Its run returned an error, a fatal one of heartwood's service among
+    /// them, or the thread panicked: why, as [`Error::NodeThread`] gives it.
+    /// The text can name a path in the node's home.
+    Failed(String),
+}
+
+/// Whether the node let go of its home's lock ([`Shutdown::home`]).
+#[derive(Debug)]
+pub enum HomeLock {
+    /// It has, as this call or an earlier one found: a node can start on
+    /// the home at once. Another may have taken it since.
+    Released,
+    /// It still held the home at the deadline. Its thread ran, or a name
+    /// lookup it started still did: heartwood's runtime holds the home until
+    /// every lookup has returned (Security R-16). Another call waits again.
+    Held,
+    /// Taking the home's node lock failed otherwise, with this error, so
+    /// whether the node let go of it isn't known.
+    Unknown(std::io::Error),
+}
+
+impl Shutdown {
+    /// The node stopped because this call asked it: this call was the first
+    /// to ask, while its thread ran, and its run returned `Ok`. Whether it
+    /// has let go of its home is [`Shutdown::home`]'s to say.
+    pub fn stopped_by_this_call(&self) -> bool {
+        self.asked == Asked::ThisCall && self.thread == ThreadEnd::Stopped
+    }
+
+    /// Nothing is left to wait for: the node's thread has ended, either way,
+    /// and it has let go of its home.
+    pub fn is_done(&self) -> bool {
+        self.thread != ThreadEnd::Running && matches!(self.home, HomeLock::Released)
+    }
+
+    /// The outcome as a `Result`, for a host that needs only to know whether
+    /// to call again:
+    /// - [`Error::ShutdownTimeout`] while the thread runs or the home is
+    ///   held: the node is still the caller's;
+    /// - then [`Error::NodeThread`] if the thread failed;
+    /// - then the error the home's lock failed with, if it did;
+    /// - `Ok` once the node stopped cleanly and let go of its home.
+    ///
+    /// It doesn't say who asked the node to stop.
+    pub fn result(self) -> Result<(), Error> {
+        match (self.thread, self.home) {
+            (ThreadEnd::Running, _) | (_, HomeLock::Held) => {
+                Err(Error::ShutdownTimeout(self.within))
+            }
+            (ThreadEnd::Failed(why), _) => Err(Error::NodeThread(why)),
+            (ThreadEnd::Stopped, HomeLock::Unknown(e)) => Err(e.into()),
+            (ThreadEnd::Stopped, HomeLock::Released) => Ok(()),
+        }
+    }
+}
 
 /// What [`shutdown_slot`] found.
 #[derive(Debug, PartialEq, Eq)]
@@ -3095,16 +3244,18 @@ pub unsafe fn remove_git_config_env() {
 
 /// Shuts down the node a binding keeps in `slot`, within `timeout` for all
 /// of it: its stop, its thread's join and its home's release
-/// ([`Embedded::shutdown_within`]).
+/// ([`Embedded::shutdown_within`], as [`Shutdown::result`] puts it).
 ///
 /// - **Stopped,** and its home let go of: the node is taken out of the slot,
 ///   [`Slot::Stopped`].
-/// - **Past the deadline:** [`Error::ShutdownTimeout`]. The node stays in the
-///   slot, asked to stop, so that another call waits again. A host retries
-///   until it is stopped before it starts a node on the home again, which
-///   is `HomeLocked` until then.
+/// - **Past the deadline:** [`Error::ShutdownTimeout`], while its thread
+///   runs or its home is held, however its thread ended. The node stays in
+///   the slot, asked to stop, so that another call waits again. A host
+///   retries until it is stopped before it starts a node on the home again,
+///   which is `HomeLocked` until then.
 /// - **Any other error is final:** the node is taken out, and the error
-///   returned.
+///   returned: [`Error::NodeThread`] for a thread that failed, once the home
+///   is let go of.
 ///
 /// A host passes a `timeout` below its own watchdog's, so that the call
 /// returns before the watchdog fires.
@@ -3115,7 +3266,7 @@ pub fn shutdown_slot(
     let Some(node) = slot.as_mut() else {
         return Ok(Slot::Empty);
     };
-    match node.shutdown_within(timeout) {
+    match node.shutdown_within(timeout).result() {
         Ok(()) => {
             slot.take();
             Ok(Slot::Stopped)
@@ -3131,18 +3282,25 @@ pub fn shutdown_slot(
 /// How long dropping an [`Embedded`] waits for a node that still runs.
 pub const DROP_SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Dropping an [`Embedded`] whose node still runs stops it, as
-/// [`Embedded::shutdown_within`] does, and waits up to
+/// Dropping an [`Embedded`] whose node's thread hasn't been joined stops
+/// it, as [`Embedded::shutdown_within`] does, and waits up to
 /// [`DROP_SHUTDOWN_LIMIT`] for its thread, joining it. A node that hasn't
 /// stopped by then is logged, and its thread is left to finish by itself: it
 /// has been asked to stop, and holds the home until it does. A node that
-/// stopped with an error is logged too.
+/// stopped with an error is logged too. A thread an earlier stop call
+/// joined has been reported by it, and isn't waited for again.
 impl Drop for Embedded {
     fn drop(&mut self) {
         if self.node_thread.is_none() {
             return;
         }
-        if let Err(e) = self.shutdown_within(DROP_SHUTDOWN_LIMIT) {
+        let stopped = self.shutdown_within(DROP_SHUTDOWN_LIMIT);
+        if let ThreadEnd::Failed(why) = &stopped.thread {
+            log::warn!(
+                target: "libradicle",
+                "Dropped a node whose thread ended with an error: {why}"
+            );
+        } else if let Err(e) = stopped.result() {
             log::warn!(target: "libradicle", "Dropped a node that didn't stop cleanly: {e}");
         }
     }
@@ -3504,18 +3662,31 @@ mod tests {
         gate.wait_for_a_lookup();
         (node.stop)();
         node.node_thread.take().unwrap().join().unwrap().unwrap();
+        // As a stop call's join keeps it.
+        node.end = super::ThreadEnd::Stopped;
         (node, home)
     }
 
+    /// Whether `stopped` says the thread failed with a reason holding
+    /// `why`.
+    fn failed(stopped: &super::Shutdown, why: &str) -> bool {
+        matches!(&stopped.thread, super::ThreadEnd::Failed(e) if e.contains(why))
+    }
+
     #[test]
-    // Review of libradicle #19, round 2: a node whose thread ended with an
-    // error, while a lookup still holds its home past the deadline, keeps
-    // that error: the call past the deadline is `ShutdownTimeout`, and the
-    // one that finds the home let go of returns the error.
-    fn a_terminal_error_outlasts_a_held_home() {
+    // Review of libradicle #19, round 2, and freedom-core #249, round 1: a
+    // node whose thread ended with an error by itself, while a lookup still
+    // holds its home past the deadline, is `Failed` at once, apart from the
+    // held home, and so is every later call. Before, the call was
+    // `ShutdownTimeout` alone, and the error came only once the home was let
+    // go of.
+    fn a_thread_that_ended_with_an_error_is_reported_while_a_lookup_holds_the_home() {
+        use super::{Asked, HomeLock};
+
         let gate = std::sync::Arc::new(Held::default());
         let (mut node, home) = stopped_with_a_held_home("terminal", &gate);
-        // The thread ended with an error of its runtime.
+        // The thread ended with an error of its runtime, before any stop
+        // call asked it.
         node.node_thread = Some(std::thread::spawn(|| {
             Err(radicle_node::runtime::Error::Io(std::io::Error::other(
                 "the runtime failed",
@@ -3525,20 +3696,177 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
 
-        let result = node.shutdown_within(Duration::ZERO);
-        assert!(
-            matches!(result, Err(super::Error::ShutdownTimeout(_))),
-            "{result:?}"
-        );
+        for within in [Duration::ZERO, Duration::from_millis(300)] {
+            let started = Instant::now();
+            let stopped = node.shutdown_within(within);
+            assert!(started.elapsed() >= within, "{:?}", started.elapsed());
+            assert_eq!(stopped.asked, Asked::Never, "{stopped:?}");
+            assert!(failed(&stopped, "the runtime failed"), "{stopped:?}");
+            assert!(matches!(stopped.home, HomeLock::Held), "{stopped:?}");
+            assert!(!stopped.stopped_by_this_call() && !stopped.is_done());
+            // As a `Result`, still a timeout: a binding keeps the node in
+            // its slot until the home is let go of.
+            let result = stopped.result();
+            assert!(
+                matches!(result, Err(super::Error::ShutdownTimeout(d)) if d == within),
+                "{result:?}"
+            );
+        }
         gate.release();
-        let result = node.shutdown_within(Duration::from_secs(10));
+        let stopped = node.shutdown_within(Duration::from_secs(10));
+        assert_eq!(stopped.asked, Asked::Never, "{stopped:?}");
+        assert!(failed(&stopped, "the runtime failed"), "{stopped:?}");
+        assert!(matches!(stopped.home, HomeLock::Released), "{stopped:?}");
+        assert!(stopped.is_done() && !stopped.stopped_by_this_call());
+        let result = stopped.result();
         assert!(
             matches!(&result, Err(super::Error::NodeThread(e)) if e.contains("the runtime failed")),
             "{result:?}"
         );
-        // Returned once.
-        assert!(node.shutdown_within(Duration::ZERO).is_ok());
+        // Every later call reports it again.
+        let again = node.shutdown_within(Duration::ZERO);
+        assert!(failed(&again, "the runtime failed"), "{again:?}");
+        assert!(again.is_done(), "{again:?}");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    // freedom-core #249, round 1: a node this call asked to stop, whose
+    // thread then ended with an error, while a lookup holds its home past
+    // the deadline: this call asked it, and it failed, whatever the home.
+    fn a_thread_asked_by_this_call_that_failed_is_reported_while_a_lookup_holds_the_home() {
+        use super::{Asked, HomeLock};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let gate = std::sync::Arc::new(Held::default());
+        let (mut node, home) = stopped_with_a_held_home("asked", &gate);
+        // A thread that runs until it is asked to stop, and then fails.
+        let asked = std::sync::Arc::new(AtomicBool::new(false));
+        node.stop = Box::new({
+            let asked = asked.clone();
+            move || asked.store(true, Ordering::SeqCst)
+        });
+        node.node_thread = Some(std::thread::spawn({
+            let asked = asked.clone();
+            move || {
+                while !asked.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(radicle_node::runtime::Error::Io(std::io::Error::other(
+                    "failed while stopping",
+                )))
+            }
+        }));
+        assert!(node.node_alive());
+
+        let stopped = node.shutdown_within(Duration::from_millis(500));
+        assert!(asked.load(Ordering::SeqCst));
+        assert_eq!(stopped.asked, Asked::ThisCall, "{stopped:?}");
+        assert!(failed(&stopped, "failed while stopping"), "{stopped:?}");
+        assert!(matches!(stopped.home, HomeLock::Held), "{stopped:?}");
+        assert!(!stopped.stopped_by_this_call() && !stopped.is_done());
+
+        gate.release();
+        let stopped = node.shutdown_within(Duration::from_secs(10));
+        assert_eq!(stopped.asked, Asked::Earlier, "{stopped:?}");
+        assert!(failed(&stopped, "failed while stopping"), "{stopped:?}");
+        assert!(matches!(stopped.home, HomeLock::Released), "{stopped:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    // The outcome as a `Result`: a timeout while the thread runs or the home
+    // is held, then the thread's failure, then the home lock's error.
+    fn the_outcome_as_a_result_keeps_the_node_while_it_holds_its_home() {
+        use super::{Asked, HomeLock, Shutdown, ThreadEnd};
+
+        let within = Duration::from_millis(7);
+        let outcome = |thread: ThreadEnd, home: HomeLock| Shutdown {
+            asked: Asked::ThisCall,
+            thread,
+            home,
+            within,
+        };
+        let failed = || ThreadEnd::Failed("ended".into());
+        let unknown = || HomeLock::Unknown(std::io::Error::other("lock"));
+        for (stopped, timeout) in [
+            (outcome(ThreadEnd::Running, HomeLock::Held), true),
+            (outcome(ThreadEnd::Stopped, HomeLock::Held), true),
+            (outcome(failed(), HomeLock::Held), true),
+            (outcome(failed(), HomeLock::Released), false),
+            (outcome(failed(), unknown()), false),
+            (outcome(ThreadEnd::Stopped, unknown()), false),
+            (outcome(ThreadEnd::Stopped, HomeLock::Released), false),
+        ] {
+            let what = format!("{stopped:?}");
+            let thread = stopped.thread.clone();
+            let io = matches!(stopped.home, HomeLock::Unknown(_));
+            match (stopped.result(), thread) {
+                (Err(super::Error::ShutdownTimeout(d)), _) => {
+                    assert!(timeout && d == within, "{what}")
+                }
+                (Err(super::Error::NodeThread(e)), ThreadEnd::Failed(_)) => {
+                    assert!(!timeout && e == "ended", "{what}")
+                }
+                (Err(super::Error::Io(e)), ThreadEnd::Stopped) => {
+                    assert!(!timeout && io && e.to_string() == "lock", "{what}")
+                }
+                (Ok(()), ThreadEnd::Stopped) => assert!(!timeout && !io, "{what}"),
+                (other, _) => panic!("{what}: {other:?}"),
+            }
+        }
+        // Who asked, and whether anything is left to wait for.
+        for (asked, thread, home, by_this_call, done) in [
+            (
+                Asked::ThisCall,
+                ThreadEnd::Stopped,
+                HomeLock::Released,
+                true,
+                true,
+            ),
+            (
+                Asked::ThisCall,
+                ThreadEnd::Stopped,
+                HomeLock::Held,
+                true,
+                false,
+            ),
+            (Asked::ThisCall, failed(), HomeLock::Released, false, true),
+            (
+                Asked::ThisCall,
+                ThreadEnd::Running,
+                HomeLock::Held,
+                false,
+                false,
+            ),
+            (
+                Asked::Earlier,
+                ThreadEnd::Stopped,
+                HomeLock::Released,
+                false,
+                true,
+            ),
+            (
+                Asked::Never,
+                ThreadEnd::Stopped,
+                HomeLock::Released,
+                false,
+                true,
+            ),
+            (Asked::ThisCall, ThreadEnd::Stopped, unknown(), true, false),
+        ] {
+            let stopped = Shutdown {
+                asked,
+                thread,
+                home,
+                within,
+            };
+            assert_eq!(
+                (stopped.stopped_by_this_call(), stopped.is_done()),
+                (by_this_call, done),
+                "{stopped:?}"
+            );
+        }
     }
 
     #[test]
@@ -3556,11 +3884,9 @@ mod tests {
         while !node.node_thread.as_ref().unwrap().is_finished() {
             std::thread::sleep(Duration::from_millis(1));
         }
-        let result = node.shutdown_within(Duration::ZERO);
-        assert!(
-            matches!(result, Err(super::Error::ShutdownTimeout(_))),
-            "{result:?}"
-        );
+        let stopped = node.shutdown_within(Duration::ZERO);
+        assert!(failed(&stopped, "the saved runtime failure"), "{stopped:?}");
+        assert!(matches!(stopped.home, super::HomeLock::Held), "{stopped:?}");
         let release = {
             let gate = gate.clone();
             std::thread::spawn(move || {
@@ -3612,12 +3938,9 @@ mod tests {
         let mut quickest = Duration::MAX;
         for _ in 0..10 {
             let started = Instant::now();
-            let result = node.shutdown_within(Duration::from_millis(1));
+            let stopped = node.shutdown_within(Duration::from_millis(1));
             quickest = quickest.min(started.elapsed());
-            assert!(
-                matches!(result, Err(super::Error::ShutdownTimeout(_))),
-                "{result:?}"
-            );
+            assert!(matches!(stopped.home, super::HomeLock::Held), "{stopped:?}");
         }
         // Sleeps on Windows round up to its timer's tick.
         if cfg!(not(windows)) {
@@ -3628,6 +3951,7 @@ mod tests {
         }
         gate.release();
         node.shutdown_within(Duration::from_secs(10))
+            .result()
             .expect("the home is let go of");
         let _ = std::fs::remove_dir_all(&home);
     }

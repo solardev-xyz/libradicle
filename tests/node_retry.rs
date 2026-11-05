@@ -7,7 +7,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use libradicle::{Embedded, Error, HostKey, Options};
+use libradicle::{Asked, Embedded, HomeLock, HostKey, Options, ThreadEnd};
 
 /// One test at a time, so that a test's count of node threads sees only its
 /// own node.
@@ -74,10 +74,11 @@ fn a_timed_out_shutdown_keeps_the_node_and_can_be_retried() {
         // No time at all: the call returns at once, without waiting for the
         // node or for the request to reach it.
         let started = Instant::now();
-        match node.shutdown_within(Duration::ZERO) {
-            Err(Error::ShutdownTimeout(timeout)) => assert_eq!(timeout, Duration::ZERO),
-            other => panic!("expected a timeout, got {other:?}"),
-        }
+        let stopped = node.shutdown_within(Duration::ZERO);
+        assert_eq!(stopped.asked, Asked::ThisCall, "{stopped:?}");
+        assert_eq!(stopped.thread, ThreadEnd::Running, "{stopped:?}");
+        assert!(matches!(stopped.home, HomeLock::Held), "{stopped:?}");
+        assert_eq!(stopped.within, Duration::ZERO);
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "a zero timeout took {:?}",
@@ -85,8 +86,11 @@ fn a_timed_out_shutdown_keeps_the_node_and_can_be_retried() {
         );
         // The node is still the caller's: waiting again joins it, so its
         // thread is gone when the call returns, and its home is free at once.
-        node.shutdown_within(Duration::from_secs(10))
-            .expect("stops on the retry");
+        // The retry didn't ask it first.
+        let stopped = node.shutdown_within(Duration::from_secs(10));
+        assert_eq!(stopped.asked, Asked::Earlier, "{stopped:?}");
+        assert_eq!(stopped.thread, ThreadEnd::Stopped, "{stopped:?}");
+        stopped.result().expect("stops on the retry");
         assert!(!node.node_alive());
         #[cfg(target_os = "linux")]
         assert_eq!(
@@ -167,6 +171,7 @@ fn a_wedged_control_socket_doesnt_hold_up_the_stop() {
 
     let started = Instant::now();
     node.shutdown_within(Duration::from_secs(10))
+        .result()
         .expect("stops while its control socket is wedged");
     assert!(
         started.elapsed() < Duration::from_secs(2),
@@ -189,10 +194,10 @@ fn dropping_a_timed_out_node_leaves_no_thread_behind() {
     let mut node = start(&home);
     let wedged = wedge_control_socket(&home);
 
-    assert!(matches!(
-        node.shutdown_within(Duration::ZERO),
-        Err(Error::ShutdownTimeout(_))
-    ));
+    assert_eq!(
+        node.shutdown_within(Duration::ZERO).thread,
+        ThreadEnd::Running
+    );
     let _ = node.shutdown_within(Duration::from_millis(300));
     drop(node);
     // Joined by `Drop`, with the control socket still wedged.
@@ -213,10 +218,10 @@ fn a_node_without_a_control_socket_is_dropped_cleanly() {
         .join("node/control.sock")
         .exists());
 
-    assert!(matches!(
-        node.shutdown_within(Duration::ZERO),
-        Err(Error::ShutdownTimeout(_))
-    ));
+    assert_eq!(
+        node.shutdown_within(Duration::ZERO).thread,
+        ThreadEnd::Running
+    );
     drop(node);
     #[cfg(target_os = "linux")]
     assert_eq!((stop_helpers(), node_threads()), (0, 0));

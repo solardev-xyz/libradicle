@@ -5,7 +5,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use libradicle::{Embedded, HostKey, Options};
+use libradicle::{Asked, Embedded, HomeLock, HostKey, Options, ThreadEnd};
 use radicle::node::Handle as _;
 
 fn key() -> HostKey {
@@ -54,13 +54,24 @@ fn a_running_node_is_alive_and_stops_within_its_timeout() {
     let mut node = start(&home);
     assert!(node.node_alive());
     let started = Instant::now();
-    node.shutdown_within(Duration::from_secs(10))
-        .expect("stops in time");
+    // The clean stop: this call asked a running node, which stopped, and let
+    // go of its home.
+    let stopped = node.shutdown_within(Duration::from_secs(10));
     assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(stopped.asked, Asked::ThisCall, "{stopped:?}");
+    assert_eq!(stopped.thread, ThreadEnd::Stopped, "{stopped:?}");
+    assert!(matches!(stopped.home, HomeLock::Released), "{stopped:?}");
+    assert!(stopped.stopped_by_this_call() && stopped.is_done());
+    stopped.result().expect("stops in time");
     assert!(!node.node_alive());
-    // Joined: another call has nothing to wait for.
-    node.shutdown_within(Duration::ZERO)
-        .expect("already joined");
+    // Joined: another call has nothing to wait for, and didn't ask.
+    let again = node.shutdown_within(Duration::ZERO);
+    assert_eq!(again.asked, Asked::Earlier, "{again:?}");
+    assert_eq!(again.thread, ThreadEnd::Stopped, "{again:?}");
+    assert!(
+        again.is_done() && !again.stopped_by_this_call(),
+        "{again:?}"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -68,7 +79,11 @@ fn a_running_node_is_alive_and_stops_within_its_timeout() {
 fn a_timeout_too_large_for_a_deadline_waits_for_the_node() {
     let home = home("radforever");
     let mut node = start(&home);
-    node.shutdown_within(Duration::MAX).expect("stops");
+    let stopped = node.shutdown_within(Duration::MAX);
+    assert!(
+        stopped.stopped_by_this_call() && stopped.is_done(),
+        "{stopped:?}"
+    );
     assert!(!node.node_alive());
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -88,8 +103,16 @@ fn a_node_stopped_from_outside_is_not_alive_and_shuts_down_cleanly() {
         assert!(Instant::now() < until, "the node never stopped");
         std::thread::sleep(Duration::from_millis(20));
     }
-    // Already stopped: joined for its own result, at once, even with no time.
-    node.shutdown_within(Duration::ZERO)
-        .expect("a node that stopped cleanly");
+    // Already stopped: joined for its own result, at once, even with no
+    // time. No stop call of the embedder's asked it.
+    let stopped = node.shutdown_within(Duration::ZERO);
+    assert_eq!(stopped.asked, Asked::Never, "{stopped:?}");
+    assert_eq!(stopped.thread, ThreadEnd::Stopped, "{stopped:?}");
+    assert!(matches!(stopped.home, HomeLock::Released), "{stopped:?}");
+    assert!(stopped.is_done() && !stopped.stopped_by_this_call());
+    stopped.result().expect("a node that stopped cleanly");
+    // Nor does a later call.
+    let again = node.shutdown_within(Duration::ZERO);
+    assert_eq!(again.asked, Asked::Never, "{again:?}");
     let _ = std::fs::remove_dir_all(&home);
 }
