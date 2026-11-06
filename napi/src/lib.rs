@@ -36,6 +36,30 @@ fn err_json(e: impl std::fmt::Display) -> String {
     json::to_string(|w| json::error(w, e))
 }
 
+/// The text of a caught panic, for the error payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
+}
+
+/// Run `f`, answering a panic with an `{"error": ...}` payload instead.
+///
+/// A panic must not reach napi: `compute` runs on a libuv worker inside an
+/// `extern "C"` callback, where an unwinding panic aborts the process, and
+/// the process is the host application (the whole browser, for Freedom).
+fn guarded(f: impl FnOnce() -> String) -> String {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(json) => json,
+        Err(payload) => err_json(format!(
+            "libradicle panicked: {}",
+            panic_message(payload.as_ref())
+        )),
+    }
+}
+
 /// One blocking call scheduled on the libuv thread pool (myotis pattern).
 pub struct BlockingJson {
     run: Option<Box<dyn FnOnce() -> String + Send>>,
@@ -46,14 +70,22 @@ impl Task for BlockingJson {
     type JsValue = String;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        match self.run.take() {
-            Some(f) => Ok(f()),
-            None => Ok(r#"{"error":"task already ran"}"#.to_string()),
-        }
+        Ok(self.output())
     }
 
     fn resolve(&mut self, _env: Env, output: String) -> Result<String> {
         Ok(output)
+    }
+}
+
+impl BlockingJson {
+    /// The task's result: its work, run once, with a panic in it answered
+    /// as an error payload ([`guarded`]).
+    fn output(&mut self) -> String {
+        match self.run.take() {
+            Some(f) => guarded(f),
+            None => r#"{"error":"task already ran"}"#.to_string(),
+        }
     }
 }
 
@@ -63,14 +95,42 @@ fn blocking(f: impl FnOnce() -> String + Send + 'static) -> AsyncTask<BlockingJs
     })
 }
 
-fn with_node(f: impl FnOnce(&mut Embedded) -> String) -> String {
+/// Run `f` on the `NODE` slot, its guard held. A panic in `f` is caught
+/// here, while the guard is still held, so it does not poison `NODE` for
+/// every later call. `start`, `shutdown` and every call on the node go
+/// through this.
+fn with_slot(f: impl FnOnce(&mut Option<Embedded>) -> String) -> String {
     match NODE.lock() {
-        Ok(mut guard) => match guard.as_mut() {
-            Some(node) => f(node),
-            None => err_json("node not started"),
-        },
+        Ok(mut guard) => guarded(|| f(&mut guard)),
         Err(_) => err_json("node lock poisoned"),
     }
+}
+
+/// Run `f` on the started node ([`with_slot`]).
+fn with_node(f: impl FnOnce(&mut Embedded) -> String) -> String {
+    with_slot(|slot| match slot.as_mut() {
+        Some(node) => f(node),
+        None => err_json("node not started"),
+    })
+}
+
+/// Start a node into `NODE` with `start`, answering `{"did": ...}` or an
+/// error payload. A panic in `start` is caught while the guard is held
+/// ([`with_slot`]), so a failed start never poisons `NODE` for the next one.
+fn start_node(start: impl FnOnce() -> std::result::Result<Embedded, libradicle::Error>) -> String {
+    with_slot(|slot| {
+        if slot.is_some() {
+            return err_json("node already started");
+        }
+        match start() {
+            Ok(node) => {
+                let did = node.did();
+                *slot = Some(node);
+                json::to_string(|w| json::did(w, &did))
+            }
+            Err(e) => err_json(e),
+        }
+    })
 }
 
 fn network() -> std::result::Result<Network, String> {
@@ -94,36 +154,51 @@ fn parse_rid(rid: &str) -> std::result::Result<radicle::identity::RepoId, String
     rid.parse().map_err(|e| format!("invalid RID {rid:?}: {e}"))
 }
 
+/// The options `start` gives the node: `config.json`'s routing. In this
+/// crate's tests, the hermetic guard's instead, checked before the node
+/// starts, so that a test through `start` never reaches the network
+/// (`tests/common/hermetic.rs`), as in the UniFFI binding.
+fn node_options(home: String, alias: String) -> Options {
+    let opts = Options {
+        home: home.into(),
+        alias,
+        listen: vec![],
+        control_socket: true,
+        routing: None,
+        seeding_policy: None,
+        isolated: false,
+        repositories: None,
+    };
+    #[cfg(test)]
+    let opts = {
+        let opts = Options {
+            routing: Some(libradicle::Routing {
+                proxy: None,
+                onion: radicle::node::config::AddressConfig::Drop,
+                gate: hermetic::gate(),
+            }),
+            ..opts
+        };
+        hermetic::check(
+            &opts.home,
+            opts.isolated,
+            &opts.listen,
+            Some((None, &radicle::node::config::AddressConfig::Drop)),
+        );
+        opts
+    };
+    opts
+}
+
 /// Start the embedded node with a profile at `home`. Resolves to
 /// `{"did": "..."}` once the node thread is up.
 #[napi]
 pub fn start(home: String, alias: String) -> AsyncTask<BlockingJson> {
-    blocking(move || {
-        let mut guard = match NODE.lock() {
-            Ok(g) => g,
-            Err(_) => return err_json("node lock poisoned"),
-        };
-        if guard.is_some() {
-            return err_json("node already started");
-        }
-        match Embedded::start(Options {
-            home: home.into(),
-            alias,
-            listen: vec![],
-            control_socket: true,
-            routing: None,
-            seeding_policy: None,
-            isolated: false,
-            repositories: None,
-        }) {
-            Ok(node) => {
-                let did = node.did();
-                *guard = Some(node);
-                json::to_string(|w| json::did(w, &did))
-            }
-            Err(e) => err_json(e),
-        }
-    })
+    blocking(move || start_json(home, alias))
+}
+
+fn start_json(home: String, alias: String) -> String {
+    start_node(|| Embedded::start(node_options(home, alias)))
 }
 
 /// Concurrently bootstrap from the effective seed book. The response retains
@@ -664,21 +739,107 @@ fn shutdown_json(timeout_ms: Option<u32>) -> String {
     let timeout = timeout_ms.map_or(libradicle::SHUTDOWN_DEADLINE, |ms| {
         Duration::from_millis(u64::from(ms))
     });
-    let mut guard = match NODE.lock() {
-        Ok(guard) => guard,
-        Err(_) => return err_json("node lock poisoned"),
-    };
-    match libradicle::shutdown_slot(&mut guard, timeout) {
+    // The node stays in the slot while it stops, so the guard is held
+    // throughout: a panic is caught inside it ([`with_slot`]).
+    with_slot(|slot| match libradicle::shutdown_slot(slot, timeout) {
         Ok(libradicle::Slot::Stopped) => json::to_string(json::ok),
         Ok(libradicle::Slot::Empty) => err_json("node not started"),
         Err(e @ libradicle::Error::ShutdownTimeout(_)) => json::to_string(|w| json::stopping(w, e)),
         Err(e) => err_json(e),
-    }
+    })
 }
+
+/// The guard every test node gets: loopback only, and loudly. `start`
+/// takes it too, in this crate's tests ([`node_options`]).
+#[cfg(test)]
+#[path = "../../tests/common/hermetic.rs"]
+mod hermetic;
 
 #[cfg(test)]
 mod tests {
-    use super::{page_size, BINDING_MAX_PER_PAGE};
+    use super::{
+        guarded, page_size, shutdown_json, start_json, start_node, with_node, BlockingJson,
+        BINDING_MAX_PER_PAGE, NODE,
+    };
+
+    #[test]
+    fn a_panic_becomes_an_error_payload() {
+        let json: serde_json::Value =
+            serde_json::from_str(&guarded(|| panic!("boom"))).expect("JSON");
+        assert_eq!(json["error"], "libradicle panicked: boom");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&guarded(|| panic!("{}", String::from("owned")))).unwrap();
+        assert_eq!(json["error"], "libradicle panicked: owned");
+
+        assert_eq!(guarded(|| "{}".to_string()), "{}");
+
+        // Every task runs through it (`compute`, on the libuv worker).
+        let mut task = BlockingJson {
+            run: Some(Box::new(|| -> String { panic!("in a task") })),
+        };
+        let json: serde_json::Value = serde_json::from_str(&task.output()).unwrap();
+        assert_eq!(json["error"], "libradicle panicked: in a task");
+    }
+
+    fn error_of(json: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(json).expect("JSON");
+        value["error"].as_str().unwrap_or_default().to_string()
+    }
+
+    fn temp_home(name: &str) -> std::path::PathBuf {
+        let mut home = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        if home.join("node/control.sock").as_os_str().len() > 100 {
+            home = std::path::Path::new("/tmp").join(format!("{name}-{}", std::process::id()));
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        home
+    }
+
+    /// One test drives `NODE` end to end, so no two tests race the global.
+    #[test]
+    fn a_failed_start_leaves_the_node_slot_usable() {
+        // A panic inside the startup lock is answered and does not poison it.
+        let failed = start_node(|| panic!("startup panic"));
+        assert_eq!(error_of(&failed), "libradicle panicked: startup panic");
+        assert!(NODE.lock().is_ok(), "NODE is not poisoned");
+
+        // An alias Radicle refuses is an error, not a panic, and nothing is
+        // written for it.
+        let home = temp_home("lr-napi-start");
+        let home_str = home.to_str().expect("utf-8 temp dir").to_owned();
+        let invalid = start_json(home_str.clone(), "invalid alias".into());
+        assert!(error_of(&invalid).contains("alias"), "{invalid}");
+        assert!(NODE.lock().is_ok(), "NODE is not poisoned");
+        assert!(!home.join("config.json").exists());
+
+        // The next, valid start works, and so do calls on the node. Its home
+        // dials nobody (a fresh profile's defaults would dial the seeds).
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.json"),
+            r#"{"preferredSeeds":[],"node":{"alias":"ValidAlias","network":"test","connect":[],"peers":{"type":"static"}}}"#,
+        )
+        .unwrap();
+        let started: serde_json::Value =
+            serde_json::from_str(&start_json(home_str.clone(), "ValidAlias".into())).unwrap();
+        assert!(
+            started["did"].as_str().unwrap().starts_with("did:key:"),
+            "{started}"
+        );
+        assert_eq!(with_node(|node| node.identity().alias), "ValidAlias");
+
+        // A panic in a call on the node is answered too, and leaves the node
+        // usable.
+        let failed = with_node(|_| panic!("call panic"));
+        assert_eq!(error_of(&failed), "libradicle panicked: call panic");
+        assert!(NODE.lock().is_ok(), "NODE is not poisoned");
+        assert_eq!(with_node(|node| node.identity().alias), "ValidAlias");
+
+        assert_eq!(shutdown_json(None), r#"{"ok":true}"#);
+        assert!(NODE.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     /// R-18: `commits` never walks a page larger than the cap, whatever
     /// page size the host asks for (a `u32`).
