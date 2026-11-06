@@ -6,7 +6,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const addonPath = path.resolve("target/release/libradicle.node");
+const addonPath = path.resolve(process.env.LIBRADICLE_ADDON || "target/release/libradicle.node");
 const addon = require(addonPath);
 const tempBase = process.platform === "darwin" ? "/private/tmp" : os.tmpdir();
 const root = fs.mkdtempSync(path.join(tempBase, "lr-repo-smoke-"));
@@ -57,6 +57,28 @@ try {
   );
   const second = git("-C", repository, "rev-parse", "HEAD");
 
+  // A third commit whose diff is not UTF-8: Latin-1 text in a changed and an
+  // added file. Serializing such a diff used to panic inside the addon and
+  // abort the host process.
+  fs.writeFileSync(
+    path.join(repository, "new.txt"),
+    Buffer.from([...Buffer.from("new file\ncaf"), 0xe9, 0x0a]),
+  );
+  fs.writeFileSync(path.join(repository, "latin1.txt"), Buffer.from([0xe0, 0x20, 0x62, 0x0a]));
+  git("-C", repository, "add", "new.txt", "latin1.txt");
+  git(
+    "-C",
+    repository,
+    "-c",
+    "user.name=Smoke Test",
+    "-c",
+    "user.email=smoke@example.test",
+    "commit",
+    "-m",
+    "latin-1 commit",
+  );
+  const third = git("-C", repository, "rev-parse", "HEAD");
+
   await call("start", home, "RepositorySmoke");
   started = true;
   const { rid } = await call(
@@ -73,6 +95,7 @@ try {
   const commitsPage0 = await call("commits", rid, second, 0, 1);
   const commitsPage1 = await call("commits", rid, second, 1, 1);
   const commit = await call("commit", rid, second);
+  const latin1 = await call("commit", rid, third);
   const stats = await call("repoStats", rid, second);
   const remotes = await call("remotes", rid);
   const seeded = await call("listSeededRepos");
@@ -99,13 +122,21 @@ try {
       ),
     ),
   );
+  assert.equal(latin1.commit.id, third);
+  assert.equal(latin1.diff.stats.insertions, 2);
+  assert.equal(latin1.diff.stats.deletions, 0);
+  const latin1Lines = latin1.diff.files.flatMap((file) =>
+    (file.diff?.hunks ?? []).flatMap((hunk) => hunk.lines.map((line) => line.line)),
+  );
+  assert(latin1Lines.includes("caf\uFFFD\n"), JSON.stringify(latin1Lines));
+  assert(latin1Lines.includes("\uFFFD b\n"), JSON.stringify(latin1Lines));
   assert.equal(stats.commits, 2);
   assert.equal(stats.contributors, 1);
   assert.equal(stats.branches, 1);
-  assert(remotes.some((remote) => remote.delegate && remote.heads.main === second));
+  assert(remotes.some((remote) => remote.delegate && remote.heads.main === third));
   assert(seeded.some((repo) => repo.rid === rid && repo.name === "repository-smoke"));
 
-  console.log(JSON.stringify({ rid, first, second, stats, remotes: remotes.length }));
+  console.log(JSON.stringify({ rid, first, second, third, stats, remotes: remotes.length }));
 } finally {
   try {
     if (started) await call("shutdown");

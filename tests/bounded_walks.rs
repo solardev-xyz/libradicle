@@ -371,6 +371,55 @@ fn moved_files_are_counted_as_moves() {
     }
 }
 
+// R-19: a commit whose diff isn't UTF-8 (Latin-1 text in a changed file and
+// an added one, and on Unix a file whose name isn't UTF-8) reads, bounded and
+// unbounded, decoded with U+FFFD for each invalid sequence, where its JSON
+// used to panic. The bounded read charges the decoded diff's JSON, and fits
+// a budget of exactly that.
+#[test]
+fn a_non_utf8_diff_is_decoded_and_charged_as_decoded() {
+    let f = fixture("radwalklatin1");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let head = git
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let mut root = git.treebuilder(Some(&head.tree().unwrap())).unwrap();
+    let changed = git.blob(b"one\ncaf\xe9\nthree\n").unwrap();
+    root.insert("a.txt", changed, 0o100644).unwrap();
+    let added = git.blob(b"\xe0 bient\xf4t\n").unwrap();
+    root.insert("latin1.txt", added, 0o100644).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let text = git.blob(b"text\n").unwrap();
+        let name = Path::new(std::ffi::OsStr::from_bytes(b"na\xefve.txt"));
+        root.insert(name, text, 0o100644).unwrap();
+    }
+    let root = root.write().unwrap();
+    drop(head);
+    let oid = store_commit(&f, Some(root), "latin-1", false).to_string();
+
+    let detail = f.node.commit(f.rid, &oid).expect("the unbounded read");
+    let text = json::to_string(|w| json::commit(w, &detail));
+    assert!(text.contains("caf\u{FFFD}\\n"), "{text}");
+    assert!(text.contains("\u{FFFD} bient\u{FFFD}t\\n"), "{text}");
+    #[cfg(unix)]
+    assert!(text.contains("na\u{FFFD}ve.txt"), "{text}");
+    let stats = detail.diff.stats();
+    let added = if cfg!(unix) { 3 } else { 2 };
+    assert_eq!((stats.insertions, stats.deletions), (added, 1), "{text}");
+
+    let bounded = f
+        .node
+        .commit_bounded(f.rid, &oid, &Bounds::for_binding())
+        .expect("the binding's bounded read");
+    assert_eq!(json::to_string(|w| json::commit(w, &bounded)), text);
+    exact(text.len() as u64, |b| f.node.commit_bounded(f.rid, &oid, b));
+}
+
 // Review of libradicle #8, round 1: listing repositories stops at the first
 // one that doesn't fit, with many in storage.
 #[test]

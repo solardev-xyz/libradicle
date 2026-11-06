@@ -44,6 +44,10 @@ pub enum Error {
     NodeThread(String),
     #[error("the node didn't stop within {0:?}")]
     ShutdownTimeout(std::time::Duration),
+    /// An alias Radicle refuses (empty, too long, or with whitespace or
+    /// control characters), for a fresh profile's `config.json`.
+    #[error("invalid node alias: {0}")]
+    Alias(#[from] radicle::node::AliasError),
     #[error("invalid collaborative object id {0:?}")]
     InvalidCobId(String),
     #[error("not a directory: {0}")]

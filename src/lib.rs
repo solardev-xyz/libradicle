@@ -55,7 +55,9 @@ use objects::{Objects, Walk};
 pub struct Options {
     /// Radicle home directory (profile, keys, storage, node dbs).
     pub home: PathBuf,
-    /// Alias to use when initializing a fresh profile.
+    /// Alias to use when initializing a fresh profile. One Radicle refuses
+    /// (empty, over 32 bytes, or with whitespace or control characters) is
+    /// [`Error::Alias`] on a fresh home, before anything is written to it.
     pub alias: String,
     /// Addresses to listen on for inbound connections. Empty = outbound-only.
     pub listen: Vec<std::net::SocketAddr>,
@@ -907,7 +909,7 @@ fn host_profile(home: Home, alias: &str, public_key: PublicKey) -> Result<Profil
     let config = if config_path.exists() {
         Config::load(config_path.as_path()).map_err(radicle::profile::Error::from)?
     } else {
-        Config::init(Alias::new(alias), config_path.as_path())
+        Config::init(alias.parse::<Alias>()?, config_path.as_path())
             .map_err(radicle::profile::Error::from)?
     };
     let storage = radicle::Storage::open(
@@ -1024,7 +1026,7 @@ impl Embedded {
                     .map_err(radicle::profile::Error::from)?;
                 Profile::load_from(home.clone())?
             } else {
-                Profile::init(home.clone(), Alias::new(&opts.alias), None, seed)?
+                Profile::init(home.clone(), opts.alias.parse::<Alias>()?, None, seed)?
             }
         };
         // In-process signer: load the (unencrypted) secret key.
@@ -2133,12 +2135,16 @@ impl Embedded {
     }
 
     /// Commit metadata plus a structured diff against its first parent.
+    ///
+    /// Diff text and paths that are not UTF-8 (a Latin-1 file, a file name
+    /// in another encoding) come back decoded lossily, with U+FFFD for each
+    /// invalid sequence; see [`utf8_diff`].
     pub fn commit(&self, rid: RepoId, revision: &str) -> Result<CommitDetail, Error> {
         self.commit_bounded(rid, revision, &Bounds::unbounded())
     }
 
     /// [`Embedded::commit`], within `bounds`: the detail is charged as
-    /// [`json::commit`] writes it.
+    /// [`json::commit`] writes it, its diff as decoded ([`utf8_diff`]).
     ///
     /// The diff is checked before it is built, and is `TooLarge` before
     /// anything of it is built when:
@@ -2168,7 +2174,7 @@ impl Embedded {
         let repo = self.surf_repo(rid)?;
         let commit = repo.commit(radicle_surf::Oid::from(oid))?;
         meter.check()?;
-        let diff = repo.diff_commit(commit.id)?;
+        let diff = utf8_diff(repo.diff_commit(commit.id)?);
         let detail = CommitDetail { commit, diff };
         meter.whole(|w| json::commit(w, &detail))?;
         Ok(detail)
@@ -3376,11 +3382,245 @@ fn parse_revision(revision: &str) -> Result<git2::Oid, Error> {
     git2::Oid::from_str(revision).map_err(|_| Error::InvalidRevision(revision.to_string()))
 }
 
+/// `diff` with every line, hunk header and path valid UTF-8, each invalid
+/// sequence replaced by U+FFFD.
+///
+/// radicle-surf keeps diff lines as bytes, and its `Serialize` for a line or
+/// a path returns an error when they are not UTF-8. The bindings serialize
+/// the diff to JSON, so such a commit (one adding a Latin-1 text file, say)
+/// would fail there; JSON text has no way to carry the raw bytes anyway.
+/// The diff is rebuilt through `Diff`'s own `insert_*`, which count the same
+/// stats radicle-surf counted.
+///
+/// A bounded read charges the decoded diff ([`Embedded::commit_bounded`]).
+/// Decoding never shortens the text: an invalid sequence is at most three
+/// bytes, and its U+FFFD is three. So the floors [`Embedded::diff_fits`]
+/// takes from the raw bytes stay floors of the decoded diff's JSON.
+fn utf8_diff(diff: radicle_surf::diff::Diff) -> radicle_surf::diff::Diff {
+    use radicle_surf::diff::{Diff, FileDiff};
+
+    let mut out = Diff::default();
+    for file in diff.into_files() {
+        match file {
+            FileDiff::Added(f) => out.insert_added(utf8_path(f.path), utf8_content(f.diff), f.new),
+            FileDiff::Deleted(f) => {
+                out.insert_deleted(utf8_path(f.path), utf8_content(f.diff), f.old)
+            }
+            FileDiff::Modified(f) => {
+                out.insert_modified(utf8_path(f.path), utf8_content(f.diff), f.old, f.new)
+            }
+            FileDiff::Moved(f) => out.insert_moved(
+                utf8_path(f.old_path),
+                utf8_path(f.new_path),
+                f.old,
+                f.new,
+                utf8_content(f.diff),
+            ),
+            FileDiff::Copied(f) => out.insert_copied(
+                utf8_path(f.old_path),
+                utf8_path(f.new_path),
+                f.old,
+                f.new,
+                utf8_content(f.diff),
+            ),
+        }
+    }
+    out
+}
+
+fn utf8_path(path: PathBuf) -> PathBuf {
+    match path.into_os_string().into_string() {
+        Ok(text) => PathBuf::from(text),
+        Err(raw) => PathBuf::from(raw.to_string_lossy().into_owned()),
+    }
+}
+
+fn utf8_line(line: radicle_surf::diff::Line) -> radicle_surf::diff::Line {
+    match line.from_utf8() {
+        Ok(text) => text.into(),
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned().into(),
+    }
+}
+
+fn utf8_content(content: radicle_surf::diff::DiffContent) -> radicle_surf::diff::DiffContent {
+    use radicle_surf::diff::{Addition, Deletion, DiffContent, Hunk, Hunks, Modification};
+
+    let DiffContent::Plain { hunks, stats, eof } = content else {
+        return content;
+    };
+    let hunks = hunks
+        .0
+        .into_iter()
+        .map(|hunk| Hunk {
+            header: utf8_line(hunk.header),
+            lines: hunk
+                .lines
+                .into_iter()
+                .map(|line| match line {
+                    Modification::Addition(Addition { line, line_no }) => {
+                        Modification::Addition(Addition {
+                            line: utf8_line(line),
+                            line_no,
+                        })
+                    }
+                    Modification::Deletion(Deletion { line, line_no }) => {
+                        Modification::Deletion(Deletion {
+                            line: utf8_line(line),
+                            line_no,
+                        })
+                    }
+                    Modification::Context {
+                        line,
+                        line_no_old,
+                        line_no_new,
+                    } => Modification::Context {
+                        line: utf8_line(line),
+                        line_no_old,
+                        line_no_new,
+                    },
+                })
+                .collect(),
+            old: hunk.old,
+            new: hunk.new,
+        })
+        .collect::<Vec<_>>();
+    DiffContent::Plain {
+        hunks: Hunks(hunks),
+        stats,
+        eof,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse_revision, repositories, validate_cob_id};
     use super::{CancelToken, FetchPolicy, Progress, FILE_JSON, HUNK_JSON, LINE_JSON};
     use std::time::{Duration, Instant};
+
+    /// A two-commit git repository whose second commit changes `ok.txt` and
+    /// adds `latin1.txt`, both with Latin-1 bytes (and, on Unix, a file whose
+    /// name is not UTF-8). Returns the directory and the second commit.
+    fn non_utf8_repo(name: &str) -> (std::path::PathBuf, git2::Oid) {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = git2::Repository::init(&dir).expect("init");
+        let sig = git2::Signature::new("t", "t@example.com", &git2::Time::new(0, 0)).unwrap();
+        let commit = |files: &[(&std::path::Path, &[u8])], parent: Option<git2::Oid>| {
+            let mut tree = repo.treebuilder(None).unwrap();
+            for (path, bytes) in files {
+                let blob = repo.blob(bytes).unwrap();
+                tree.insert(path, blob, 0o100644).unwrap();
+            }
+            let tree = repo.find_tree(tree.write().unwrap()).unwrap();
+            let parents = parent.map(|oid| repo.find_commit(oid).unwrap());
+            let parents: Vec<_> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, "change", &tree, &parents)
+                .unwrap()
+        };
+        let ok = std::path::Path::new("ok.txt");
+        let latin1 = std::path::Path::new("latin1.txt");
+        let first = commit(&[(ok, &b"plain\n"[..])], None);
+        #[cfg(unix)]
+        let odd_name = {
+            use std::os::unix::ffi::OsStrExt;
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"na\xefve.txt"))
+        };
+        let mut files: Vec<(&std::path::Path, &[u8])> = vec![
+            (ok, &b"plain\ncaf\xe9\n"[..]),
+            (latin1, &b"\xe0 bient\xf4t\n"[..]),
+        ];
+        #[cfg(unix)]
+        files.push((odd_name.as_path(), &b"text\n"[..]));
+        let second = commit(&files, Some(first));
+        (dir, second)
+    }
+
+    #[test]
+    fn utf8_diff_makes_a_non_utf8_commit_serializable() {
+        let (dir, oid) = non_utf8_repo("libradicle-utf8-diff");
+        let surf = radicle_surf::Repository::open(&dir).expect("open");
+        let raw = surf
+            .diff_commit(radicle_surf::Oid::from(oid))
+            .expect("diff");
+
+        // radicle-surf's own serializer refuses the raw diff: the bindings'
+        // `json!` unwrapped exactly this error.
+        assert!(serde_json::to_string(&raw).is_err());
+
+        let diff = super::utf8_diff(raw.clone());
+        let json = serde_json::to_value(&diff).expect("the converted diff serializes");
+        let text = json.to_string();
+        assert!(text.contains("caf\u{FFFD}"), "{text}");
+        assert!(text.contains("\u{FFFD} bient\u{FFFD}t"), "{text}");
+        assert!(text.contains("plain"), "{text}");
+        #[cfg(unix)]
+        assert!(text.contains("na\u{FFFD}ve.txt"), "{text}");
+
+        // Same files, same stats, same shape.
+        assert_eq!(diff.stats(), raw.stats());
+        assert_eq!(diff.files().count(), raw.files().count());
+        let files = json["files"].as_array().unwrap();
+        assert!(files.iter().all(|f| f["diff"]["type"] == "plain"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utf8_diff_leaves_a_utf8_diff_unchanged() {
+        let (dir, oid) = non_utf8_repo("libradicle-utf8-diff-same");
+        let surf = radicle_surf::Repository::open(&dir).expect("open");
+        let first = surf
+            .commit(radicle_surf::Oid::from(oid))
+            .expect("commit")
+            .parents[0];
+        let raw = surf.diff_commit(first).expect("diff");
+        assert_eq!(super::utf8_diff(raw.clone()), raw);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `json::commit` returns radicle-surf's error for a diff it can't
+    /// serialize, where the `json!` it replaced unwrapped it and panicked;
+    /// and writes what that `json!` did, byte for byte, for one it can.
+    #[test]
+    fn commit_json_is_fallible_and_unchanged() {
+        let (dir, oid) = non_utf8_repo("libradicle-utf8-commit-json");
+        let surf = radicle_surf::Repository::open(&dir).expect("open");
+        let commit = surf.commit(radicle_surf::Oid::from(oid)).expect("commit");
+        let raw = surf.diff_commit(commit.id).expect("diff");
+        let decoded = super::utf8_diff(raw.clone());
+
+        let refused = super::CommitDetail {
+            commit: commit.clone(),
+            diff: raw,
+        };
+        assert!(super::json::commit(&mut Vec::new(), &refused).is_err());
+        let failed = super::json::to_string(|w| super::json::commit(w, &refused));
+        assert!(failed.starts_with(r#"{"error":"#), "{failed}");
+
+        let first = surf.commit(commit.parents[0]).expect("first commit");
+        let first_diff = surf.diff_commit(first.id).expect("first diff");
+        for detail in [
+            super::CommitDetail {
+                commit,
+                diff: decoded,
+            },
+            super::CommitDetail {
+                commit: first,
+                diff: first_diff,
+            },
+        ] {
+            let before = serde_json::json!({
+                "commit": detail.commit,
+                "diff": detail.diff,
+            })
+            .to_string();
+            assert_eq!(
+                super::json::to_string(|w| super::json::commit(w, &detail)),
+                before
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The bounded diff's line count is a floor of radicle-surf's JSON: no
     /// line's JSON is shorter than `LINE_JSON`, an empty addition's.

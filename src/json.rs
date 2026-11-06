@@ -401,15 +401,26 @@ pub fn commits(w: &mut impl io::Write, commits: &[radicle_surf::Commit]) -> Writ
     serde_json::to_writer(w, commits)
 }
 
+struct CommitJson<'a>(&'a CommitDetail);
+
+impl Serialize for CommitJson<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        object!(s, {
+            "commit": self.0.commit,
+            "diff": self.0.diff,
+        })
+    }
+}
+
 /// A commit's metadata and its diff against its first parent.
+///
+/// Written as it is serialized, with no `Value` built first. A diff
+/// radicle-surf can't serialize (a line or a path that isn't UTF-8, which
+/// [`Embedded::commit`](crate::Embedded::commit) decodes before it gets
+/// here) is an error: the `json!` this replaced unwrapped it, and the panic
+/// aborted the host process (R-19).
 pub fn commit(w: &mut impl io::Write, detail: &CommitDetail) -> Written {
-    put(
-        w,
-        &json!({
-            "commit": detail.commit,
-            "diff": detail.diff,
-        }),
-    )
+    serde_json::to_writer(w, &CommitJson(detail))
 }
 
 /// File paths, as an array.
