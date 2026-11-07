@@ -115,6 +115,10 @@ radicle-signals = { path = "../heartwood/crates/radicle-signals" }
 - `import_repo` is desktop-only: heartwood currently invokes the system
   `git` executable to push a working copy into storage. Omit this method from
   iOS bindings until that push is implemented in-process.
+- `import::Import` imports a working copy into storage with no node running:
+  a libgit2 fetch in this process, into a temporary clone moved into place
+  last, the working copy read and never written. freedom-radicled's one-shot
+  import process runs it.
 
 ## License
 
