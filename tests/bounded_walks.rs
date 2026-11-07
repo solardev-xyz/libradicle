@@ -574,9 +574,15 @@ use radicle::storage::ReadStorage as _;
 /// aborts the process, which no `catch_unwind` turns into an error) fails
 /// the test with how it died, instead of taking the test run down.
 fn in_child(name: &str) -> String {
+    in_child_with(name, &[])
+}
+
+/// [`in_child`], with `envs` set in the child too.
+fn in_child_with(name: &str, envs: &[(&str, &std::ffi::OsStr)]) -> String {
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args([name, "--exact", "--nocapture", "--test-threads=1"])
         .env("LIBRADICLE_CHILD", name)
+        .envs(envs.iter().copied())
         .output()
         .unwrap();
     assert!(
@@ -678,25 +684,28 @@ fn a_deep_tree_is_refused_never_overflowed() {
     );
 }
 
-/// The trees a bounded walk loads count against its loads budget: the
-/// listing fits at exactly what it loads, and not one byte less.
+/// The trees a bounded walk loads count against its loads budget, each at
+/// what libgit2 holds of it once parsed, as the commit does (review of
+/// freedom-core #277, round 2): the listing fits at exactly what it loads,
+/// and not one byte less.
 #[test]
 fn a_tree_walk_counts_what_it_loads() {
     let f = fixture("radloads");
     let stored = storage(&f).repository(f.rid).unwrap();
     let git = &stored.backend;
     let odb = git.odb().unwrap();
+    let size = |oid: git2::Oid| odb.read_header(oid).unwrap().0 as u64;
     let head = git
         .find_reference("refs/heads/main")
         .unwrap()
         .peel_to_commit()
         .unwrap();
-    let mut loads = odb.read_header(head.id()).unwrap().0 as u64;
+    let mut loads = libradicle::commit_held(size(head.id()));
     let root = head.tree().unwrap();
-    loads += odb.read_header(root.id()).unwrap().0 as u64;
+    loads += libradicle::tree_held(size(root.id()));
     for entry in root.iter() {
         if entry.kind() == Some(git2::ObjectType::Tree) {
-            loads += odb.read_header(entry.id()).unwrap().0 as u64;
+            loads += libradicle::tree_held(size(entry.id()));
         }
     }
     let at = |loads: u64| budget(1 << 20).with_loads(loads);
@@ -708,6 +717,148 @@ fn a_tree_walk_counts_what_it_loads() {
         f.node.list_files_bounded(f.rid, &at(loads - 1)),
         Err(Error::TooLarge { .. })
     ));
+}
+
+/// libgit2's array of `item`-byte items, as `git_array_alloc` grows it from
+/// `first`: to eight while it holds fewer, then by half once full. Its
+/// bytes once it holds `items`, and the most it holds at once on the way:
+/// the array it leaves and the one it moves to, while it grows.
+fn libgit2_array(first: u64, item: u64, items: u64) -> (u64, u64) {
+    let (mut before, mut capacity) = (0, first);
+    let mut size = 0;
+    while size < items {
+        if size == capacity {
+            before = capacity;
+            capacity = if size < 8 { 8 } else { capacity * 3 / 2 };
+        }
+        size += 1;
+    }
+    (item * capacity, item * (before + capacity))
+}
+
+/// Review of freedom-core #277, round 2: what libgit2 holds of a parsed
+/// tree and commit.
+/// - **A tree of 100,000 of the shortest entries libgit2 parses**, 24 bytes
+///   each (a mode of one digit, a name of one byte, its NUL and an ID): it
+///   keeps the tree's bytes, in a buffer one byte longer, and a 32-byte
+///   entry for each, in an array that starts at 16 and grows by half. Its
+///   charge, from its header's size, is at least that, the two arrays held
+///   while the last growth copies included, for the entries libgit2 itself
+///   counts, and within its structs' 256 bytes of it: the shortest entries
+///   are the bound's own case.
+/// - **A commit of 20,000 `parent` lines and a 1 MiB message:** libgit2
+///   holds its bytes while it parses them, a copy of its header and one of
+///   its message, its parents' IDs (20 bytes each, in an array that grows
+///   by half from one, then eight) and its signatures' names and emails.
+///   Its charge is at least that.
+/// - On Linux, each parse, the first thing a child of its own loads, grows
+///   that process's peak by less than its charge, and by more than the
+///   object's bytes, so the measure saw it.
+#[test]
+fn trees_and_commits_are_charged_what_libgit2_holds_of_them() {
+    const NAME: &str = "trees_and_commits_are_charged_what_libgit2_holds_of_them";
+    const ENTRIES: u64 = 100_000;
+    const PARENTS: u64 = 20_000;
+    const MESSAGE: usize = 1 << 20;
+    if is_child(NAME) {
+        // The object named, loaded first, in a process that has loaded
+        // nothing else.
+        let git =
+            git2::Repository::open_bare(std::env::var("LIBRADICLE_PARSED_REPO").unwrap()).unwrap();
+        let oid = git2::Oid::from_str(&std::env::var("LIBRADICLE_PARSED_OBJECT").unwrap()).unwrap();
+        let grew = match git.odb().unwrap().read_header(oid).unwrap().1 {
+            git2::ObjectType::Tree => peak_growth(|| drop(git.find_tree(oid).unwrap())),
+            _ => peak_growth(|| drop(git.find_commit(oid).unwrap())),
+        };
+        match grew {
+            Some(grew) => println!("\ngrew: {grew}"),
+            None => println!("\ngrew: unmeasured"),
+        }
+        return;
+    }
+    let dir = scratch("radparsed");
+    let git = git2::Repository::init_bare(&dir).unwrap();
+    let odb = git.odb().unwrap();
+    let mut bytes = Vec::new();
+    for _ in 0..ENTRIES {
+        bytes.extend_from_slice(b"0 a\0");
+        bytes.extend_from_slice(&[7; 20]);
+    }
+    let tree = odb.write(git2::ObjectType::Tree, &bytes).unwrap();
+    let tree_size = bytes.len() as u64;
+    assert_eq!(tree_size, 24 * ENTRIES);
+    let mut text = format!("tree {tree}\n");
+    for _ in 0..PARENTS {
+        text.push_str(&format!("parent {}\n", "7".repeat(40)));
+    }
+    text.push_str("author A <a@example.com> 0 +0000\n");
+    text.push_str("committer C <c@example.com> 0 +0000\n");
+    let header = text.len() as u64;
+    text.push('\n');
+    text.push_str(&"m".repeat(MESSAGE));
+    let commit = odb
+        .write(git2::ObjectType::Commit, text.as_bytes())
+        .unwrap();
+    let commit_size = text.len() as u64;
+
+    // The tree, as libgit2 counts its entries.
+    let entries = git.find_tree(tree).unwrap().len() as u64;
+    assert_eq!(entries, ENTRIES);
+    let (_, entries_peak) = libgit2_array(16, 32, entries);
+    let parsed = tree_size + 1 + entries_peak;
+    let tree_charged = libradicle::tree_held(tree_size);
+    assert!(tree_charged >= parsed, "{tree_charged} < {parsed}");
+    assert!(
+        tree_charged <= parsed + 256,
+        "{tree_charged} is loose for {parsed}"
+    );
+
+    // The commit: its bytes, its header's copy and its message's, each with
+    // a NUL, its parents' array at its peak, and two names and two emails.
+    let parsed_commit = git.find_commit(commit).unwrap();
+    assert_eq!(parsed_commit.parent_count() as u64, PARENTS);
+    assert_eq!(parsed_commit.message_bytes().len(), MESSAGE);
+    drop(parsed_commit);
+    let (_, parents_peak) = libgit2_array(1, 20, PARENTS);
+    let signatures = ["A", "a@example.com", "C", "c@example.com"]
+        .iter()
+        .map(|s| s.len() as u64 + 1)
+        .sum::<u64>();
+    let parsed =
+        (commit_size + 1) + (header + 1) + (commit_size - header) + parents_peak + signatures;
+    let commit_charged = libradicle::commit_held(commit_size);
+    assert!(commit_charged >= parsed, "{commit_charged} < {parsed}");
+
+    // As measured, where it can be.
+    for (what, oid, size, charged) in [
+        ("tree", tree, tree_size, tree_charged),
+        ("commit", commit, commit_size, commit_charged),
+    ] {
+        let oid = oid.to_string();
+        let out = in_child_with(
+            NAME,
+            &[
+                ("LIBRADICLE_PARSED_REPO", dir.as_os_str()),
+                ("LIBRADICLE_PARSED_OBJECT", std::ffi::OsStr::new(&oid)),
+            ],
+        );
+        let grew = out
+            .lines()
+            .find_map(|l| l.strip_prefix("grew: "))
+            .unwrap_or_else(|| panic!("{what}: no measure in {out}"));
+        if let Ok(grew) = grew.parse::<u64>() {
+            assert!(
+                grew < charged,
+                "{what}: the parse grew the peak by {grew}, over {charged}"
+            );
+            assert!(
+                grew > size,
+                "{what}: the measure missed the parse: {grew} of {size}"
+            );
+        }
+        println!("{what}: charged {charged} for {size} bytes, measured {grew}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// LR15-M2: the reads that were unbounded now stop at their budget, and a
@@ -885,6 +1036,7 @@ fn skipped_commits_count_against_the_loads_budget() {
         .commits
         .iter()
         .map(|c| odb.read_header(git2::Oid::from_str(c).unwrap()).unwrap().0 as u64)
+        .map(libradicle::commit_held)
         .sum();
     let head = f.commits[2].as_str();
     let at = |loads: u64| budget(1 << 20).with_loads(loads);
@@ -1292,7 +1444,9 @@ fn repo_stats_count_all_of_history_against_the_loads_budget() {
         Err(e @ Error::TooLarge { .. }) => println!("binding: {e:?}"),
         other => println!("binding: unexpected {other:?}"),
     }
-    let larger = budget(1 << 20).with_loads(64 * MIB);
+    // Each commit of about 1.2 KB is charged about 3.7 KB, what libgit2
+    // holds of it parsed (review of freedom-core #277, round 2).
+    let larger = budget(1 << 20).with_loads(128 * MIB);
     match f.node.repo_stats_bounded(f.rid, &tip, &larger) {
         Ok(stats) => println!("larger: {} commits", stats.commits),
         other => println!("larger: unexpected {other:?}"),

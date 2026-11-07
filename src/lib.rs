@@ -48,6 +48,7 @@ mod seams;
 mod seeds;
 
 use meter::Meter;
+pub use objects::{commit_held, raw_held, tree_held};
 use objects::{Objects, Walk};
 
 /// Options for starting an embedded Radicle stack.
@@ -451,7 +452,9 @@ impl CancelToken {
 /// a result it returns never writes more JSON than its budget. It reads each
 /// object's size from its header before loading it, and stops with
 /// [`Error::TooLarge`] before loading one that `loads` has no room left for,
-/// counting every object it has loaded so far, skipped ones included.
+/// counting every object it has loaded so far, skipped ones included. A
+/// tree or commit counts what libgit2 holds of it once parsed, from its
+/// header size ([`tree_held`], [`commit_held`]): several times its size.
 #[derive(Debug, Clone)]
 pub struct Bounds {
     pub cancel: CancelToken,
@@ -2484,8 +2487,25 @@ impl Embedded {
         revision: &str,
         path: &str,
     ) -> Result<BlobHeader, Error> {
+        self.blob_header_bounded(rid, revision, path, &Bounds::unbounded())
+    }
+
+    /// [`Embedded::blob_header`], within `bounds`' loads and token: the
+    /// commit and every tree on the way to the file are sized from their
+    /// headers before they are loaded, each at most `bounds.loads`, and
+    /// what libgit2 holds of each once parsed ([`commit_held`],
+    /// [`tree_held`]) is charged, all of them within `bounds.loads`. The
+    /// walk stops with [`Error::Cancelled`] once the token is cancelled.
+    /// `bounds.budget` isn't used: the result is no JSON.
+    pub fn blob_header_bounded(
+        &self,
+        rid: RepoId,
+        revision: &str,
+        path: &str,
+        bounds: &Bounds,
+    ) -> Result<BlobHeader, Error> {
         let repo = self.profile.storage.repository(rid)?;
-        let (oid, size) = Self::blob_header_in(&repo, revision, path, u64::MAX)?;
+        let (oid, size) = Self::blob_header_in(&repo, revision, path, bounds)?;
         Ok(BlobHeader {
             oid: oid.to_string(),
             size,
@@ -2494,17 +2514,18 @@ impl Embedded {
 
     /// The id and size of the blob at `path` in `revision`. The commit and
     /// every tree on the way are sized from their headers first, each
-    /// within `loads` (review of libradicle #15), and the blob's own size
-    /// is read from its header.
+    /// within `bounds.loads` (review of libradicle #15), and charged, all of
+    /// them within it too (review of freedom-core #277, round 2); the
+    /// blob's own size is read from its header.
     fn blob_header_in(
         repo: &radicle::storage::git::Repository,
         revision: &str,
         path: &str,
-        loads: u64,
+        bounds: &Bounds,
     ) -> Result<(git2::Oid, u64), Error> {
-        let objects = Objects::new(&repo.backend, loads)?;
-        let unbounded = Bounds::unbounded();
-        let mut read = Meter::new(&unbounded);
+        let objects = Objects::new(&repo.backend, bounds.loads)?;
+        let loading = bounds.loading();
+        let mut read = Meter::new(&loading);
         let commit = objects.commit(parse_revision(revision)?, &mut read)?;
         let root = objects.tree(commit.tree_id(), &mut read)?;
         let trimmed = path.trim_end_matches('/');
@@ -2541,7 +2562,9 @@ impl Embedded {
     /// size is read from the object's header first, so a larger file is
     /// refused with [`Error::TooLarge`] before any of it is loaded. The
     /// commit and the trees on the way to it are sized from their headers
-    /// too, each at most the larger of `limit` and [`BINDING_READ_BUDGET`].
+    /// too, each at most the larger of `limit` and [`BINDING_READ_BUDGET`],
+    /// and what libgit2 holds of them is charged, all of them within it
+    /// ([`Embedded::read_blob_at_bounded`]).
     pub fn read_blob_at_capped(
         &self,
         rid: RepoId,
@@ -2549,13 +2572,32 @@ impl Embedded {
         path: &str,
         limit: u64,
     ) -> Result<Blob, Error> {
-        let repo = self.profile.storage.repository(rid)?;
-        // The commit and the trees on the way: at most the larger of the
-        // blob's cap and a binding's loads budget, each.
+        // The commit and the trees on the way: within the larger of the
+        // blob's cap and a binding's loads budget, each and in all.
         let loads = limit.max(BINDING_READ_BUDGET);
-        let (oid, size) = Self::blob_header_in(&repo, revision, path, loads)?;
+        let bounds = Bounds::unbounded().with_loads(loads);
+        self.read_blob_at_bounded(rid, revision, path, limit, &bounds)
+    }
+
+    /// [`Embedded::read_blob_at`], for a file of at most `limit` bytes, as
+    /// [`Embedded::read_blob_at_capped`], with the walk to it within
+    /// `bounds`' loads and token, as [`Embedded::blob_header_bounded`]'s:
+    /// it holds nothing of that walk once the file loads.
+    pub fn read_blob_at_bounded(
+        &self,
+        rid: RepoId,
+        revision: &str,
+        path: &str,
+        limit: u64,
+        bounds: &Bounds,
+    ) -> Result<Blob, Error> {
+        let repo = self.profile.storage.repository(rid)?;
+        let (oid, size) = Self::blob_header_in(&repo, revision, path, bounds)?;
         if size > limit {
             return Err(Error::TooLarge { size, limit });
+        }
+        if bounds.cancel.is_cancelled() {
+            return Err(Error::Cancelled);
         }
         let blob = repo.backend.find_blob(oid)?;
         let content = blob.content();
