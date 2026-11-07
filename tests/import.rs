@@ -363,10 +363,8 @@ fn a_run_cut_off_before_its_end_leaves_only_a_temporary_clone() {
         let entries = storage_entries(&home);
         assert_eq!(entries.len(), 1, "{at:?}: {entries:?}");
         let name = &entries[0];
-        assert!(
-            name.starts_with(&format!("{}.", rid.canonical())) && name.ends_with(".tmp"),
-            "{at:?}: {name}"
-        );
+        // As heartwood names a clone's: what reconciliation removes.
+        assert_eq!(name, &format!("{}.tmp", rid.canonical()), "{at:?}");
         assert!(!home.join("storage").join(rid.canonical()).exists());
     }
 }

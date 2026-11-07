@@ -18,7 +18,7 @@
 //!    alone decides, isn't already in storage ([`Error::Exists`]). It reads
 //!    the home's `config.json` for the alias the storage names.
 //! 2. **[`Import::run`] makes the repository** in a temporary directory of
-//!    the storage, as a clone does (`<rid>.<random>.tmp`), so that a kill
+//!    the storage, as a clone does (`<rid>.tmp`), so that a kill
 //!    or a crash leaves only a temporary clone, which reconciliation
 //!    removes at the next start:
 //!    - the identity document and its first commit, signed by `key`;
