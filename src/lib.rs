@@ -2581,8 +2581,14 @@ impl Embedded {
 
     /// [`Embedded::read_blob_at`], for a file of at most `limit` bytes, as
     /// [`Embedded::read_blob_at_capped`], with the walk to it within
-    /// `bounds`' loads and token, as [`Embedded::blob_header_bounded`]'s:
-    /// it holds nothing of that walk once the file loads.
+    /// `bounds`' loads and token, as [`Embedded::blob_header_bounded`]'s.
+    /// The walk's own handles to the commit and the trees are dropped
+    /// before the file loads. With libgit2's object cache off, that is all
+    /// of the walk, and nothing of it is held while the file loads. With
+    /// the cache on (libgit2's default), the repository's cache keeps the
+    /// commits and trees under 4 KiB it parsed, so up to the walk's charge
+    /// can stay held beside the file until the repository handle closes,
+    /// when this returns.
     pub fn read_blob_at_bounded(
         &self,
         rid: RepoId,
