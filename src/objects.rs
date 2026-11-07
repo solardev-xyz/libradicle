@@ -4,15 +4,113 @@
 //!
 //! [`Objects`] reads an object's size and type from its header (libgit2's
 //! `git_odb_read_header`, which for a packed delta resolves only the
-//! header), refuses one over its limit with [`Error::TooLarge`], charges it
-//! to a [`Meter`] of what the read has loaded so far, and only then loads
-//! it. [`Walk`] is commit history on top of it.
+//! header), refuses one over its limit with [`Error::TooLarge`], charges
+//! what libgit2 will hold of it once loaded ([`tree_held`],
+//! [`commit_held`], [`raw_held`]) to a [`Meter`] of what the read has loaded
+//! so far, and only then loads it. [`Walk`] is commit history on top of it.
+//!
+//! **What libgit2 holds** (1.9.6, as libgit2-sys 0.18.7 vendors it, built
+//! for SHA-1 object IDs as heartwood builds it): a loaded object's bytes, in
+//! a buffer one byte longer, and, once a tree or commit is parsed, what the
+//! parse allocates from them. Each figure below is an upper bound, from the
+//! object's header size alone, of the bytes libgit2 asks its allocator for
+//! while it loads and parses the object and while the object lives: its
+//! structs included, the allocator's own rounding not, as for every figure
+//! of a budget. A tree's or commit's charge is several times its size, so
+//! a meter counts what is really held (review of freedom-core #277, round
+//! 2).
+//!
+//! An object the repository's object cache keeps is held past its walk:
+//! the host that bounds memory turns libgit2's cache off (freedom-radicled
+//! does, at its start). With the cache on, what a bounded read loads is
+//! still charged once, but the cache may keep it, and what it parsed, for
+//! as long as the read's repository is open.
 
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 
 use crate::meter::Meter;
 use crate::Error;
+
+/// What libgit2 allocates beside an object's bytes, at most: the object's
+/// struct (`git_tree`, `git_blob`, `git_commit`'s first part), the object
+/// database's (`git_odb_object`), and their allocations' headers.
+const OBJECT_FIXED: u64 = 256;
+
+/// The shortest entry libgit2 parses in a tree of SHA-1 IDs: a mode of one
+/// octal digit, its space, a name of one byte, its NUL and the 20-byte ID.
+/// libgit2 checks neither the mode nor the names' order, so a tree of
+/// `size` bytes has at most `size / 24` entries.
+const TREE_ENTRY_SHORTEST: u64 = 24;
+
+/// A parsed tree entry, `git_tree_entry`: its mode and name length, its ID
+/// and a pointer to its name in the tree's bytes.
+const TREE_ENTRY_PARSED: u64 = 32;
+
+// A parsed entry's ID is the 20 bytes of a SHA-1 `git_oid`: a libgit2 built
+// for SHA-256 IDs makes it larger, and every tree's figure wrong.
+const _: () = assert!(std::mem::size_of::<git2::Oid>() == 20);
+
+/// The entries libgit2's tree parse allocates for first.
+const TREE_ENTRIES_FIRST: u64 = 16;
+
+/// A commit's header line naming a parent, `parent <40 hex>\n`.
+const PARENT_LINE: u64 = 48;
+
+/// What a commit's parse allocates beside what grows with its bytes, at
+/// most: the rest of `git_commit` (its parents' array, tree ID and string
+/// pointers), its two signatures, its parents' first arrays (one ID, then
+/// eight, both held while the array grows), and their allocations' headers.
+const COMMIT_FIXED: u64 = 512;
+
+/// What libgit2 holds of an object of `size` bytes it loads unparsed (a
+/// blob, or an object database read): its bytes, in a buffer one byte
+/// longer for a NUL, and its structs.
+pub const fn raw_held(size: u64) -> u64 {
+    size.saturating_add(1 + OBJECT_FIXED)
+}
+
+/// What libgit2 holds of a tree of `size` bytes, by its header, once it is
+/// loaded and parsed, at most: the tree's bytes, which the parsed tree
+/// keeps ([`raw_held`]), and its array of parsed entries, 32 bytes each
+/// (`git_tree_entry`). A tree of the shortest entries, 24 bytes each, has
+/// the most of them. The array starts at 16 entries and grows by half each
+/// time it is full (libgit2's `git_array_alloc`): while it grows, the
+/// array it leaves and the one it moves to are both held. So this is the
+/// tree's bytes, and both of those arrays for the most entries the tree can
+/// have: at most about 4.4 times its size.
+pub const fn tree_held(size: u64) -> u64 {
+    let entries = size / TREE_ENTRY_SHORTEST;
+    let (mut before, mut capacity) = (0u64, TREE_ENTRIES_FIRST);
+    while capacity < entries {
+        before = capacity;
+        capacity = capacity.saturating_mul(3) / 2;
+    }
+    raw_held(size).saturating_add(TREE_ENTRY_PARSED.saturating_mul(before + capacity))
+}
+
+/// What libgit2 holds of a commit of `size` bytes, by its header, while it
+/// is loaded and parsed, at most (its parse keeps no buffer of the object
+/// once done, so this is its peak):
+/// - its bytes ([`raw_held`]), until the parse is done;
+/// - its copies of the header and of the message, each with a NUL: at most
+///   `size + 2` together;
+/// - what it parses out of the header, each from bytes of its own: the
+///   author's and committer's names and emails (and one more author's, as
+///   it skips another), each at most its line; each encoding, at most its
+///   line; its parents' IDs, 20 bytes for each 48-byte `parent` line, and
+///   at most 50 while their array grows by half. At most `size` and 2 bytes
+///   more for each `parent` line;
+/// - [`COMMIT_FIXED`].
+///
+/// About 3 times its size.
+pub const fn commit_held(size: u64) -> u64 {
+    let parents = size / PARENT_LINE;
+    raw_held(size)
+        .saturating_add(size.saturating_add(2))
+        .saturating_add(size.saturating_add(2 * parents))
+        .saturating_add(COMMIT_FIXED)
+}
 
 /// A repository's objects, each loaded after its header is read.
 pub(crate) struct Objects<'r> {
@@ -32,11 +130,13 @@ impl<'r> Objects<'r> {
     }
 
     /// The size of `oid`, from its header, when it is of `kind` and within
-    /// the limit; charged to `read`.
+    /// the limit; what libgit2 will hold of it, `held` of its size, charged
+    /// to `read`.
     fn admit(
         &self,
         oid: git2::Oid,
         kind: git2::ObjectType,
+        held: fn(u64) -> u64,
         read: &mut Meter,
     ) -> Result<u64, Error> {
         read.check()?;
@@ -55,15 +155,15 @@ impl<'r> Objects<'r> {
                 limit: self.limit,
             });
         }
-        read.charge(size)?;
+        read.charge(held(size))?;
         Ok(size)
     }
 
-    /// The size of the blob `oid`, from its header, checked and charged:
-    /// for a blob something else loads (heartwood's readers). Nothing of
-    /// it is loaded here.
+    /// The size of the blob `oid`, from its header, checked and charged its
+    /// size: for a blob something else loads (heartwood's readers). Nothing
+    /// of it is loaded here.
     pub(crate) fn blob(&self, oid: git2::Oid, read: &mut Meter) -> Result<u64, Error> {
-        self.admit(oid, git2::ObjectType::Blob, read)
+        self.admit(oid, git2::ObjectType::Blob, |size| size, read)
     }
 
     /// The object `oid`, of any kind, sized from its header, checked and
@@ -90,19 +190,21 @@ impl<'r> Objects<'r> {
         Ok(Some(kind))
     }
 
-    /// The commit `oid`, its size checked and charged before it is loaded.
+    /// The commit `oid`, its size checked and what libgit2 holds of it
+    /// ([`commit_held`]) charged before it is loaded.
     pub(crate) fn commit(
         &self,
         oid: git2::Oid,
         read: &mut Meter,
     ) -> Result<git2::Commit<'r>, Error> {
-        self.admit(oid, git2::ObjectType::Commit, read)?;
+        self.admit(oid, git2::ObjectType::Commit, commit_held, read)?;
         Ok(self.repo.find_commit(oid)?)
     }
 
-    /// The tree `oid`, its size checked and charged before it is loaded.
+    /// The tree `oid`, its size checked and what libgit2 holds of it
+    /// ([`tree_held`]) charged before it is loaded.
     pub(crate) fn tree(&self, oid: git2::Oid, read: &mut Meter) -> Result<git2::Tree<'r>, Error> {
-        self.admit(oid, git2::ObjectType::Tree, read)?;
+        self.admit(oid, git2::ObjectType::Tree, tree_held, read)?;
         Ok(self.repo.find_tree(oid)?)
     }
 
@@ -261,10 +363,14 @@ impl<'a, 'r, 'b> Metered<'a, 'r, 'b> {
         self.refused.borrow_mut().take()
     }
 
-    /// The object `oid`, its kind, once its size is admitted and charged;
-    /// `None` when it isn't there. A refusal is kept for
-    /// [`Metered::refused`].
-    fn admit(&self, oid: git2::Oid) -> Result<Option<git2::ObjectType>, Admit> {
+    /// The object `oid`, its kind, once its size is admitted and what the
+    /// reader will hold of it, `held` of its size, charged; `None` when it
+    /// isn't there. A refusal is kept for [`Metered::refused`].
+    fn admit(
+        &self,
+        oid: git2::Oid,
+        held: fn(u64) -> u64,
+    ) -> Result<Option<git2::ObjectType>, Admit> {
         let (size, kind) = match self.objects.odb.read_header(oid) {
             Ok((size, kind)) => (size as u64, kind),
             Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
@@ -278,7 +384,7 @@ impl<'a, 'r, 'b> Metered<'a, 'r, 'b> {
                     limit: self.objects.limit,
                 });
             }
-            read.charge(size)
+            read.charge(held(size))
         });
         match admitted {
             Ok(()) => Ok(Some(kind)),
@@ -322,7 +428,13 @@ mod sigrefs_reader {
     use radicle::storage::refs::sigrefs::git::object::{Blob, Reader};
     use radicle::storage::refs::sigrefs::git::reference;
 
-    use super::Metered;
+    use super::{commit_held, raw_held, tree_held, Metered};
+
+    /// What reading an object unparsed and copying its bytes holds while it
+    /// copies them: libgit2's buffer ([`raw_held`]) and the copy.
+    fn copied(size: u64) -> u64 {
+        raw_held(size).saturating_add(size)
+    }
 
     impl radicle::storage::HasRepoId for Metered<'_, '_, '_> {
         fn rid(&self) -> radicle::identity::RepoId {
@@ -340,10 +452,11 @@ mod sigrefs_reader {
     }
 
     impl Reader for Metered<'_, '_, '_> {
-        // As heartwood's git2 reader: the commit's raw bytes.
+        // As heartwood's git2 reader: the commit's raw bytes, read from the
+        // object database and copied, both held as it copies them.
         fn read_commit(&self, oid: &Oid) -> Result<Option<Vec<u8>>, ReadCommit> {
             let id = git2::Oid::from(*oid);
-            match self.admit(id) {
+            match self.admit(id, copied) {
                 Ok(None) => Ok(None),
                 Ok(Some(git2::ObjectType::Commit)) => {
                     let object = self.objects.odb.read(id).map_err(ReadCommit::other)?;
@@ -359,7 +472,7 @@ mod sigrefs_reader {
         fn read_blob(&self, commit: &Oid, path: &Path) -> Result<Option<Blob>, ReadBlob> {
             let repo = self.objects.repo;
             let id = git2::Oid::from(*commit);
-            match self.admit(id) {
+            match self.admit(id, commit_held) {
                 Ok(Some(git2::ObjectType::Commit)) => {}
                 Ok(_) => return Err(ReadBlob::commit_not_found_error(*commit)),
                 Err(e) => return Err(e.blob()),
@@ -369,7 +482,7 @@ mod sigrefs_reader {
             drop(commit_object);
             let mut components = path.iter().peekable();
             while let Some(component) = components.next() {
-                match self.admit(tree_id) {
+                match self.admit(tree_id, tree_held) {
                     Ok(Some(git2::ObjectType::Tree)) => {}
                     Ok(_) => return Ok(None),
                     Err(e) => return Err(e.blob()),
@@ -390,7 +503,7 @@ mod sigrefs_reader {
                     tree_id = entry_id;
                     continue;
                 }
-                return match self.admit(entry_id) {
+                return match self.admit(entry_id, copied) {
                     Ok(Some(git2::ObjectType::Blob)) => {
                         let blob = repo.find_blob(entry_id).map_err(ReadBlob::other)?;
                         Ok(Some(Blob {

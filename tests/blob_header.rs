@@ -1,12 +1,14 @@
 //! `Embedded::blob_header` and `Embedded::read_blob_at_capped`: a file's
 //! size comes from its object header, so a read can refuse a file that is
-//! too large before loading any of it.
+//! too large before loading any of it. Their bounded forms,
+//! `blob_header_bounded` and `read_blob_at_bounded`, charge the walk to the
+//! file what libgit2 holds of it.
 
 mod common;
 
 use std::path::{Path, PathBuf};
 
-use libradicle::{BlobHeader, Embedded, Error, HostKey, Options};
+use libradicle::{BlobHeader, Bounds, CancelToken, Embedded, Error, HostKey, Options};
 
 const SMALL: &[u8] = b"hello\n";
 const BIG: usize = 1000;
@@ -206,6 +208,138 @@ fn a_file_over_the_cap_is_refused_before_it_is_loaded() {
         .node
         .read_blob_at_capped(f.rid, &f.revision, "big.txt", BIG as u64);
     assert!(loaded.is_err(), "the damaged object loaded: {loaded:?}");
+}
+
+/// Review of freedom-core #277, round 2: the walk to a file charges what
+/// libgit2 holds of the commit and of each tree on the way once parsed,
+/// all of them within the loads. At exactly that the header and the read
+/// are served; a byte short of it, each is `TooLarge`, asking for at least
+/// that; with its token cancelled, `Cancelled`.
+#[test]
+fn the_walk_to_a_file_is_charged_what_libgit2_holds() {
+    let f = fixture("radblobwalk");
+    let repo = stored(&f.dir.join("home/storage"), &f.revision);
+    let odb = repo.odb().unwrap();
+    let size = |oid: git2::Oid| odb.read_header(oid).unwrap().0 as u64;
+    let commit = repo
+        .find_commit(git2::Oid::from_str(&f.revision).unwrap())
+        .unwrap();
+    let root = commit.tree().unwrap();
+    let dir = root.get_name("dir").unwrap().id();
+    let walk = libradicle::commit_held(size(commit.id()))
+        + libradicle::tree_held(size(root.id()))
+        + libradicle::tree_held(size(dir));
+    assert!(walk > 3 * (size(commit.id()) + size(root.id()) + size(dir)));
+
+    let at = |loads: u64| Bounds::unbounded().with_loads(loads);
+    let header = f
+        .node
+        .blob_header_bounded(f.rid, &f.revision, "dir/inner.txt", &at(walk))
+        .expect("at exactly the walk's charge");
+    assert_eq!(header.size, 6);
+    let blob = f
+        .node
+        .read_blob_at_bounded(f.rid, &f.revision, "dir/inner.txt", 6, &at(walk))
+        .expect("read at exactly the walk's charge");
+    assert_eq!(blob.content, b"inner\n");
+    let short = [
+        f.node
+            .blob_header_bounded(f.rid, &f.revision, "dir/inner.txt", &at(walk - 1))
+            .map(|_| ()),
+        f.node
+            .read_blob_at_bounded(f.rid, &f.revision, "dir/inner.txt", 6, &at(walk - 1))
+            .map(|_| ()),
+    ];
+    for result in short {
+        match result {
+            Err(Error::TooLarge { size, limit }) => {
+                assert_eq!(limit, walk - 1);
+                assert!(size >= walk, "{size} < {walk}");
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+    let token = CancelToken::new();
+    token.cancel();
+    let cancelled = Bounds::new(token, u64::MAX);
+    assert!(matches!(
+        f.node
+            .blob_header_bounded(f.rid, &f.revision, "dir/inner.txt", &cancelled),
+        Err(Error::Cancelled)
+    ));
+    assert!(matches!(
+        f.node
+            .read_blob_at_bounded(f.rid, &f.revision, "dir/inner.txt", 6, &cancelled),
+        Err(Error::Cancelled)
+    ));
+}
+
+/// Review of freedom-core #277, round 2: the capped read's walk is within
+/// its loads in all, not only object by object. A tree of 143,000 entries,
+/// about 5 MB, is under the binding's 16 MiB, but what libgit2 holds of it
+/// once parsed is over it: the binding's read of a file in it is
+/// `TooLarge`, as the binding's `tree_at` of it is, and the uncapped read
+/// serves it.
+#[test]
+fn a_tree_whose_parse_is_over_the_loads_is_refused() {
+    let f = fixture("radblobwide");
+    let repo = stored(&f.dir.join("home/storage"), &f.revision);
+    let base = repo
+        .find_commit(git2::Oid::from_str(&f.revision).unwrap())
+        .unwrap();
+    let blob = repo.blob(b"wide\n").unwrap();
+    let mut wide = repo.treebuilder(None).unwrap();
+    for i in 0..143_000 {
+        wide.insert(format!("{i:07}"), blob, 0o100644).unwrap();
+    }
+    let wide = wide.write().unwrap();
+    let size = repo.odb().unwrap().read_header(wide).unwrap().0 as u64;
+    assert!(size < libradicle::BINDING_READ_BUDGET, "{size}");
+    assert!(libradicle::tree_held(size) > libradicle::BINDING_READ_BUDGET);
+    let mut root = repo.treebuilder(Some(&base.tree().unwrap())).unwrap();
+    root.insert("wide", wide, 0o040000).unwrap();
+    let root = repo.find_tree(root.write().unwrap()).unwrap();
+    let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+    let revision = repo
+        .commit(None, &signature, &signature, "wide", &root, &[&base])
+        .unwrap()
+        .to_string();
+
+    let budget = libradicle::BINDING_READ_BUDGET;
+    match f
+        .node
+        .read_blob_at_capped(f.rid, &revision, "wide/0000007", budget)
+    {
+        Err(Error::TooLarge { size, limit }) => {
+            assert_eq!(limit, budget);
+            assert!(size > budget, "{size}");
+        }
+        other => panic!("expected TooLarge, got {other:?}"),
+    }
+    assert!(matches!(
+        f.node
+            .tree_at_bounded(f.rid, &revision, "wide", &Bounds::for_binding()),
+        Err(Error::TooLarge { .. })
+    ));
+    let uncapped = f
+        .node
+        .read_blob_at(f.rid, &revision, "wide/0000007")
+        .expect("uncapped");
+    assert_eq!(uncapped.content, b"wide\n");
+}
+
+/// The storage repository under `storage` that has the commit `revision`.
+fn stored(storage: &Path, revision: &str) -> git2::Repository {
+    let revision = git2::Oid::from_str(revision).unwrap();
+    for repo in std::fs::read_dir(storage).unwrap() {
+        let Ok(repo) = git2::Repository::open_bare(repo.unwrap().path()) else {
+            continue;
+        };
+        if repo.find_commit(revision).is_ok() {
+            return repo;
+        }
+    }
+    panic!("no repository under {storage:?} has {revision}");
 }
 
 /// A commit on `revision`, written straight into the storage repository that
