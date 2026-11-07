@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use libradicle::import::{Import, Stage};
 use radicle::crypto::{Seed, SigningKey};
 use radicle::git::raw as git2;
+use radicle::identity::doc::GetPayload as _;
 use radicle::node::policy::{Scope, SeedingPolicy};
 use radicle::prelude::RepoId;
 use radicle::storage::refs::SignedRefs;
@@ -177,7 +178,7 @@ fn check_imported(home: &Path, rid: RepoId, tip: git2::Oid) {
     let validations = repo.validate().unwrap();
     assert!(validations.is_empty(), "{validations:?}");
     let doc = repo.identity_doc().unwrap();
-    let project = doc.project().unwrap();
+    let project = doc.project().unwrap().unwrap();
     assert_eq!(project.name(), NAME);
     assert_eq!(project.description(), DESCRIPTION);
     assert_eq!(project.default_branch().as_str(), "master");

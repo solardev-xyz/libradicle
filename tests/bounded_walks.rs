@@ -2073,3 +2073,54 @@ fn a_commit_and_a_tag_tip_are_refused_as_disagreement() {
         other => panic!("expected NoCanonicalHead, got {other:?}"),
     }
 }
+
+/// An identity document with no project payload (#34 review, round 1):
+/// heartwood's `project()` answers `None` for it since upstream 138404df,
+/// and `repo_info` answers `Error::NoProject` with the text the old
+/// `PayloadError::NotFound` had, which freedom-radicled reads as
+/// `not_found` and passes on.
+#[test]
+fn an_identity_without_a_project_is_no_project_with_the_old_text() {
+    let f = fixture("radnoproject");
+    let stored = storage(&f).repository(f.rid).unwrap();
+    let git = &stored.backend;
+    let id = git.refname_to_id("refs/rad/id").unwrap();
+    let commit = git.find_commit(id).unwrap();
+    let doc_entry = commit
+        .tree()
+        .unwrap()
+        .get_path(std::path::Path::new("embeds/radicle.json"))
+        .unwrap();
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(git.find_blob(doc_entry.id()).unwrap().content()).unwrap();
+    assert!(doc["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("xyz.radicle.project")
+        .is_some());
+    let blob = git.blob(&serde_json::to_vec(&doc).unwrap()).unwrap();
+    let mut embeds = git.treebuilder(None).unwrap();
+    embeds.insert("radicle.json", blob, 0o100644).unwrap();
+    let embeds = embeds.write().unwrap();
+    let mut root = git.treebuilder(None).unwrap();
+    root.insert("embeds", embeds, 0o040000).unwrap();
+    let root = git.find_tree(root.write().unwrap()).unwrap();
+    let signature =
+        git2::Signature::new("Test", "test@example.com", &git2::Time::new(1, 0)).unwrap();
+    let id = git
+        .commit(
+            None,
+            &signature,
+            &signature,
+            "no project",
+            &root,
+            &[&commit],
+        )
+        .unwrap();
+    git.reference("refs/rad/id", id, true, "test").unwrap();
+
+    const TEXT: &str = "payload 'xyz.radicle.project' not found in identity document";
+    let bounded = f.node.repo_info_bounded(f.rid, &Bounds::for_binding());
+    assert!(matches!(bounded, Err(Error::NoProject)), "{bounded:?}");
+    assert_eq!(bounded.unwrap_err().to_string(), TEXT);
+}

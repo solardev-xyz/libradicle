@@ -20,6 +20,7 @@ use radicle::cob;
 use radicle::cob::common::Label;
 use radicle::cob::issue::{CloseReason, State as IssueState};
 use radicle::crypto::ssh::Keystore;
+use radicle::identity::doc::GetPayload as _;
 use radicle::identity::project::ProjectName;
 use radicle::identity::RepoId;
 use radicle::identity::Visibility;
@@ -1758,7 +1759,7 @@ impl Embedded {
         let repo = self.profile.storage.repository(rid)?;
         let objects = Objects::new(&repo.backend, read.bounds().budget)?;
         let doc = Self::identity_doc(&repo, identity)?;
-        let proj = doc.project()?;
+        let proj = doc.project().ok_or(Error::NoProject)??;
         let head = Self::head_bounded(&repo, &objects, read, identity)?;
 
         let issues = self.profile.issues(&repo)?;

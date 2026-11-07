@@ -21,6 +21,11 @@ pub enum Error {
     StorageRefs(#[from] radicle::storage::refs::Error),
     #[error(transparent)]
     Repository(#[from] radicle::storage::RepositoryError),
+    /// The identity document has no project payload. heartwood's
+    /// `project()` answers `None` for it since upstream 138404df, where it
+    /// was `PayloadError::NotFound`: the text is that error's, unchanged.
+    #[error("payload 'xyz.radicle.project' not found in identity document")]
+    NoProject,
     #[error(transparent)]
     Surf(#[from] radicle_surf::Error),
     #[error(transparent)]
