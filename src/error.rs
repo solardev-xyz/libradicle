@@ -89,6 +89,16 @@ pub enum Error {
     Signer(#[from] radicle::profile::SignerError),
     #[error(transparent)]
     Init(#[from] radicle::rad::InitError),
+    /// An import's argument Radicle refuses (the project's name, its
+    /// description or its default branch, as `rad init` checks them), or a
+    /// default branch the working copy doesn't have ([`crate::import`]).
+    /// Nothing is made.
+    #[error("invalid import: {0}")]
+    InvalidImport(String),
+    /// The repository an import would make is already in storage
+    /// ([`crate::import`]). Nothing is made.
+    #[error("{0} already exists in storage")]
+    Exists(RepoId),
     #[error(transparent)]
     Policy(#[from] radicle::node::policy::store::Error),
     #[error(transparent)]

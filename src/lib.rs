@@ -40,6 +40,7 @@ pub use error::Error;
 #[cfg(test)]
 #[path = "../tests/common/hermetic.rs"]
 mod hermetic;
+pub mod import;
 pub mod json;
 mod meter;
 mod objects;
