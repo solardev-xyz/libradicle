@@ -19,8 +19,8 @@
 //!    the home's `config.json` for the alias the storage names.
 //! 2. **[`Import::run`] makes the repository** in a temporary directory of
 //!    the storage, as a clone does (`<rid>.tmp`), so that a kill
-//!    or a crash leaves only a temporary clone, which reconciliation
-//!    removes at the next start:
+//!    or a crash before the move leaves only a temporary clone, which
+//!    reconciliation removes at the next start:
 //!    - the identity document and its first commit, signed by `key`;
 //!    - the working copy's default branch, fetched into `key`'s namespace
 //!      by libgit2's local transport, in this process: no `git` process
@@ -39,7 +39,13 @@
 //! failure before it removes the temporary clone; the seeding policy, if
 //! written, stays, and names a repository the storage doesn't hold, until a
 //! later import of it makes it. A failure of the move itself leaves the
-//! temporary clone, which the next start removes.
+//! temporary clone, which the next start removes. **A kill after the
+//! move**, or a failure of the flush after it, leaves the whole
+//! repository, signed and seeded, with no temporary clone: `run` may not
+//! have returned, so a host that didn't see its `Ok` can't tell which
+//! side of the move it stopped on. Either way the storage holds a whole
+//! repository or none, and a later [`Import::prepare`] of the same working
+//! copy refuses an imported one ([`Error::Exists`]).
 //!
 //! **libgit2's options are the host's:** its configuration search paths
 //! ([`crate::isolate_git_config`]) and its fsync (a host runs
@@ -72,6 +78,9 @@ pub enum Stage {
     Signed,
     /// The seeding policy is written.
     Seeded,
+    /// The repository is in place under its ID, whole: signed and seeded.
+    /// Only the storage directory's flush is left.
+    Moved,
 }
 
 /// An import, checked: nothing is changed until [`Import::run`].
@@ -194,6 +203,7 @@ impl Import {
         }
         let to = paths::repository(&self.storage, &self.rid);
         temp.mv(&to)?;
+        stage(Stage::Moved);
         sync_dir(self.storage.path())?;
         Ok(self.rid)
     }

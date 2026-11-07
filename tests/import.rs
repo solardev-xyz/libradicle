@@ -208,7 +208,13 @@ fn an_import_makes_a_signed_seeded_repository_and_leaves_the_working_copy_as_it_
     assert_eq!(made, rid);
     assert_eq!(
         stages,
-        [Stage::Created, Stage::Fetched, Stage::Signed, Stage::Seeded]
+        [
+            Stage::Created,
+            Stage::Fetched,
+            Stage::Signed,
+            Stage::Seeded,
+            Stage::Moved
+        ]
     );
     assert_eq!(storage_entries(&home), [rid.canonical()]);
     check_imported(&home, rid, tip);
@@ -345,7 +351,7 @@ fn a_failure_after_the_start_leaves_no_repository() {
 }
 
 #[test]
-fn a_run_cut_off_before_its_end_leaves_only_a_temporary_clone() {
+fn a_run_cut_off_before_the_move_leaves_only_a_temporary_clone() {
     for at in [Stage::Created, Stage::Fetched, Stage::Signed, Stage::Seeded] {
         let home = home(&format!("cut-{at:?}"));
         let (work, _) = working_copy(&format!("cut-{at:?}"));
@@ -367,4 +373,29 @@ fn a_run_cut_off_before_its_end_leaves_only_a_temporary_clone() {
         assert_eq!(name, &format!("{}.tmp", rid.canonical()), "{at:?}");
         assert!(!home.join("storage").join(rid.canonical()).exists());
     }
+}
+
+/// Cut off after the move (#33 review, round 1): the whole repository is in
+/// place, signed and seeded, with no temporary clone, and a second import
+/// of the working copy is refused as already in storage.
+#[test]
+fn a_run_cut_off_after_the_move_leaves_the_whole_repository() {
+    let home = home("cut-Moved");
+    let (work, tip) = working_copy("cut-Moved");
+    let import = prepare(&home, &work).unwrap();
+    let rid = import.rid();
+    let cut = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        import.run(&mut |stage| {
+            if stage == Stage::Moved {
+                panic!("cut off");
+            }
+        })
+    }));
+    assert!(cut.is_err());
+    assert_eq!(storage_entries(&home), vec![rid.canonical().to_string()]);
+    check_imported(&home, rid, tip);
+    assert!(matches!(
+        prepare(&home, &work),
+        Err(libradicle::Error::Exists(_))
+    ));
 }
