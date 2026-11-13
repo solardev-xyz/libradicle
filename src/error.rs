@@ -49,6 +49,21 @@ pub enum Error {
     NodeThread(String),
     #[error("the node didn't stop within {0:?}")]
     ShutdownTimeout(std::time::Duration),
+    /// The node's reactor didn't answer `call` within `within`
+    /// ([`crate::Embedded::connected_peers_within`],
+    /// [`crate::Embedded::unseed_repo_within`]). The request was sent: for
+    /// one that changes the node's state, whether it took effect is unknown,
+    /// as the reactor may still carry it out. The call goes on waiting in the
+    /// background ([`crate::Embedded::waiting_on_node`]).
+    #[error("the node didn't answer {call} within {within:?}")]
+    NodeDeadline {
+        call: &'static str,
+        within: std::time::Duration,
+    },
+    /// `call` wasn't sent: the node's reactor has yet to answer `overdue`
+    /// earlier calls past their bounds ([`crate::NODE_OVERDUE_LIMIT`]).
+    #[error("{call} wasn't sent: the node has yet to answer {overdue} overdue calls")]
+    NodeOverdue { call: &'static str, overdue: usize },
     /// An alias Radicle refuses (empty, too long, or with whitespace or
     /// control characters), for a fresh profile's `config.json`.
     #[error("invalid node alias: {0}")]
