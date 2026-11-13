@@ -1,7 +1,10 @@
-//! The calls that wait on the node's reactor for an answer
-//! (`connected_peers`, `unseed_repo`) wait within a bound (freedom-core
-//! #340). A wedged reactor answers neither: each call returns
-//! `NodeDeadline` at its bound, and `waiting_on_node` names it. At most
+//! The calls that wait on the node's reactor for an answer wait within a
+//! bound: `connected_peers` and `unseed_repo` (freedom-core #340), and
+//! `seeders`, a COB change's announcement and `remove_quarantined`'s unseed
+//! (freedom-core #363). A wedged reactor answers none: each call returns
+//! `NodeDeadline` at its bound, and `waiting_on_node` names it. A COB change
+//! stands in storage either way, and a removal cut off at its unseed keeps
+//! its record, and completes when run again. At most
 //! `NODE_WAIT_LIMIT` calls wait at once, within their bounds or past them,
 //! even for callers that all arrive together: a call past those isn't sent,
 //! and fails at once. When the reactor comes back, it answers the calls left
@@ -13,13 +16,16 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use libradicle::{Embedded, Error, HostKey, Options, NODE_WAIT_LIMIT};
+use radicle::git::raw as git2;
 use radicle::identity::RepoId;
+use radicle::node::gate::{Quarantine as Shut, RepoGate, RepoState};
+use radicle::storage::git::reconcile::quarantine::{Kind, Quarantine, Removal, QUARANTINE_DB_FILE};
 
 /// A dial gate that holds the reactor in its first ask until it's let go,
 /// then refuses every dial.
@@ -79,7 +85,7 @@ fn home() -> PathBuf {
     home
 }
 
-fn start(home: &std::path::Path, gate: Arc<Wedge>) -> Embedded {
+fn start(home: &Path, gate: Arc<Wedge>, repositories: RepoGate) -> Embedded {
     let mut bytes = vec![71u8; 32];
     common::start_with_key(
         Options {
@@ -90,11 +96,52 @@ fn start(home: &std::path::Path, gate: Arc<Wedge>) -> Embedded {
             routing: Some(common::routing_with(Some(gate))),
             seeding_policy: None,
             isolated: false,
-            repositories: None,
+            repositories: Some(repositories),
         },
         HostKey::from_bytes(&mut bytes).expect("32 bytes"),
     )
     .expect("start")
+}
+
+/// A repository named `name` imported into `node`'s storage, from a working
+/// copy with one commit on `master`.
+fn import(node: &mut Embedded, name: &str) -> RepoId {
+    let work = std::env::temp_dir().join(format!("lr-waits-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+    let repo = git2::Repository::init(&work).unwrap();
+    std::fs::write(work.join("README.md"), "# Waits\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("README.md")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let signature = git2::Signature::now("Waits", "waits@example.invalid").unwrap();
+    repo.commit(
+        Some("refs/heads/master"),
+        &signature,
+        &signature,
+        "First",
+        &tree,
+        &[],
+    )
+    .unwrap();
+    let rid = node
+        .import_repo(&work, name, "A waits test.", "master")
+        .expect("import");
+    let _ = std::fs::remove_dir_all(&work);
+    rid
+}
+
+/// The titles of the issues in `rid`, read from storage.
+fn issue_titles(node: &Embedded, rid: RepoId) -> Vec<String> {
+    let mut titles = node
+        .issues(rid)
+        .expect("the issues")
+        .into_iter()
+        .map(|(_, issue)| issue.title().to_string())
+        .collect::<Vec<_>>();
+    titles.sort();
+    titles
 }
 
 /// The threads waiting on the node for a caller: on Linux, by their name;
@@ -128,12 +175,38 @@ fn wait_for(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
 fn a_wedged_reactor_answers_no_call_past_its_bound() {
     let home = home();
     let gate = Arc::new(Wedge::default());
-    let mut node = start(&home, Arc::clone(&gate));
+    let repositories = RepoGate::new();
+    let mut node = start(&home, Arc::clone(&gate), repositories.clone());
     let rid = RepoId::from_str("rad:z3gqcJUoA1n9HaHKufZs5FCSGazv5").unwrap();
     let bound = Duration::from_millis(300);
 
+    // A repository to write to, and one quarantined and shut, to remove.
+    let written = import(&mut node, "written");
+    let removed = import(&mut node, "removed");
+    let mut quarantine = Quarantine::open(home.join("node").join(QUARANTINE_DB_FILE)).unwrap();
+    let record = quarantine
+        .quarantine(
+            removed,
+            Kind::Namespace,
+            "test",
+            None,
+            "a test",
+            Default::default(),
+        )
+        .unwrap();
+    repositories
+        .close(
+            removed,
+            RepoState::Quarantined(Shut::Namespace),
+            Duration::from_secs(5),
+        )
+        .expect("the gate closes");
+    let removed_storage = home.join("storage").join(removed.canonical());
+    assert!(removed_storage.is_dir());
+
     // The node answers while its reactor runs.
     assert_eq!(node.connected_peers_within(bound).expect("an answer"), 0);
+    let seeders = node.seeders_within(written, bound).expect("an answer");
     assert!(node.waiting_on_node().is_empty());
 
     // A dial of the seed reaches the gate on the reactor's thread, which it
@@ -156,15 +229,44 @@ fn a_wedged_reactor_answers_no_call_past_its_bound() {
         matches!(unseed, Err(Error::NodeDeadline { call: "unseed", within }) if within == bound),
         "{unseed:?}"
     );
+    let seeding = node.seeders_within(written, bound);
+    assert!(
+        matches!(seeding, Err(Error::NodeDeadline { call: "seeds_for", within }) if within == bound),
+        "{seeding:?}"
+    );
+    // A COB change is committed, then announced: the announcement is sent,
+    // and not answered.
+    let created = node.create_issue_within(written, "Wedged", "Its description.", vec![], bound);
+    assert!(
+        matches!(created, Err(Error::NodeDeadline { call: "announce_refs_for", within }) if within == bound),
+        "{created:?}"
+    );
+    assert!(created.unwrap_err().is_announce());
+    assert!(!seeding.unwrap_err().is_announce());
+    // A removal's unseed is sent, and not answered: nothing after it runs.
+    let removal = node.remove_quarantined_within(removed, record.qid, &mut quarantine, bound);
+    assert!(
+        matches!(removal, Err(Error::NodeDeadline { call: "unseed", within }) if within == bound),
+        "{removal:?}"
+    );
     let took = asked.elapsed();
-    assert!(took < Duration::from_secs(3), "two calls took {took:?}");
+    assert!(took < Duration::from_secs(6), "five calls took {took:?}");
+    assert_eq!(issue_titles(&node, written), ["Wedged"]);
+    assert!(quarantine.get(&removed).unwrap().is_some());
+    assert!(removed_storage.is_dir());
     let waiting = node.waiting_on_node();
     assert_eq!(
         waiting
             .iter()
             .map(|wait| (wait.call, wait.overdue))
             .collect::<Vec<_>>(),
-        [("sessions", true), ("unseed", true)],
+        [
+            ("sessions", true),
+            ("unseed", true),
+            ("seeds_for", true),
+            ("announce_refs_for", true),
+            ("unseed", true)
+        ],
         "{waiting:?}"
     );
 
@@ -172,7 +274,7 @@ fn a_wedged_reactor_answers_no_call_past_its_bound() {
     // room for are sent, and wait to their bound; the rest aren't sent, and
     // fail at once. No more threads wait on the node than the limit, nor
     // more calls.
-    let room = NODE_WAIT_LIMIT - 2;
+    let room = NODE_WAIT_LIMIT - waiting.len();
     let callers = NODE_WAIT_LIMIT + 4;
     let burst = Duration::from_secs(2);
     let start = Barrier::new(callers + 1);
@@ -220,6 +322,44 @@ fn a_wedged_reactor_answers_no_call_past_its_bound() {
         "{busy:?}"
     );
     assert!(asked.elapsed() < Duration::from_secs(1));
+    let asked = Instant::now();
+    let seeding = node.seeders_within(written, Duration::from_secs(5));
+    assert!(
+        matches!(seeding, Err(Error::NodeBusy { call: "seeds_for", waiting }) if waiting == NODE_WAIT_LIMIT),
+        "{seeding:?}"
+    );
+    // A COB change still stands, unannounced.
+    let created = node.create_issue_within(
+        written,
+        "Unannounced",
+        "Its description.",
+        vec![],
+        Duration::from_secs(5),
+    );
+    assert!(
+        matches!(created, Err(Error::NodeBusy { call: "announce_refs_for", waiting }) if waiting == NODE_WAIT_LIMIT),
+        "{created:?}"
+    );
+    assert!(created.unwrap_err().is_announce());
+    assert_eq!(issue_titles(&node, written), ["Unannounced", "Wedged"]);
+    // A removal touches nothing.
+    let removal = node.remove_quarantined_within(
+        removed,
+        record.qid,
+        &mut quarantine,
+        Duration::from_secs(5),
+    );
+    assert!(
+        matches!(removal, Err(Error::NodeBusy { call: "unseed", waiting }) if waiting == NODE_WAIT_LIMIT),
+        "{removal:?}"
+    );
+    assert!(quarantine.get(&removed).unwrap().is_some());
+    assert!(removed_storage.is_dir());
+    let took = asked.elapsed();
+    assert!(
+        took < Duration::from_secs(2),
+        "three refusals took {took:?}"
+    );
     let waiting = node.waiting_on_node();
     assert_eq!(waiting.len(), NODE_WAIT_LIMIT);
     assert!(waiting.iter().all(|wait| wait.overdue), "{waiting:?}");
@@ -239,6 +379,39 @@ fn a_wedged_reactor_answers_no_call_past_its_bound() {
     assert!(!node
         .unseed_repo_within(rid, Duration::from_secs(10))
         .expect("an answer"));
+    assert_eq!(
+        node.seeders_within(written, Duration::from_secs(10))
+            .expect("an answer"),
+        seeders
+    );
+    let (issue, _) = node
+        .issues(written)
+        .expect("the issues")
+        .into_iter()
+        .find(|(_, issue)| issue.title() == "Wedged")
+        .expect("the wedged write's issue");
+    node.comment_issue_within(
+        written,
+        &issue.to_string(),
+        "Announced.",
+        None,
+        Duration::from_secs(10),
+    )
+    .expect("a comment, announced");
+    // The removal, run again, completes.
+    assert_eq!(
+        node.remove_quarantined_within(
+            removed,
+            record.qid,
+            &mut quarantine,
+            Duration::from_secs(10)
+        )
+        .expect("a removal"),
+        Removal::Removed
+    );
+    assert!(quarantine.get(&removed).unwrap().is_none());
+    assert!(!removed_storage.exists());
+    assert!(node.waiting_on_node().is_empty());
     dial.join()
         .expect("the dial's thread")
         .expect("a seed book report");

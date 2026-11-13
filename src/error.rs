@@ -43,6 +43,9 @@ pub enum Error {
     /// A clone, or a bounded walk, cancelled through its `CancelToken`.
     #[error("cancelled")]
     Cancelled,
+    /// The node answered an announcement of this node's refs with a
+    /// failure. A COB change or an import is committed before it's
+    /// announced, and stands ([`Error::is_announce`]).
     #[error("announce refs failed: {0}")]
     Announce(String),
     #[error("node thread: {0}")]
@@ -51,7 +54,11 @@ pub enum Error {
     ShutdownTimeout(std::time::Duration),
     /// The node's reactor didn't answer `call` within `within`
     /// ([`crate::Embedded::connected_peers_within`],
-    /// [`crate::Embedded::unseed_repo_within`]). The request was sent: for
+    /// [`crate::Embedded::seeders_within`],
+    /// [`crate::Embedded::unseed_repo_within`],
+    /// [`crate::Embedded::remove_quarantined_within`], and the announcement
+    /// of [`crate::Embedded::create_issue_within`] and the other COB
+    /// changes, after the change is committed). The request was sent: for
     /// one that changes the node's state, whether it took effect is unknown,
     /// as the reactor may still carry it out. The call goes on waiting in the
     /// background ([`crate::Embedded::waiting_on_node`]).
@@ -157,6 +164,28 @@ pub enum Error {
     /// ([`crate::isolate_git_config`]).
     #[error("libgit2's configuration search paths: {0}")]
     GitConfig(String),
+}
+
+/// The name, in [`Error::NodeDeadline`] and [`Error::NodeBusy`], of the
+/// announcement that follows a committed COB change or import.
+pub(crate) const ANNOUNCE: &str = "announce_refs_for";
+
+impl Error {
+    /// Whether this is the error of an announcement, which follows a COB
+    /// change ([`crate::Embedded::create_issue_within`] and the others) or an
+    /// import: [`Error::Announce`], or [`Error::NodeDeadline`] or
+    /// [`Error::NodeBusy`] for `announce_refs_for`. The change itself was
+    /// committed before it, and stands in storage: the error says only that
+    /// the node didn't confirm the announcement (`NodeDeadline`, sent), wasn't
+    /// sent it (`NodeBusy`), or failed it (`Announce`). Any other error of a
+    /// COB change leaves open whether the change was committed.
+    pub fn is_announce(&self) -> bool {
+        match self {
+            Error::Announce(_) => true,
+            Error::NodeDeadline { call, .. } | Error::NodeBusy { call, .. } => *call == ANNOUNCE,
+            _ => false,
+        }
+    }
 }
 
 impl From<radicle::storage::git::reconcile::driver::Error> for Error {

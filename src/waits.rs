@@ -1,7 +1,8 @@
 //! Calls that wait on the node's reactor for an answer, each within a bound.
 //!
 //! heartwood's handle sends a command to the reactor and waits for its answer
-//! with no bound (`Handle::sessions`, `Handle::unseed`, ...). A reactor that
+//! with no bound (`Handle::sessions`, `Handle::seeds_for`,
+//! `Handle::announce_refs_for`, `Handle::unseed`, ...). A reactor that
 //! never answers would hold the caller, and any lock the caller holds, for
 //! good. So each such call here runs on a thread of its own, and its caller
 //! waits for the answer up to a bound: past it, the caller has
@@ -23,9 +24,14 @@ use radicle_node::runtime::handle::{Error as HandleError, Handle as NodeHandle};
 
 use crate::Error;
 
-/// How long [`crate::Embedded::connected_peers`] and
-/// [`crate::Embedded::unseed_repo`] wait for the node's answer. A caller with
-/// a bound of its own passes it to their `_within` forms.
+/// How long the calls that wait on the node's reactor wait for its answer:
+/// [`crate::Embedded::connected_peers`], [`crate::Embedded::seeders`],
+/// [`crate::Embedded::unseed_repo`], [`crate::Embedded::remove_quarantined`],
+/// and the announcement of a COB change ([`crate::Embedded::create_issue`],
+/// [`crate::Embedded::comment_issue`], [`crate::Embedded::edit_issue_state`],
+/// [`crate::Embedded::comment_patch`]) or of an import
+/// ([`crate::Embedded::import_repo`]). A caller with a bound of its own
+/// passes it to their `_within` forms.
 pub const NODE_ANSWER_WITHIN: Duration = Duration::from_secs(30);
 
 /// How many calls may wait on the node at once, within their bounds or past
@@ -37,7 +43,8 @@ pub const NODE_WAIT_LIMIT: usize = 8;
 /// A call waiting on the node's reactor ([`crate::Embedded::waiting_on_node`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeWait {
-    /// The call's name: `sessions` or `unseed`.
+    /// The call's name, heartwood's handle's: `sessions`, `seeds_for`,
+    /// `announce_refs_for` or `unseed`.
     pub call: &'static str,
     /// How long it has waited.
     pub waited: Duration,
