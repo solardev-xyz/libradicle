@@ -18,7 +18,7 @@ no-spawn = ["libradicle/no-spawn"]
 
 [dependencies]
 libradicle = { path = ".." }
-radicle = { git = "https://github.com/solardev-xyz/heartwood", rev = "c1634ac2e58af218a85e431bbd5c9782f1134ab1" }
+radicle = { git = "https://github.com/solardev-xyz/heartwood", rev = "bef1fc97245f088d48c483cdc3e1c001539bc97c" }
 napi = { version = "3", default-features = false, features = ["napi8"] }
 napi-derive = "3"
 serde_json = "1"
