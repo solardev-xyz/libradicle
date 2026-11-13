@@ -590,7 +590,9 @@ impl Network {
     /// Dial the device-ranked seed book with bounded concurrency. Each dial
     /// gets at most five seconds; the pass returns as soon as four seed
     /// sessions stand, while already in-flight attempts finish in the
-    /// background and Heartwood maintains persistent successes.
+    /// background and Heartwood maintains persistent successes. A seed whose
+    /// session is disconnected, waiting out Heartwood's reconnection delay,
+    /// is dialled now.
     pub fn connect_seed_book(&mut self, timeout: Duration) -> Result<SeedConnectReport, Error> {
         struct DialResult {
             candidate: seeds::Candidate,
@@ -606,8 +608,15 @@ impl Network {
             .iter()
             .map(seeds::Candidate::nid)
             .collect::<HashSet<_>>();
+        // A seed whose session is connected, or connecting, isn't dialled
+        // again. One whose session is disconnected is: heartwood keeps it
+        // while it waits out a reconnection delay that doubles with each
+        // failed dial, up to an hour, so after the transport restarts (Tor,
+        // say) the seed could go undialled for many minutes. Heartwood
+        // redials a disconnected session when asked to connect.
         let occupied = sessions
             .iter()
+            .filter(|session| !matches!(session.state, radicle::node::State::Disconnected { .. }))
             .map(|session| session.nid)
             .collect::<HashSet<_>>();
         let initially_connected = sessions
