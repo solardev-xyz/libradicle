@@ -60,10 +60,11 @@ pub enum Error {
         call: &'static str,
         within: std::time::Duration,
     },
-    /// `call` wasn't sent: the node's reactor has yet to answer `overdue`
-    /// earlier calls past their bounds ([`crate::NODE_OVERDUE_LIMIT`]).
-    #[error("{call} wasn't sent: the node has yet to answer {overdue} overdue calls")]
-    NodeOverdue { call: &'static str, overdue: usize },
+    /// `call` wasn't sent: `waiting` calls were already waiting on the node's
+    /// reactor, as many as may at once ([`crate::NODE_WAIT_LIMIT`]), within
+    /// their bounds or past them. Nothing of `call` reached the node.
+    #[error("{call} wasn't sent: {waiting} calls are already waiting on the node")]
+    NodeBusy { call: &'static str, waiting: usize },
     /// An alias Radicle refuses (empty, too long, or with whitespace or
     /// control characters), for a fresh profile's `config.json`.
     #[error("invalid node alias: {0}")]

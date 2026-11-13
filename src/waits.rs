@@ -9,10 +9,12 @@
 //! until the reactor answers, or ends, and so drops the command.
 //!
 //! The calls still waiting are listed, by name, for a host that stops the node
-//! to report ([`Waits::waiting`]). Calls left waiting past their bounds are
-//! capped: at [`NODE_OVERDUE_LIMIT`], a new call isn't sent, and its caller
-//! has [`Error::NodeOverdue`] at once, so that a wedged reactor doesn't
-//! gather a thread for every call made of it.
+//! to report ([`Waits::waiting`]). They are capped: with [`NODE_WAIT_LIMIT`]
+//! calls waiting, within their bounds or past them, a new call isn't sent, and
+//! its caller has [`Error::NodeBusy`] at once. A call takes its place under
+//! the lock that counts them, before its thread starts, so callers arriving
+//! together can't pass the cap: a wedged reactor holds at most that many
+//! threads and commands, however many calls are made of it.
 
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -26,9 +28,11 @@ use crate::Error;
 /// a bound of its own passes it to their `_within` forms.
 pub const NODE_ANSWER_WITHIN: Duration = Duration::from_secs(30);
 
-/// How many calls left waiting on the node past their bounds stop a new call
-/// from being sent ([`Error::NodeOverdue`]).
-pub const NODE_OVERDUE_LIMIT: usize = 8;
+/// How many calls may wait on the node at once, within their bounds or past
+/// them: a call past this many isn't sent ([`Error::NodeBusy`]). Above the
+/// most freedom-radicled makes at once, from its four read threads, its writer
+/// and its watch of the node.
+pub const NODE_WAIT_LIMIT: usize = 8;
 
 /// A call waiting on the node's reactor ([`crate::Embedded::waiting_on_node`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,13 +105,15 @@ impl Waits {
         T: Send + 'static,
         F: FnOnce(NodeHandle) -> Result<T, HandleError> + Send + 'static,
     {
+        // The call's place is taken here, under the lock, before anything is
+        // sent: a call past the cap sends nothing.
         let entry = {
             let mut inner = self.lock();
-            let overdue = inner.calls.iter().filter(|call| call.overdue).count();
-            if overdue >= NODE_OVERDUE_LIMIT {
-                return Err(Error::NodeOverdue {
+            let waiting = inner.calls.len();
+            if waiting >= NODE_WAIT_LIMIT {
+                return Err(Error::NodeBusy {
                     call: name,
-                    overdue,
+                    waiting,
                 });
             }
             inner.next += 1;

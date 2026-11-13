@@ -54,7 +54,7 @@ use meter::Meter;
 pub use objects::{commit_held, raw_held, tree_held};
 use objects::{Objects, Walk};
 use waits::Waits;
-pub use waits::{NodeWait, NODE_ANSWER_WITHIN, NODE_OVERDUE_LIMIT};
+pub use waits::{NodeWait, NODE_ANSWER_WITHIN, NODE_WAIT_LIMIT};
 
 /// Options for starting an embedded Radicle stack.
 #[derive(Debug, Clone)]
@@ -1221,7 +1221,7 @@ impl Embedded {
     /// [`Embedded::unseed_repo`], waiting for the node's answer up to
     /// `within`. Past it, [`Error::NodeDeadline`]: the request was sent, and
     /// whether the repository is still seeded is unknown, as the node may
-    /// still carry it out. With [`Error::NodeOverdue`], it wasn't sent.
+    /// still carry it out. With [`Error::NodeBusy`], it wasn't sent.
     pub fn unseed_repo_within(&mut self, rid: RepoId, within: Duration) -> Result<bool, Error> {
         self.waits
             .call(&self.handle, "unseed", within, move |mut handle| {

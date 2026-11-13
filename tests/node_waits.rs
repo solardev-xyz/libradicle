@@ -1,9 +1,11 @@
 //! The calls that wait on the node's reactor for an answer
 //! (`connected_peers`, `unseed_repo`) wait within a bound (freedom-core
 //! #340). A wedged reactor answers neither: each call returns
-//! `NodeDeadline` at its bound, `waiting_on_node` names it, and once enough
-//! are overdue a new call isn't sent at all. When the reactor comes back, it
-//! answers the calls left waiting, and they end.
+//! `NodeDeadline` at its bound, and `waiting_on_node` names it. At most
+//! `NODE_WAIT_LIMIT` calls wait at once, within their bounds or past them,
+//! even for callers that all arrive together: a call past those isn't sent,
+//! and fails at once. When the reactor comes back, it answers the calls left
+//! waiting, and they end.
 //!
 //! The reactor is wedged through the node's dial gate, which it asks on its
 //! own thread before every dial: this test's gate doesn't return until the
@@ -13,10 +15,10 @@ mod common;
 
 use std::path::PathBuf;
 use std::str::FromStr as _;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use libradicle::{Embedded, Error, HostKey, Options, NODE_OVERDUE_LIMIT};
+use libradicle::{Embedded, Error, HostKey, Options, NODE_WAIT_LIMIT};
 use radicle::identity::RepoId;
 
 /// A dial gate that holds the reactor in its first ask until it's let go,
@@ -95,6 +97,24 @@ fn start(home: &std::path::Path, gate: Arc<Wedge>) -> Embedded {
     .expect("start")
 }
 
+/// The threads waiting on the node for a caller: on Linux, by their name;
+/// elsewhere, the calls the node lists.
+fn helpers(node: &Embedded) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = node;
+        std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
+            .filter(|name| name.trim_end() == "radicle-wait")
+            .count()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        node.waiting_on_node().len()
+    }
+}
+
 /// Waits up to `within` for `done`, or panics naming `what`.
 fn wait_for(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
     let started = Instant::now();
@@ -148,27 +168,68 @@ fn a_wedged_reactor_answers_no_call_past_its_bound() {
         "{waiting:?}"
     );
 
-    // Once the limit's worth are overdue, a call isn't sent: it fails at once.
-    while node.waiting_on_node().len() < NODE_OVERDUE_LIMIT {
-        assert!(matches!(
-            node.connected_peers_within(Duration::from_millis(10)),
-            Err(Error::NodeDeadline { .. })
-        ));
-    }
+    // Callers that all arrive at once, more than may wait: as many as there's
+    // room for are sent, and wait to their bound; the rest aren't sent, and
+    // fail at once. No more threads wait on the node than the limit, nor
+    // more calls.
+    let room = NODE_WAIT_LIMIT - 2;
+    let callers = NODE_WAIT_LIMIT + 4;
+    let burst = Duration::from_secs(2);
+    let start = Barrier::new(callers + 1);
+    let answers = std::thread::scope(|scope| {
+        let calls = (0..callers)
+            .map(|_| {
+                scope.spawn(|| {
+                    start.wait();
+                    let asked = Instant::now();
+                    let answer = node.connected_peers_within(burst);
+                    (answer, asked.elapsed())
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(node.waiting_on_node().len(), NODE_WAIT_LIMIT);
+        assert_eq!(helpers(&node), NODE_WAIT_LIMIT);
+        calls
+            .into_iter()
+            .map(|call| call.join().expect("a caller"))
+            .collect::<Vec<_>>()
+    });
+    let sent = answers
+        .iter()
+        .filter(|(answer, took)| {
+            matches!(answer, Err(Error::NodeDeadline { call: "sessions", within }) if *within == burst)
+                && *took >= burst
+        })
+        .count();
+    let refused = answers
+        .iter()
+        .filter(|(answer, took)| {
+            matches!(answer, Err(Error::NodeBusy { call: "sessions", waiting }) if *waiting == NODE_WAIT_LIMIT)
+                && *took < Duration::from_secs(1)
+        })
+        .count();
+    assert_eq!((sent, refused), (room, callers - room), "{answers:?}");
+
+    // Every place is taken, by calls past their bounds: a call isn't sent.
     let asked = Instant::now();
-    let refused = node.connected_peers_within(Duration::from_secs(5));
+    let busy = node.connected_peers_within(Duration::from_secs(5));
     assert!(
-        matches!(refused, Err(Error::NodeOverdue { call: "sessions", overdue }) if overdue == NODE_OVERDUE_LIMIT),
-        "{refused:?}"
+        matches!(busy, Err(Error::NodeBusy { call: "sessions", waiting }) if waiting == NODE_WAIT_LIMIT),
+        "{busy:?}"
     );
     assert!(asked.elapsed() < Duration::from_secs(1));
-    assert_eq!(node.waiting_on_node().len(), NODE_OVERDUE_LIMIT);
+    let waiting = node.waiting_on_node();
+    assert_eq!(waiting.len(), NODE_WAIT_LIMIT);
+    assert!(waiting.iter().all(|wait| wait.overdue), "{waiting:?}");
+    assert_eq!(helpers(&node), NODE_WAIT_LIMIT);
 
     // The reactor comes back: it answers the calls left waiting, which end,
     // and answers new calls again.
     gate.let_go();
     wait_for("end of the waiting calls", Duration::from_secs(10), || {
-        node.waiting_on_node().is_empty()
+        node.waiting_on_node().is_empty() && helpers(&node) == 0
     });
     assert_eq!(
         node.connected_peers_within(Duration::from_secs(10))
