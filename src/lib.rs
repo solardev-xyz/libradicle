@@ -48,10 +48,13 @@ mod objects;
 #[cfg(test)]
 mod seams;
 mod seeds;
+mod waits;
 
 use meter::Meter;
 pub use objects::{commit_held, raw_held, tree_held};
 use objects::{Objects, Walk};
+use waits::Waits;
+pub use waits::{NodeWait, NODE_ANSWER_WITHIN, NODE_WAIT_LIMIT};
 
 /// Options for starting an embedded Radicle stack.
 #[derive(Debug, Clone)]
@@ -998,6 +1001,9 @@ pub struct Embedded {
     /// The node's repository gate ([`Options::repositories`]): the host's,
     /// or one that admits everything.
     repositories: radicle::node::gate::RepoGate,
+    /// The calls waiting on the node's reactor, each within a bound
+    /// ([`Embedded::waiting_on_node`]).
+    waits: Waits,
 }
 
 impl Embedded {
@@ -1149,6 +1155,7 @@ impl Embedded {
             released: false,
             end: ThreadEnd::Running,
             repositories,
+            waits: Waits::default(),
         })
     }
 
@@ -1205,8 +1212,30 @@ impl Embedded {
     }
 
     /// Stop seeding a repository. The bare repository remains in storage.
+    /// The node's answer is waited for up to [`NODE_ANSWER_WITHIN`]
+    /// ([`Embedded::unseed_repo_within`]).
     pub fn unseed_repo(&mut self, rid: RepoId) -> Result<bool, Error> {
-        Ok(self.handle.unseed(rid)?)
+        self.unseed_repo_within(rid, NODE_ANSWER_WITHIN)
+    }
+
+    /// [`Embedded::unseed_repo`], waiting for the node's answer up to
+    /// `within`. Past it, [`Error::NodeDeadline`]: the request was sent, and
+    /// whether the repository is still seeded is unknown, as the node may
+    /// still carry it out. With [`Error::NodeBusy`], it wasn't sent.
+    pub fn unseed_repo_within(&mut self, rid: RepoId, within: Duration) -> Result<bool, Error> {
+        self.waits
+            .call(&self.handle, "unseed", within, move |mut handle| {
+                handle.unseed(rid)
+            })
+    }
+
+    /// The calls waiting on the node's reactor, oldest first: those still
+    /// within their bounds, and those whose callers stopped waiting at them
+    /// ([`Error::NodeDeadline`]), which wait on in the background until the
+    /// node answers or ends. A host that stops the node can name the calls a
+    /// wedged node holds.
+    pub fn waiting_on_node(&self) -> Vec<NodeWait> {
+        self.waits.waiting()
     }
 
     /// List all locally stored repositories.
@@ -1868,9 +1897,19 @@ impl Embedded {
         Ok(files)
     }
 
-    /// Number of currently connected peer sessions.
+    /// Number of currently connected peer sessions. The node's answer is
+    /// waited for up to [`NODE_ANSWER_WITHIN`]
+    /// ([`Embedded::connected_peers_within`]).
     pub fn connected_peers(&self) -> Result<usize, Error> {
-        let sessions = self.handle.sessions()?;
+        self.connected_peers_within(NODE_ANSWER_WITHIN)
+    }
+
+    /// [`Embedded::connected_peers`], waiting for the node's answer up to
+    /// `within`: past it, [`Error::NodeDeadline`].
+    pub fn connected_peers_within(&self, within: Duration) -> Result<usize, Error> {
+        let sessions = self
+            .waits
+            .call(&self.handle, "sessions", within, |handle| handle.sessions())?;
         Ok(sessions
             .iter()
             .filter(|s| matches!(s.state, radicle::node::State::Connected { .. }))
