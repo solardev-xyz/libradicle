@@ -74,6 +74,29 @@ fn read(counter: &'static LocalKey<Cell<usize>>) -> usize {
     counter.with(|count| count.replace(0))
 }
 
+/// A failure a test gives the next wait on the node made on its thread,
+/// once the wait's place is taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WaitFault {
+    /// Its thread doesn't start, as with a failed spawn.
+    Spawn,
+    /// Its thread panics before it asks the node.
+    Panic,
+}
+
+thread_local! {
+    static WAIT_FAULT: Cell<Option<WaitFault>> = const { Cell::new(None) };
+}
+
+/// The failure the test gives this wait, if any, taken: it fails once.
+pub(crate) fn wait_fault() -> Option<WaitFault> {
+    WAIT_FAULT.with(Cell::take)
+}
+
+fn fail_next_wait(fault: WaitFault) {
+    WAIT_FAULT.with(|next| next.set(Some(fault)));
+}
+
 mod tests {
     use std::path::PathBuf;
 
@@ -161,6 +184,80 @@ mod tests {
 
     fn budget(budget: u64) -> Bounds {
         Bounds::new(CancelToken::new(), budget)
+    }
+
+    // Review of libradicle #40, round 1: a COB change is committed before
+    // it's announced, so every failure of the announcement's wait, not only
+    // its bound and the cap, is an announcement's error, and the change
+    // stands. The wait's thread doesn't start, or panics before it asks the
+    // node; either way its place is given back. A failure of the change
+    // itself, before the announcement, isn't one.
+    #[test]
+    fn a_failed_wait_for_a_cob_changes_announcement_is_the_announcements_error() {
+        let f = fixture("rsannounce", 1);
+        let rid = f.repos[0].0;
+        let within = std::time::Duration::from_secs(30);
+        let titles = || {
+            let mut titles = f
+                .node
+                .issues(rid)
+                .unwrap()
+                .into_iter()
+                .map(|(_, issue)| issue.title().to_string())
+                .collect::<Vec<_>>();
+            titles.sort();
+            titles
+        };
+
+        fail_next_wait(WaitFault::Spawn);
+        let unspawned = f
+            .node
+            .create_issue_within(rid, "Unspawned", "Its description.", vec![], within)
+            .unwrap_err();
+        assert!(
+            matches!(unspawned, Error::Announce(_)) && unspawned.is_announce(),
+            "{unspawned:?}"
+        );
+        fail_next_wait(WaitFault::Panic);
+        let panicked = f
+            .node
+            .create_issue_within(rid, "Panicked", "Its description.", vec![], within)
+            .unwrap_err();
+        assert!(
+            matches!(panicked, Error::Announce(_)) && panicked.is_announce(),
+            "{panicked:?}"
+        );
+        assert_eq!(titles(), ["Panicked", "Unspawned"]);
+        assert!(f.node.waiting_on_node().is_empty());
+
+        // Another call's failed wait is its own: not an announcement's.
+        fail_next_wait(WaitFault::Spawn);
+        let seeders = f.node.seeders_within(rid, within).unwrap_err();
+        assert!(
+            matches!(seeders, Error::Io(_)) && !seeders.is_announce(),
+            "{seeders:?}"
+        );
+        fail_next_wait(WaitFault::Panic);
+        let seeders = f.node.seeders_within(rid, within).unwrap_err();
+        assert!(
+            matches!(seeders, Error::NodeThread(_)) && !seeders.is_announce(),
+            "{seeders:?}"
+        );
+
+        // The change's own failure, before its announcement, isn't one.
+        let (issue, _) = f.node.issues(rid).unwrap().remove(0);
+        let refused = f
+            .node
+            .edit_issue_state_within(rid, &issue.to_string(), "bogus", within)
+            .unwrap_err();
+        assert!(!refused.is_announce(), "{refused:?}");
+        assert!(wait_fault().is_none());
+
+        // With no failure given, the change is announced.
+        f.node
+            .comment_issue_within(rid, &issue.to_string(), "Announced.", None, within)
+            .expect("a comment, announced");
+        assert!(f.node.waiting_on_node().is_empty());
     }
 
     // Review of libradicle #8, round 2: with no room left for a repository,

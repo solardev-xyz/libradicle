@@ -43,9 +43,12 @@ pub enum Error {
     /// A clone, or a bounded walk, cancelled through its `CancelToken`.
     #[error("cancelled")]
     Cancelled,
-    /// The node answered an announcement of this node's refs with a
-    /// failure. A COB change or an import is committed before it's
-    /// announced, and stands ([`Error::is_announce`]).
+    /// An announcement of this node's refs failed, other than at its bound
+    /// or the cap ([`Error::NodeDeadline`], [`Error::NodeBusy`]): the node
+    /// answered it with a failure, or the wait for its answer failed (its
+    /// thread didn't start, or ended without the answer). A COB change or an
+    /// import is committed before it's announced, and stands
+    /// ([`Error::is_announce`]).
     #[error("announce refs failed: {0}")]
     Announce(String),
     #[error("node thread: {0}")]
@@ -177,8 +180,9 @@ impl Error {
     /// [`Error::NodeBusy`] for `announce_refs_for`. The change itself was
     /// committed before it, and stands in storage: the error says only that
     /// the node didn't confirm the announcement (`NodeDeadline`, sent), wasn't
-    /// sent it (`NodeBusy`), or failed it (`Announce`). Any other error of a
-    /// COB change leaves open whether the change was committed.
+    /// sent it (`NodeBusy`), or that it failed otherwise (`Announce`: the
+    /// node's failure, or the wait's). Any other error of a COB change leaves
+    /// open whether the change was committed.
     pub fn is_announce(&self) -> bool {
         match self {
             Error::Announce(_) => true,

@@ -137,6 +137,12 @@ impl Waits {
             }
         };
         let id = entry.id;
+        #[cfg(test)]
+        let fault = crate::seams::wait_fault();
+        #[cfg(test)]
+        if fault == Some(crate::seams::WaitFault::Spawn) {
+            return Err(std::io::Error::other("a test's failed spawn").into());
+        }
         let (send, answer) = mpsc::sync_channel(1);
         let handle = handle.clone();
         // A failed spawn drops the closure, and the entry with it; so does a
@@ -145,6 +151,10 @@ impl Waits {
         std::thread::Builder::new()
             .name("radicle-wait".into())
             .spawn(move || {
+                #[cfg(test)]
+                if fault == Some(crate::seams::WaitFault::Panic) {
+                    panic!("a test's panic, before the node is asked");
+                }
                 let answer = ask(handle);
                 drop(entry);
                 send.send(answer).ok();

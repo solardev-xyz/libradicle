@@ -1427,23 +1427,30 @@ impl Embedded {
 
     /// Announces this node's refs of `rid`, waiting for the node's answer up
     /// to `within`. Past it, [`Error::NodeDeadline`]: the announcement was
-    /// sent. With [`Error::NodeBusy`], it wasn't. A failure the node answers
-    /// is [`Error::Announce`].
+    /// sent. With [`Error::NodeBusy`], it wasn't. Every other failure, the
+    /// node's or the wait's, is [`Error::Announce`]: whatever its caller
+    /// committed before stands, and [`Error::is_announce`] says so.
     fn announce_refs(&self, rid: RepoId, within: Duration) -> Result<(), Error> {
         let namespace = *self.profile.did();
-        self.waits
-            .call(
-                &self.handle,
-                crate::error::ANNOUNCE,
-                within,
-                move |mut handle| {
-                    Ok(handle
-                        .announce_refs_for(rid, [namespace])
-                        .map(|_| ())
-                        .map_err(|err| err.to_string()))
-                },
-            )?
-            .map_err(Error::Announce)
+        let answer = self.waits.call(
+            &self.handle,
+            crate::error::ANNOUNCE,
+            within,
+            move |mut handle| {
+                Ok(handle
+                    .announce_refs_for(rid, [namespace])
+                    .map(|_| ())
+                    .map_err(|err| err.to_string()))
+            },
+        );
+        match answer {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(failed)) => Err(Error::Announce(failed)),
+            Err(error @ (Error::NodeDeadline { .. } | Error::NodeBusy { .. })) => Err(error),
+            // The wait itself failed: its thread didn't start, or ended
+            // without the answer.
+            Err(error) => Err(Error::Announce(error.to_string())),
+        }
     }
 
     /// Create an issue directly in the repository's COB store. The node's
@@ -1466,8 +1473,10 @@ impl Embedded {
     /// announcement doesn't mean the change didn't happen: it is recorded
     /// already, and stands in storage. Past `within`, the call has
     /// [`Error::NodeDeadline`]: the announcement was sent, and not confirmed.
-    /// With [`Error::NodeBusy`], it wasn't sent. A failure the node answers
-    /// is [`Error::Announce`]. [`Error::is_announce`] tells these three from
+    /// With [`Error::NodeBusy`], it wasn't sent. Any other failure of the
+    /// announcement, the node's or that of the wait for its answer (its
+    /// thread didn't start, or ended without it), is [`Error::Announce`].
+    /// [`Error::is_announce`] tells these three from
     /// an error of the change itself, after which whether it was committed
     /// is open.
     ///
