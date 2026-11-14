@@ -1425,21 +1425,71 @@ impl Embedded {
         }
     }
 
-    fn announce_refs(&self, rid: RepoId) -> Result<(), Error> {
-        let mut handle = self.handle.clone();
-        handle
-            .announce_refs_for(rid, [*self.profile.did()])
-            .map(|_| ())
-            .map_err(|err| Error::Announce(err.to_string()))
+    /// Announces this node's refs of `rid`, waiting for the node's answer up
+    /// to `within`. Past it, [`Error::NodeDeadline`]: the announcement was
+    /// sent. With [`Error::NodeBusy`], it wasn't. Every other failure, the
+    /// node's or the wait's, is [`Error::Announce`]: whatever its caller
+    /// committed before stands, and [`Error::is_announce`] says so.
+    fn announce_refs(&self, rid: RepoId, within: Duration) -> Result<(), Error> {
+        let namespace = *self.profile.did();
+        let answer = self.waits.call(
+            &self.handle,
+            crate::error::ANNOUNCE,
+            within,
+            move |mut handle| {
+                Ok(handle
+                    .announce_refs_for(rid, [namespace])
+                    .map(|_| ())
+                    .map_err(|err| err.to_string()))
+            },
+        );
+        match answer {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(failed)) => Err(Error::Announce(failed)),
+            Err(error @ (Error::NodeDeadline { .. } | Error::NodeBusy { .. })) => Err(error),
+            // The wait itself failed: its thread didn't start, or ended
+            // without the answer.
+            Err(error) => Err(Error::Announce(error.to_string())),
+        }
     }
 
-    /// Create an issue directly in the repository's COB store.
+    /// Create an issue directly in the repository's COB store. The node's
+    /// answer to its announcement is waited for up to [`NODE_ANSWER_WITHIN`]
+    /// ([`Embedded::create_issue_within`]).
     pub fn create_issue(
         &self,
         rid: RepoId,
         title: &str,
         description: &str,
         labels: Vec<String>,
+    ) -> Result<String, Error> {
+        self.create_issue_within(rid, title, description, labels, NODE_ANSWER_WITHIN)
+    }
+
+    /// [`Embedded::create_issue`], waiting for the node's answer to its
+    /// announcement up to `within`.
+    ///
+    /// A COB change is committed before it's announced, so an error of the
+    /// announcement doesn't mean the change didn't happen: it is recorded
+    /// already, and stands in storage. Past `within`, the call has
+    /// [`Error::NodeDeadline`]: the announcement was sent, and not confirmed.
+    /// With [`Error::NodeBusy`], it wasn't sent. Any other failure of the
+    /// announcement, the node's or that of the wait for its answer (its
+    /// thread didn't start, or ended without it), is [`Error::Announce`].
+    /// [`Error::is_announce`] tells these three from
+    /// an error of the change itself, after which whether it was committed
+    /// is open.
+    ///
+    /// [`Embedded::comment_issue_within`],
+    /// [`Embedded::edit_issue_state_within`] and
+    /// [`Embedded::comment_patch_within`] do the same.
+    pub fn create_issue_within(
+        &self,
+        rid: RepoId,
+        title: &str,
+        description: &str,
+        labels: Vec<String>,
+        within: Duration,
     ) -> Result<String, Error> {
         let repo = self.profile.storage.repository_mut(rid)?;
         let signer = self.signer()?;
@@ -1452,17 +1502,33 @@ impl Embedded {
             .map_err(|e| Error::NodeThread(e.to_string()))?;
         let issue = issues.create(title, description, &labels, &[], [])?;
         let id = issue.id().to_string();
-        self.announce_refs(rid)?;
+        self.announce_refs(rid, within)?;
         Ok(id)
     }
 
-    /// Add a comment to an issue.
+    /// Add a comment to an issue. The node's answer to its announcement is
+    /// waited for up to [`NODE_ANSWER_WITHIN`]
+    /// ([`Embedded::comment_issue_within`]).
     pub fn comment_issue(
         &self,
         rid: RepoId,
         issue_id: &str,
         body: &str,
         reply_to: Option<&str>,
+    ) -> Result<String, Error> {
+        self.comment_issue_within(rid, issue_id, body, reply_to, NODE_ANSWER_WITHIN)
+    }
+
+    /// [`Embedded::comment_issue`], waiting for the node's answer to its
+    /// announcement up to `within`, as [`Embedded::create_issue_within`]
+    /// does.
+    pub fn comment_issue_within(
+        &self,
+        rid: RepoId,
+        issue_id: &str,
+        body: &str,
+        reply_to: Option<&str>,
+        within: Duration,
     ) -> Result<String, Error> {
         let repo = self.profile.storage.repository_mut(rid)?;
         let signer = self.signer()?;
@@ -1478,16 +1544,31 @@ impl Embedded {
             None => *issue.root().0,
         };
         let id = issue.comment(body, parent, [])?.to_string();
-        self.announce_refs(rid)?;
+        self.announce_refs(rid, within)?;
         Ok(id)
     }
 
-    /// Transition an issue between open, closed and solved.
+    /// Transition an issue between open, closed and solved. The node's
+    /// answer to its announcement is waited for up to [`NODE_ANSWER_WITHIN`]
+    /// ([`Embedded::edit_issue_state_within`]).
     pub fn edit_issue_state(
         &self,
         rid: RepoId,
         issue_id: &str,
         state: &str,
+    ) -> Result<String, Error> {
+        self.edit_issue_state_within(rid, issue_id, state, NODE_ANSWER_WITHIN)
+    }
+
+    /// [`Embedded::edit_issue_state`], waiting for the node's answer to its
+    /// announcement up to `within`, as [`Embedded::create_issue_within`]
+    /// does.
+    pub fn edit_issue_state_within(
+        &self,
+        rid: RepoId,
+        issue_id: &str,
+        state: &str,
+        within: Duration,
     ) -> Result<String, Error> {
         let repo = self.profile.storage.repository_mut(rid)?;
         let signer = self.signer()?;
@@ -1506,16 +1587,31 @@ impl Embedded {
         };
         let mut issue = issues.get_mut(&issue_id)?;
         issue.lifecycle(state)?;
-        self.announce_refs(rid)?;
+        self.announce_refs(rid, within)?;
         Ok(issue_id.to_string())
     }
 
-    /// Add a comment to a patch revision.
+    /// Add a comment to a patch revision. The node's answer to its
+    /// announcement is waited for up to [`NODE_ANSWER_WITHIN`]
+    /// ([`Embedded::comment_patch_within`]).
     pub fn comment_patch(
         &self,
         rid: RepoId,
         revision_id: &str,
         body: &str,
+    ) -> Result<String, Error> {
+        self.comment_patch_within(rid, revision_id, body, NODE_ANSWER_WITHIN)
+    }
+
+    /// [`Embedded::comment_patch`], waiting for the node's answer to its
+    /// announcement up to `within`, as [`Embedded::create_issue_within`]
+    /// does.
+    pub fn comment_patch_within(
+        &self,
+        rid: RepoId,
+        revision_id: &str,
+        body: &str,
+        within: Duration,
     ) -> Result<String, Error> {
         let repo = self.profile.storage.repository_mut(rid)?;
         let signer = self.signer()?;
@@ -1530,11 +1626,13 @@ impl Embedded {
         let id = patch
             .comment(revision_id, body, None, None, [])?
             .to_string();
-        self.announce_refs(rid)?;
+        self.announce_refs(rid, within)?;
         Ok(id)
     }
 
     /// Import the default branch of an existing working Git repository.
+    /// The node's answer to its announcement is waited for up to
+    /// [`NODE_ANSWER_WITHIN`], as [`Embedded::create_issue_within`]'s is.
     pub fn import_repo(
         &mut self,
         repo_path: &std::path::Path,
@@ -1558,7 +1656,7 @@ impl Embedded {
         )?;
         seed(&self.repositories, &mut self.handle, rid)?;
         self.handle.add_inventory(rid)?;
-        self.announce_refs(rid)?;
+        self.announce_refs(rid, NODE_ANSWER_WITHIN)?;
         Ok(rid)
     }
 
@@ -1925,9 +2023,21 @@ impl Embedded {
             .count())
     }
 
-    /// Number of nodes known to seed the given repository.
-    pub fn seeders(&mut self, rid: RepoId) -> Result<usize, Error> {
-        Ok(self.handle.seeds_for(rid, [*self.profile.did()])?.len())
+    /// Number of nodes known to seed the given repository. The node's answer
+    /// is waited for up to [`NODE_ANSWER_WITHIN`]
+    /// ([`Embedded::seeders_within`]).
+    pub fn seeders(&self, rid: RepoId) -> Result<usize, Error> {
+        self.seeders_within(rid, NODE_ANSWER_WITHIN)
+    }
+
+    /// [`Embedded::seeders`], waiting for the node's answer up to `within`:
+    /// past it, [`Error::NodeDeadline`].
+    pub fn seeders_within(&self, rid: RepoId, within: Duration) -> Result<usize, Error> {
+        let namespace = *self.profile.did();
+        self.waits
+            .call(&self.handle, "seeds_for", within, move |mut handle| {
+                Ok(handle.seeds_for(rid, [namespace])?.len())
+            })
     }
 
     /// What heartwood's `identity_doc()` will load, sized first (review of
@@ -2997,11 +3107,30 @@ impl Embedded {
     /// It runs only with the repository shut at the node's gate, as a
     /// quarantined repository is, and refuses with [`Error::Open`]
     /// otherwise.
+    ///
+    /// The node's answer to the unseed is waited for up to
+    /// [`NODE_ANSWER_WITHIN`] ([`Embedded::remove_quarantined_within`]).
     pub fn remove_quarantined(
         &self,
         rid: RepoId,
         qid: reconcile::quarantine::Qid,
         quarantine: &mut reconcile::quarantine::Quarantine,
+    ) -> Result<reconcile::quarantine::Removal, Error> {
+        self.remove_quarantined_within(rid, qid, quarantine, NODE_ANSWER_WITHIN)
+    }
+
+    /// [`Embedded::remove_quarantined`], waiting for the node's answer to
+    /// its unseed up to `within`. Past it, [`Error::NodeDeadline`]: the
+    /// unseed was sent, and whether the node still seeds the repository is
+    /// unknown; nothing after it ran, so the record stays, and the removal
+    /// completes when run again with the same `qid`. With
+    /// [`Error::NodeBusy`], the unseed wasn't sent, and nothing was touched.
+    pub fn remove_quarantined_within(
+        &self,
+        rid: RepoId,
+        qid: reconcile::quarantine::Qid,
+        quarantine: &mut reconcile::quarantine::Quarantine,
+        within: Duration,
     ) -> Result<reconcile::quarantine::Removal, Error> {
         // Shut, nothing seeds it while it is removed: neither this crate's
         // clone and import ([`seed`]) nor the node's own seed and unblock
@@ -3014,7 +3143,10 @@ impl Embedded {
         if quarantine.get(&rid)?.is_none_or(|record| record.qid != qid) {
             return Ok(reconcile::quarantine::Removal::NotQuarantined);
         }
-        self.handle.clone().unseed(rid)?;
+        self.waits
+            .call(&self.handle, "unseed", within, move |mut handle| {
+                handle.unseed(rid)
+            })?;
         // The node's default, the one it seeds by: `Options::seeding_policy`
         // is set on this profile too.
         let mut policies = radicle::node::policy::config::Config::new(
