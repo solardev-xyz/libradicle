@@ -61,6 +61,12 @@ ignore = [
     # crypto-bigint, timing variability: fixed from 0.7.6 only, which
     # elliptic-curve 0.13 can't use.
     { id = "RUSTSEC-2026-0387", reason = "no ECDSA private-key operation in libradicle or heartwood; crypto-bigint 0.5 has no fix" },
+    # chrono is unmaintained: an informational notice, no vulnerability, and
+    # no release to move to. It comes in through heartwood alone: radicle-log,
+    # a dependency of radicle-node, formats its log lines' timestamps with
+    # it. Only the radicle-node binary installs that logger; libradicle links
+    # the library and never does. Dropping chrono is a heartwood change.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained notice, no vulnerability: chrono comes in only through heartwood's radicle-log (radicle-node), for log-line timestamps of a logger libradicle never installs" },
 ]
 
 # This section is considered when running `cargo deny check licenses`
