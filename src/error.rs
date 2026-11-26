@@ -167,6 +167,11 @@ pub enum Error {
     /// ([`crate::isolate_git_config`]).
     #[error("libgit2's configuration search paths: {0}")]
     GitConfig(String),
+    /// The out-of-memory hooks of [`crate::process_init`] weren't installed:
+    /// SQLite was already initialized, or the libgit2 linked isn't 1.9.
+    /// Nothing was changed.
+    #[error("the out-of-memory hooks: {0}")]
+    ProcessInit(String),
 }
 
 /// The name, in [`Error::NodeDeadline`] and [`Error::NodeBusy`], of the
@@ -188,6 +193,114 @@ impl Error {
             Error::Announce(_) => true,
             Error::NodeDeadline { call, .. } | Error::NodeBusy { call, .. } => *call == ANNOUNCE,
             _ => false,
+        }
+    }
+
+    /// Whether this is, or wraps, an out-of-memory error of libgit2
+    /// (`GIT_ERROR_NOMEMORY`) or SQLite (`SQLITE_NOMEM`, or the extended
+    /// `SQLITE_IOERR_NOMEM`). A service process ends with
+    /// [`crate::OUT_OF_MEMORY_EXIT`] when one reaches it, and never answers it
+    /// as the request's error (freedom-core design 0010, "The memory cap").
+    ///
+    /// It is the backstop behind [`crate::process_init`]'s hooks. With them
+    /// installed, an allocation libgit2 or SQLite can't get has already ended
+    /// the process. What can still arrive here is an out-of-memory error that
+    /// no allocation of theirs failed:
+    ///
+    /// - zlib's, inside libgit2: zlib allocates through its own default, and
+    ///   libgit2 reports its `Z_MEM_ERROR` from inflating or deflating a
+    ///   stream (packs, loose objects, the indexer) as `GIT_ERROR_NOMEMORY`;
+    /// - libgit2's size checks: a size whose arithmetic overflows is
+    ///   `GIT_ERROR_NOMEMORY`, with no allocation tried;
+    /// - SQLite's own refusal of an allocation of 2^31 - 256 bytes or more,
+    ///   which never reaches its `xMalloc`.
+    ///
+    /// It follows the error's chain: `source()`, an `io::Error`'s inner
+    /// error, this crate's variants, and the errors that the heartwood types
+    /// those hold, and the public types they hold, wrap without making them
+    /// a `source()` (thiserror's `transparent`, or a field without
+    /// `#[source]`). It doesn't see an out-of-memory error:
+    ///
+    /// - made text, by heartwood or by libradicle: a fetch's failure
+    ///   ([`Error::FetchFailed`], from heartwood's `FetchResult::Failed`), the
+    ///   node's control replies ([`radicle::node::Error`]'s `Node` and
+    ///   `Command`), an announcement's ([`Error::Announce`]), the node
+    ///   thread's ([`Error::NodeThread`]), and [`Error::GitConfig`];
+    /// - wrapped `transparent`ly in a type heartwood keeps private
+    ///   (radicle-surf's reference, branch, tag, commit and repository
+    ///   errors; the signed refs' boxed reference and object errors;
+    ///   radicle-cob's change errors), or in radicle-protocol's service error
+    ///   (`radicle_node::runtime::Error::Service`), which this crate doesn't
+    ///   depend on;
+    /// - zlib's `deflateInit` refused for want of memory when libgit2 writes
+    ///   a loose object: libgit2 reports it as `GIT_ERROR_ZLIB` ("failed to
+    ///   initialize zlib"), which isn't counted, since a corrupt object's
+    ///   inflate is `GIT_ERROR_ZLIB` too.
+    pub fn is_out_of_memory(&self) -> bool {
+        crate::oom::in_chain(self)
+    }
+
+    /// The error this one wraps without making it its `source()`: each
+    /// `transparent` variant's, whose `source()` is the wrapped error's own
+    /// `source()` and skips that error ([`Error::is_out_of_memory`]).
+    pub(crate) fn wrapped(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        use std::error::Error as StdError;
+        fn dyn_error<E: StdError + 'static>(e: &E) -> &(dyn StdError + 'static) {
+            e
+        }
+        match self {
+            Error::Io(e) => Some(dyn_error(e)),
+            Error::Profile(e) => Some(dyn_error(e)),
+            Error::Keystore(e) => Some(dyn_error(e)),
+            Error::Runtime(e) => Some(dyn_error(e)),
+            Error::Node(e) => Some(dyn_error(e)),
+            Error::NodeHandle(e) => Some(dyn_error(e)),
+            Error::Storage(e) => Some(dyn_error(e)),
+            Error::StorageRefs(e) => Some(dyn_error(e)),
+            Error::Repository(e) => Some(dyn_error(e)),
+            Error::Surf(e) => Some(dyn_error(e)),
+            Error::Git(e) => Some(dyn_error(e)),
+            Error::Doc(e) => Some(dyn_error(e)),
+            Error::Payload(e) => Some(dyn_error(e)),
+            Error::Json(e) => Some(dyn_error(e)),
+            Error::Cob(e) => Some(dyn_error(e)),
+            Error::IssueCache(e) => Some(dyn_error(e)),
+            Error::Issue(e) => Some(dyn_error(e)),
+            Error::PatchCache(e) => Some(dyn_error(e)),
+            Error::Patch(e) => Some(dyn_error(e)),
+            Error::Signer(e) => Some(dyn_error(e)),
+            Error::Init(e) => Some(dyn_error(e)),
+            Error::Policy(e) => Some(dyn_error(e)),
+            Error::Sqlite(e) => Some(dyn_error(e)),
+            Error::Reconcile(e) => Some(dyn_error(&**e)),
+            Error::Quarantine(e) => Some(dyn_error(&**e)),
+            Error::Remove(e) => Some(dyn_error(&**e)),
+            // Its `source()` is the alias error itself.
+            Error::Alias(_) => None,
+            Error::NoProject
+            | Error::NoSeeds(_)
+            | Error::FetchFailed(..)
+            | Error::Timeout(_)
+            | Error::Cancelled
+            | Error::Announce(_)
+            | Error::NodeThread(_)
+            | Error::ShutdownTimeout(_)
+            | Error::NodeDeadline { .. }
+            | Error::NodeBusy { .. }
+            | Error::InvalidCobId(_)
+            | Error::NotATree(_)
+            | Error::NotABlob(_)
+            | Error::TooLarge { .. }
+            | Error::TooDeep { .. }
+            | Error::NoIdentityHead(_)
+            | Error::NoCanonicalHead(_)
+            | Error::InvalidRevision(_)
+            | Error::InvalidImport(_)
+            | Error::Exists(_)
+            | Error::Gated { .. }
+            | Error::Open(_)
+            | Error::GitConfig(_)
+            | Error::ProcessInit(_) => None,
         }
     }
 }

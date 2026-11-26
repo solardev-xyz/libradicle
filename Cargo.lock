@@ -2077,6 +2077,8 @@ dependencies = [
  "env_logger",
  "getrandom 0.4.3",
  "git2",
+ "libc",
+ "libgit2-sys",
  "log",
  "radicle",
  "radicle-node",
