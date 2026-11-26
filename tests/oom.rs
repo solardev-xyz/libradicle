@@ -75,6 +75,34 @@ fn after_sqlite_is_initialized_it_changes_nothing() {
     assert_done("after-sqlite");
 }
 
+/// libgit2's global initialization allocates (its system directories, its
+/// filters): with the hook set before it, a failure there exits 71 too, where
+/// libgit2-sys would panic. The child has no memory left to give before its
+/// first `process_init`.
+#[cfg(target_os = "linux")]
+#[test]
+fn libgit2_initialization_failure_exits_71() {
+    assert_exits_71("libgit2-init-exhausted", "libgit2");
+}
+
+/// libgit2's `grealloc`, of a buffer it holds (`git_buf_grow` after
+/// `git_buf_set`) and of NULL (`git_buf_grow` on an empty buffer).
+#[test]
+fn libgit2_reallocation_failure_exits_71() {
+    assert_exits_71("libgit2-realloc", "libgit2");
+    assert_exits_71("libgit2-realloc-null", "libgit2");
+}
+
+/// SQLite's `xRealloc`, of a block it holds; and a reallocation of NULL,
+/// which SQLite answers with an allocation (`sqlite3Realloc` calls
+/// `sqlite3Malloc` for it), so that `xRealloc` never sees NULL.
+#[cfg(target_os = "linux")]
+#[test]
+fn sqlite_reallocation_failure_under_the_data_limit_exits_71() {
+    assert_exits_71("sqlite-realloc-limit", "SQLite");
+    assert_exits_71("sqlite-realloc-null-limit", "SQLite");
+}
+
 #[test]
 fn child() {
     let Ok(case) = std::env::var(CASE) else {
@@ -90,20 +118,20 @@ fn child() {
         "libgit2-limit" => {
             init();
             let odb = mempack();
-            lower_data_limit();
+            lower_data_limit(HEADROOM);
             returned(odb.writer(OVER_THE_LIMIT, ObjectType::Blob).map(drop));
         }
         #[cfg(target_os = "linux")]
         "sqlite-limit" => {
             init();
             let db = sqlite::open(":memory:").unwrap();
-            lower_data_limit();
+            lower_data_limit(HEADROOM);
             returned(db.execute(randomblob(OVER_THE_LIMIT)));
         }
         #[cfg(target_os = "linux")]
         "libgit2-limit-unhooked" => {
             let odb = mempack();
-            lower_data_limit();
+            lower_data_limit(HEADROOM);
             let error = odb.writer(OVER_THE_LIMIT, ObjectType::Blob).err().unwrap();
             assert_eq!(error.class(), git2::ErrorClass::NoMemory, "{error}");
             assert!(libradicle::Error::Git(error).is_out_of_memory());
@@ -112,11 +140,57 @@ fn child() {
         #[cfg(target_os = "linux")]
         "sqlite-limit-unhooked" => {
             let db = sqlite::open(":memory:").unwrap();
-            lower_data_limit();
+            lower_data_limit(HEADROOM);
             let error = db.execute(randomblob(OVER_THE_LIMIT)).unwrap_err();
             assert_eq!(error.code, Some(7), "SQLITE_NOMEM: {error}");
             assert!(libradicle::Error::Sqlite(error).is_out_of_memory());
             println!("{DONE}");
+        }
+        #[cfg(target_os = "linux")]
+        "libgit2-init-exhausted" => {
+            lower_data_limit(0);
+            exhaust_the_allocator();
+            // SAFETY: first in the child, on the one thread that uses libgit2
+            // or SQLite, before either is used.
+            returned(unsafe { libradicle::process_init() }.map(drop));
+        }
+        "libgit2-realloc" => {
+            init();
+            let mut buf = empty_buf();
+            // SAFETY: `buf` is a valid, empty `git_buf`, and the data is one
+            // byte long.
+            let set = unsafe { libgit2_sys::git_buf_set(&mut buf, b"x".as_ptr().cast(), 1) };
+            assert_eq!(set, 0, "git_buf_set");
+            // SAFETY: `buf` holds libgit2's allocation; growing it reallocates.
+            returned(rc(unsafe { libgit2_sys::git_buf_grow(&mut buf, HUGE) }));
+        }
+        "libgit2-realloc-null" => {
+            init();
+            let mut buf = empty_buf();
+            // SAFETY: `buf` is a valid, empty `git_buf`, whose NULL pointer
+            // libgit2 reallocates (`git_buf_grow`, `src/libgit2/buf.c`).
+            returned(rc(unsafe { libgit2_sys::git_buf_grow(&mut buf, HUGE) }));
+        }
+        #[cfg(target_os = "linux")]
+        "sqlite-realloc-limit" => {
+            init();
+            // SAFETY: SQLite's allocator; the block is reallocated below.
+            let block = unsafe { sqlite::ffi::sqlite3_malloc64(64) };
+            assert!(!block.is_null());
+            lower_data_limit(HEADROOM);
+            // SAFETY: `block` is SQLite's, from `sqlite3_malloc64`.
+            let grown = unsafe { sqlite::ffi::sqlite3_realloc64(block, OVER_THE_LIMIT as u64) };
+            returned(if grown.is_null() { Err("NULL") } else { Ok(()) });
+        }
+        #[cfg(target_os = "linux")]
+        "sqlite-realloc-null-limit" => {
+            init();
+            lower_data_limit(HEADROOM);
+            // SAFETY: a reallocation of NULL is an allocation.
+            let grown = unsafe {
+                sqlite::ffi::sqlite3_realloc64(std::ptr::null_mut(), OVER_THE_LIMIT as u64)
+            };
+            returned(if grown.is_null() { Err("NULL") } else { Ok(()) });
         }
         "twice" => {
             init();
@@ -177,11 +251,47 @@ fn returned<E: std::fmt::Debug>(result: Result<(), E>) {
     println!("{RETURNED}{result:?}");
 }
 
-/// Lowers this child's `RLIMIT_DATA`, soft and hard, to 64 MiB above the
+/// An empty `git_buf` (`GIT_BUF_INIT`).
+fn empty_buf() -> libgit2_sys::git_buf {
+    libgit2_sys::git_buf {
+        ptr: std::ptr::null_mut(),
+        reserved: 0,
+        size: 0,
+    }
+}
+
+/// A libgit2 return code as a result.
+fn rc(code: std::ffi::c_int) -> Result<(), std::ffi::c_int> {
+    if code < 0 {
+        Err(code)
+    } else {
+        Ok(())
+    }
+}
+
+/// Takes every block the C library's allocator has left under the lowered
+/// limit, so that its next allocation of any size fails. The blocks are never
+/// freed: the child ends with its case. Nothing in it may allocate after
+/// this but the code under test.
+#[cfg(target_os = "linux")]
+fn exhaust_the_allocator() {
+    for size in [1 << 20, 1 << 16, 1 << 12, 1 << 8, 1] {
+        // SAFETY: `malloc` takes any size; its blocks are leaked on purpose.
+        // `black_box` keeps the compiler from assuming the allocation and
+        // dropping it.
+        while !std::hint::black_box(unsafe { libc::malloc(size) }).is_null() {}
+    }
+}
+
+/// The headroom a case leaves itself under the lowered limit
+/// ([`lower_data_limit`]).
+#[cfg(target_os = "linux")]
+const HEADROOM: u64 = 64 << 20;
+
+/// Lowers this child's `RLIMIT_DATA`, soft and hard, to `headroom` above the
 /// private writable memory it maps now (`VmData`, which the limit counts).
 #[cfg(target_os = "linux")]
-fn lower_data_limit() {
-    const HEADROOM: u64 = 64 << 20;
+fn lower_data_limit(headroom: u64) {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     let kib: u64 = status
         .lines()
@@ -189,7 +299,7 @@ fn lower_data_limit() {
         .and_then(|value| value.trim().strip_suffix("kB"))
         .and_then(|kib| kib.trim().parse().ok())
         .expect("VmData in /proc/self/status");
-    let cap = kib * 1024 + HEADROOM;
+    let cap = kib * 1024 + headroom;
     let limit = libc::rlimit {
         rlim_cur: cap,
         rlim_max: cap,
