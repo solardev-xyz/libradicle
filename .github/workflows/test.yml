@@ -47,6 +47,12 @@ jobs:
         with:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
+      # Every target's packages, not only the host's: tests/heartwood_pin.rs
+      # runs `cargo metadata --locked --offline`, which reads every package
+      # in the lockfile and fails on one a cold cache doesn't hold.
+      - name: cargo fetch
+        shell: bash
+        run: cargo fetch --locked
       - name: cargo test
         shell: bash
         run: cargo test --locked -p libradicle --features no-spawn
