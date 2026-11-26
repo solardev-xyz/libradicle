@@ -168,7 +168,7 @@ pub enum Error {
     #[error("libgit2's configuration search paths: {0}")]
     GitConfig(String),
     /// The out-of-memory hooks of [`crate::process_init`] weren't installed:
-    /// SQLite was already initialized, or the libgit2 linked isn't 1.9.
+    /// SQLite was already initialized, or the libgit2 linked isn't 1.9.6.
     /// Nothing was changed.
     #[error("the out-of-memory hooks: {0}")]
     ProcessInit(String),

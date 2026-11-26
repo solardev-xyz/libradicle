@@ -74,8 +74,8 @@ fn fail_stop(message: &'static [u8]) -> ! {
 ///
 /// `GIT_CALLBACK(name)` is `(*name)`, or `(__cdecl *name)` under MSVC
 /// (`include/git2/common.h`, lines 51 to 55): `extern "C"` in both cases.
-/// [`libgit2_version`] refuses at run time any libgit2 but 1.9, whose layout
-/// this is.
+/// [`libgit2_version`] refuses at run time any libgit2 but 1.9.6, the one
+/// this was checked against.
 ///
 /// `GIT_OPT_SET_ALLOCATOR` copies the struct (`git_allocator_setup`,
 /// `src/util/alloc.c`), so it needn't outlive the call.
@@ -96,30 +96,50 @@ struct GitAllocator {
 /// `GIT_OPT_GET_MWINDOW_SIZE`.
 const _: () = assert!(libgit2_sys::GIT_OPT_SET_ALLOCATOR as i64 == 23);
 
-/// Refuses a libgit2 other than 1.9, whose `git_allocator` [`GitAllocator`]
-/// mirrors. libgit2-sys 0.18.7 links 1.9.6, or a system libgit2 from 1.9.6 to
-/// before 1.10.0; a mismatch would have libgit2 call through a wrong table.
+/// Refuses any libgit2 but 1.9.6, whose `git_allocator` [`GitAllocator`]
+/// was checked against. libgit2-sys 0.18.7 vendors 1.9.6, but can link a
+/// system libgit2 from 1.9.6 up to 1.10.0, whose layout no one has checked:
+/// a mismatch would have libgit2 call through a wrong table.
 fn libgit2_version() -> Result<(), String> {
-    match git2::Version::get().libgit2_version() {
-        (1, 9, _) => Ok(()),
+    checked_version(git2::Version::get().libgit2_version())
+}
+
+fn checked_version(version: (u32, u32, u32)) -> Result<(), String> {
+    match version {
+        (1, 9, 6) => Ok(()),
         (major, minor, rev) => Err(format!(
-            "libgit2 {major}.{minor}.{rev} is linked, and its allocator's layout is known for 1.9 only"
+            "libgit2 {major}.{minor}.{rev} is linked, and its allocator's layout is checked for 1.9.6 only"
         )),
     }
 }
 
 /// Routes libgit2's allocations through [`git_malloc`], [`git_realloc`] and
-/// [`git_free`].
+/// [`git_free`], from libgit2's global initialization on.
+///
+/// The allocator is set first, and libgit2 initialized after, so that the
+/// initialization's own allocations (`git_sysdir_global_init`,
+/// `git_filter_global_init` and the others) go through it too. libgit2
+/// allows that order:
+///
+/// - `git_libgit2_opts` checks no initialization: it is a switch on its
+///   option (`src/libgit2/settings.c`, lines 108 to 115), and
+///   `GIT_OPT_SET_ALLOCATOR` only copies the struct into `git__allocator`
+///   (lines 346 to 348; `git_allocator_setup`, `src/util/alloc.c`, lines 111
+///   to 118);
+/// - `git_libgit2_init`'s first step, `git_allocator_global_init`
+///   (`src/libgit2/libgit2.c`, line 40), keeps an allocator set before it,
+///   and installs the default only over the placeholder that fails every
+///   allocation (`src/util/alloc.c`, lines 17 to 21 and 99 to 108).
+///
+/// In a process that used libgit2 before, the allocator is replaced after
+/// its initialization: what libgit2 allocated with its default, the hooks
+/// free with the same `free`.
 ///
 /// # Safety
 ///
 /// No other thread uses libgit2: every libgit2 allocation reads the table
 /// `GIT_OPT_SET_ALLOCATOR` writes, without synchronization.
 unsafe fn install_libgit2() -> Result<(), String> {
-    // `GIT_OPT_SET_ALLOCATOR` after `git_libgit2_init`, which installs the
-    // default allocator first (`git_allocator_global_init`) and allocates
-    // with it; what it allocated, the hooks' `free` frees (`git_free`).
-    libgit2_sys::init();
     let mut allocator = GitAllocator {
         gmalloc: git_malloc,
         grealloc: git_realloc,
@@ -127,7 +147,8 @@ unsafe fn install_libgit2() -> Result<(), String> {
     };
     // SAFETY: `GIT_OPT_SET_ALLOCATOR` takes one `git_allocator *`, which
     // `allocator` is in layout (`GitAllocator`'s docs), with every member
-    // set; libgit2 copies it before the call returns. No other thread uses
+    // set; libgit2 copies it before the call returns, and needs no
+    // initialization for it (this function's docs). No other thread uses
     // libgit2 (this function's contract).
     let rc = unsafe {
         libgit2_sys::git_libgit2_opts(
@@ -136,11 +157,11 @@ unsafe fn install_libgit2() -> Result<(), String> {
         )
     };
     if rc < 0 {
-        return Err(format!(
-            "libgit2 refused its allocator: {}",
-            git2::Error::last_error(rc).message()
-        ));
+        return Err(format!("libgit2 refused its allocator: code {rc}"));
     }
+    // Once per process; a NULL from an allocation in it now ends the
+    // process, where libgit2-sys would panic on the failed initialization.
+    libgit2_sys::init();
     Ok(())
 }
 
@@ -486,6 +507,22 @@ mod tests {
         sqlite::Error {
             code,
             message: Some("out of memory".to_owned()),
+        }
+    }
+
+    #[test]
+    fn only_libgit2_1_9_6_is_accepted() {
+        assert!(super::libgit2_version().is_ok(), "the vendored libgit2");
+        assert!(super::checked_version((1, 9, 6)).is_ok());
+        for other in [
+            (1, 9, 5),
+            (1, 9, 7),
+            (1, 9, 0),
+            (1, 10, 6),
+            (1, 8, 6),
+            (2, 9, 6),
+        ] {
+            assert!(super::checked_version(other).is_err(), "{other:?}");
         }
     }
 

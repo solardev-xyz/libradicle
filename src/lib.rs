@@ -3468,7 +3468,9 @@ pub unsafe fn isolate_git_config() -> Result<GitConfigIsolated, Error> {
 ///
 /// - **libgit2:** its allocator is replaced (`GIT_OPT_SET_ALLOCATOR`) by one
 ///   that calls the C library's `malloc`, `realloc` and `free`, as libgit2's
-///   default does, and ends the process on a NULL. zlib, which libgit2
+///   default does, and ends the process on a NULL. It is set before
+///   libgit2's global initialization (`git_libgit2_init`), which keeps it,
+///   so that the initialization's own allocations go through it. zlib, which libgit2
 ///   inflates and deflates with, allocates through its own default, not
 ///   libgit2's allocator: its failures are libgit2's errors, which
 ///   [`Error::is_out_of_memory`] counts where libgit2 reports them as
@@ -3485,7 +3487,7 @@ pub unsafe fn isolate_git_config() -> Result<GitConfigIsolated, Error> {
 /// [`isolate_git_config`]. [`Error::is_out_of_memory`] is the backstop for an
 /// out-of-memory error that neither hook sees.
 ///
-/// Nothing is half done: it first checks that libgit2 is 1.9, whose
+/// Nothing is half done: it first checks that libgit2 is 1.9.6, whose
 /// allocator's layout libradicle declares, and reads SQLite's default
 /// methods, which SQLite refuses once it is initialized. If either fails, it
 /// changes nothing and returns [`Error::ProcessInit`]. Then it installs both
@@ -3510,7 +3512,8 @@ pub unsafe fn isolate_git_config() -> Result<GitConfigIsolated, Error> {
 /// - SQLite's allocator can be replaced only before SQLite initializes,
 ///   which its first use does (`sqlite3_initialize`, run by the first open).
 ///   After that, the call returns [`Error::ProcessInit`] and changes nothing.
-///   libgit2's needn't come before libgit2's first use: memory allocated
+///   libgit2's needn't come before libgit2's first use, though then the
+///   initialization's allocations were made without it: memory allocated
 ///   before it, with libgit2's default, the hooks free with the same `free`.
 /// - The process accepts ending, at once and with nothing else run, at any
 ///   allocation libgit2 or SQLite can't get.
