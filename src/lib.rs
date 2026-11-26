@@ -45,6 +45,8 @@ pub mod import;
 pub mod json;
 mod meter;
 mod objects;
+mod oom;
+pub use oom::OUT_OF_MEMORY_EXIT;
 #[cfg(test)]
 mod seams;
 mod seeds;
@@ -3420,7 +3422,8 @@ pub const GIT_CONFIG_ENV: [&str; 3] = [
 /// A later call returns the first one's result and leaves libgit2's options
 /// alone. [`Embedded::start`] and [`Embedded::start_with_key`] don't call it:
 /// the N-API and UniFFI bindings run in a host's process, where libradicle
-/// can't know that the contract below holds.
+/// can't know that the contract below holds. A service process calls
+/// [`process_init`] instead, which does this and more.
 ///
 /// # Safety
 ///
@@ -3454,6 +3457,77 @@ pub unsafe fn isolate_git_config() -> Result<GitConfigIsolated, Error> {
         .clone()
         .map(|()| GitConfigIsolated(()))
         .map_err(Error::GitConfig)
+}
+
+/// Sets up a service process: what [`isolate_git_config`] does, and the
+/// fail-stop on out of memory of freedom-core design 0010 ("The memory cap",
+/// 0008's question 10). From then on, an allocation that libgit2 or SQLite
+/// asks of the C library's allocator and doesn't get ends the process with
+/// [`OUT_OF_MEMORY_EXIT`] (71), on whichever thread it fails, and is never
+/// returned to their caller as an error:
+///
+/// - **libgit2:** its allocator is replaced (`GIT_OPT_SET_ALLOCATOR`) by one
+///   that calls the C library's `malloc`, `realloc` and `free`, as libgit2's
+///   default does, and ends the process on a NULL. It is set before
+///   libgit2's global initialization (`git_libgit2_init`), which keeps it,
+///   so that the initialization's own allocations go through it. zlib, which libgit2
+///   inflates and deflates with, allocates through its own default, not
+///   libgit2's allocator: its failures are libgit2's errors, which
+///   [`Error::is_out_of_memory`] counts where libgit2 reports them as
+///   `GIT_ERROR_NOMEMORY`.
+/// - **SQLite:** its default memory methods (`SQLITE_CONFIG_GETMALLOC`) are
+///   installed again (`SQLITE_CONFIG_MALLOC`) with their `xMalloc` and
+///   `xRealloc` wrapped to end the process on a NULL.
+///
+/// The process ends with `_exit`, after one line on standard error: no
+/// destructor, `atexit` handler or flush runs. That is for a process whose
+/// host restarts it on exit 71, as freedom-radicled's main does with it and
+/// its import process. The N-API and UniFFI bindings run in a host's
+/// process, which the hooks would end, and call neither this nor
+/// [`isolate_git_config`]. [`Error::is_out_of_memory`] is the backstop for an
+/// out-of-memory error that neither hook sees.
+///
+/// Nothing is half done: it first checks that libgit2 is 1.9.6, whose
+/// allocator's layout libradicle declares, and reads SQLite's default
+/// methods, which SQLite refuses once it is initialized. If either fails, it
+/// changes nothing and returns [`Error::ProcessInit`]. Then it installs both
+/// hooks, and empties libgit2's search paths as [`isolate_git_config`] does,
+/// whose result it returns (the first one's, if that ran before).
+///
+/// A later call returns the first one's result and changes nothing.
+///
+/// # Safety
+///
+/// The first call in a process must come before any other thread can use
+/// libgit2 or SQLite, and before any use of SQLite at all: first thing in
+/// `main`, before any other thread is spawned. freedom-radicled calls it
+/// there. A later call has no requirement.
+///
+/// - It writes state that libgit2 and SQLite read on every thread without
+///   synchronization: libgit2's allocator table, which every libgit2
+///   allocation reads, its search paths ([`isolate_git_config`]'s
+///   `# Safety`), and SQLite's global configuration, whose `sqlite3_config`
+///   SQLite documents as not threadsafe. A libgit2 or SQLite call on another
+///   thread at the same time is a data race.
+/// - SQLite's allocator can be replaced only before SQLite initializes,
+///   which its first use does (`sqlite3_initialize`, run by the first open).
+///   After that, the call returns [`Error::ProcessInit`] and changes nothing.
+///   libgit2's needn't come before libgit2's first use, though then the
+///   initialization's allocations were made without it: memory allocated
+///   before it, with libgit2's default, the hooks free with the same `free`.
+/// - The process accepts ending, at once and with nothing else run, at any
+///   allocation libgit2 or SQLite can't get.
+pub unsafe fn process_init() -> Result<GitConfigIsolated, Error> {
+    static HOOKS: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    HOOKS
+        // SAFETY: no other thread uses libgit2 or SQLite, and SQLite isn't
+        // initialized (this function's `# Safety`); the `OnceLock` runs it
+        // once.
+        .get_or_init(|| unsafe { oom::install() })
+        .clone()
+        .map_err(Error::ProcessInit)?;
+    // SAFETY: as above.
+    unsafe { isolate_git_config() }
 }
 
 /// Removes [`GIT_CONFIG_ENV`] from the process's environment: what an
