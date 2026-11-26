@@ -120,6 +120,17 @@ radicle-signals = { path = "../heartwood/crates/radicle-signals" }
   last, the working copy read and never written. freedom-radicled's one-shot
   import process runs it.
 
+## Process setup
+
+A service process that embeds libradicle, such as freedom-radicled, calls the
+`unsafe` `process_init` first thing in `main`, before any other thread starts.
+It empties libgit2's configuration search paths, as `isolate_git_config` does.
+It also makes out of memory in libgit2 or SQLite end the process with exit 71
+(`OUT_OF_MEMORY_EXIT`) instead of returning an error (freedom-core design 0010,
+"The memory cap"). `Error::is_out_of_memory` is the backstop for an
+out-of-memory error that reaches the host anyway. The bindings call neither,
+because they run in a host's process.
+
 ## License
 
 MIT OR Apache-2.0, at your option: [`LICENSE-MIT`](LICENSE-MIT) or
